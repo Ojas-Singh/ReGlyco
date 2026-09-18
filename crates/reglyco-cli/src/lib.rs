@@ -141,6 +141,10 @@ struct BuildArgs {
     rotamers: bool,
     #[arg(long)]
     allow_clashes: bool,
+    /// Return a nonzero status after writing artifacts unless the selected
+    /// Build is clash-free.  The diagnostic PDB/report are always preserved.
+    #[arg(long, conflicts_with = "allow_clashes")]
+    require_clash_free: bool,
     /// Suppress progress messages on stderr.
     #[arg(long)]
     quiet: bool,
@@ -663,7 +667,9 @@ fn run_build(arguments: BuildArgs) -> anyhow::Result<()> {
         seed: arguments.seed,
         population_size: arguments.population,
         generations: arguments.generations,
-        require_clash_free: !arguments.allow_clashes,
+        // Build always materialises the best complete candidate.  Strict
+        // automation is enforced after artifacts are written below.
+        require_clash_free: false,
         scan_rotamers: arguments.rotamers,
         polish_attachment_vmm: true,
         ..energy_search_config(&arguments.energy)?
@@ -701,8 +707,10 @@ fn run_build(arguments: BuildArgs) -> anyhow::Result<()> {
             "Local glycan bundles preserve their input residue names; --output-format selects the representation for remote GlycoShape assets only.".into(),
         );
     }
+    let partial =
+        outcome.clash_status != reglyco_core::ClashStatus::ClashFree || !outcome.vmm_gate_satisfied;
     let mut report = WorkflowReport {
-        status: "complete".into(),
+        status: if partial { "partial" } else { "complete" }.into(),
         clash_status: Some(outcome.clash_status),
         search: Some(outcome.clone()),
         relaxation: None,
@@ -731,6 +739,31 @@ fn run_build(arguments: BuildArgs) -> anyhow::Result<()> {
         arguments.output.display()
     );
     print_clash_status(outcome.clash_status);
+    let unresolved_sites = outcome
+        .sites
+        .iter()
+        .filter(|site| {
+            site.steric_score > 1.1
+                || !site.phi_within_vmm95.unwrap_or(true)
+                || !site.psi_within_vmm95.unwrap_or(true)
+        })
+        .map(|site| site.site.residue.to_string())
+        .collect::<Vec<_>>();
+    if !unresolved_sites.is_empty() {
+        println!(
+            "WARNING: unresolved attachment sites: {}",
+            unresolved_sites.join(", ")
+        );
+    }
+    if !outcome.vmm_gate_satisfied {
+        println!("WARNING: selected complete result is outside the VMM acceptance gate");
+    }
+    if arguments.require_clash_free && partial {
+        anyhow::bail!(
+            "Build wrote the best complete result to {}, but it is not clash-free",
+            arguments.output.display()
+        );
+    }
     Ok(())
 }
 
@@ -2623,6 +2656,10 @@ fn run_scan(arguments: ScanArgs) -> anyhow::Result<()> {
             seed: config.seed,
             generations: outcome.generations,
             clash_status: reglyco_core::ClashStatus::ClashFree,
+            complete_output: true,
+            vmm_gate_satisfied: true,
+            termination_reason: "completed".into(),
+            clash_partners: Vec::new(),
             history: Vec::new(),
             warnings: Vec::new(),
             scoring_mode: SearchScoringMode::StericPrior,
@@ -2658,6 +2695,10 @@ fn run_scan(arguments: ScanArgs) -> anyhow::Result<()> {
         seed: config.seed,
         generations: independent.iter().map(|outcome| outcome.generations).sum(),
         clash_status: reglyco_core::ClashStatus::ClashFree,
+        complete_output: true,
+        vmm_gate_satisfied: true,
+        termination_reason: "completed".into(),
+        clash_partners: Vec::new(),
         history: Vec::new(),
         warnings: Vec::new(),
         scoring_mode: SearchScoringMode::StericPrior,
@@ -4094,6 +4135,43 @@ mod tests {
         };
         assert_eq!(arguments.seed, 0);
         assert!(matches!(arguments.output_format, OutputFormatArg::Glycam));
+        assert!(!arguments.require_clash_free);
+
+        let strict = Cli::try_parse_from([
+            "reglyco",
+            "build",
+            "--protein",
+            "protein.pdb",
+            "--site",
+            "A:42",
+            "--glycan",
+            "G00028MO",
+            "--output",
+            "result",
+            "--require-clash-free",
+        ])
+        .unwrap();
+        let Command::Build(arguments) = strict.command else {
+            panic!("expected build command");
+        };
+        assert!(arguments.require_clash_free);
+        assert!(
+            Cli::try_parse_from([
+                "reglyco",
+                "build",
+                "--protein",
+                "protein.pdb",
+                "--site",
+                "A:42",
+                "--glycan",
+                "G00028MO",
+                "--output",
+                "result",
+                "--allow-clashes",
+                "--require-clash-free",
+            ])
+            .is_err()
+        );
 
         let cli = Cli::try_parse_from([
             "reglyco",

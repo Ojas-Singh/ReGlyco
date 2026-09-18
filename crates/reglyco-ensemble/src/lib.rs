@@ -2686,11 +2686,16 @@ where
                         }
                         None => sample_truncated_vmm(&priors.psi, &mut rng),
                     };
+                    // `then_some` evaluates its argument eagerly.  Keep the
+                    // deposited side-chain pass at `None` without computing
+                    // `0 - 1`; the old expression underflowed in debug/WASM
+                    // builds before a diagnostic Build could be exported.
+                    let rotamer = rotamer_pass_index(rotamer_pass);
                     candidate.genes[index] = Gene {
                         conformer,
                         phi: phi.degrees,
                         psi: psi.degrees,
-                        rotamer: (rotamer_pass > 0).then_some(rotamer_pass - 1),
+                        rotamer,
                     };
                     candidate.phi_components[index] = phi.component;
                     candidate.psi_components[index] = psi.component;
@@ -2766,7 +2771,7 @@ fn cookbook_try_rotamer_repair(
             .min(5);
         for rotamer_pass in 0..=rotamer_count {
             let mut candidate = original_state.clone();
-            candidate[index].rotamer = (rotamer_pass > 0).then_some(rotamer_pass - 1);
+            candidate[index].rotamer = rotamer_pass_index(rotamer_pass);
             let Ok(candidate_evaluation) = problem
                 .prepared
                 .evaluate(&candidate, problem.clash_distance)
@@ -2801,95 +2806,6 @@ fn cookbook_try_rotamer_repair(
         }
     }
     Ok((working_state, working_evaluation))
-}
-
-fn cookbook_failure_diagnostics(
-    problem: &SearchProblem<'_>,
-    chromosome: &CookbookStericChromosome,
-    generation: usize,
-    evaluations: usize,
-    repaired: bool,
-) -> StrictSearchDiagnostics {
-    let sites: Vec<StrictSearchSiteDiagnostic> = chromosome
-        .genes
-        .iter()
-        .zip(problem.sites)
-        .enumerate()
-        .map(|(index, (gene, site))| {
-            let priors = resolved_priors(
-                problem.protein,
-                site,
-                &site.ensemble.conformers[gene.conformer].priors,
-            );
-            let phi_bounds = priors
-                .phi
-                .get(chromosome.phi_components[index])
-                .and_then(vmm_component_bounds_95);
-            let psi_bounds = priors
-                .psi
-                .get(chromosome.psi_components[index])
-                .and_then(vmm_component_bounds_95);
-            StrictSearchSiteDiagnostic {
-                site: site.site.residue.clone(),
-                phi_degrees: gene.phi,
-                psi_degrees: gene.psi,
-                phi_component: chromosome.phi_components[index],
-                psi_component: chromosome.psi_components[index],
-                phi_within_95: vmm_angle_within_95(
-                    VmmAngle {
-                        degrees: gene.phi,
-                        component: chromosome.phi_components[index],
-                    },
-                    &priors.phi,
-                ),
-                psi_within_95: vmm_angle_within_95(
-                    VmmAngle {
-                        degrees: gene.psi,
-                        component: chromosome.psi_components[index],
-                    },
-                    &priors.psi,
-                ),
-                phi_lower_95_degrees: phi_bounds.map(|(lower, _)| lower),
-                phi_upper_95_degrees: phi_bounds.map(|(_, upper)| upper),
-                psi_lower_95_degrees: psi_bounds.map(|(lower, _)| lower),
-                psi_upper_95_degrees: psi_bounds.map(|(_, upper)| upper),
-                steric_score: chromosome.steric_scores[index],
-            }
-        })
-        .collect();
-    let best_candidate = build_state(
-        problem.protein,
-        problem.sites,
-        &chromosome.genes,
-        problem.builder,
-    );
-    let best_candidate_pdb = best_candidate
-        .map(|structure| structure.to_pdb_string())
-        .unwrap_or_default();
-    let outlier_sites = sites
-        .iter()
-        .filter(|site| site.steric_score > 1.1 || !site.phi_within_95 || !site.psi_within_95)
-        .map(|site| site.site.clone())
-        .collect();
-    StrictSearchDiagnostics {
-        generation,
-        frozen_sites: chromosome
-            .frozen_mask
-            .iter()
-            .filter(|frozen| **frozen)
-            .count(),
-        evaluations,
-        repaired,
-        vdw_hard_contacts: 0,
-        vdw_advisory_contacts: 0,
-        vdw_max_overlap_angstrom: 0.0,
-        vdw_total_overlap_angstrom: 0.0,
-        vdw_contacts: Vec::new(),
-        sites,
-        outlier_sites,
-        vdw_outlier_sites: Vec::new(),
-        best_candidate_pdb,
-    }
 }
 
 #[maybe_async_cfg::maybe(
@@ -3258,15 +3174,26 @@ where
             &geometry,
         ));
     }
-    Err(EnsembleError::StrictVmmFailure {
-        diagnostics: Box::new(cookbook_failure_diagnostics(
-            problem,
-            &best,
-            best_generation,
-            evaluations,
-            repaired,
-        )),
-    })
+    // A strict gate miss is still a useful Build result.  The chromosome is
+    // complete (one evaluated gene per requested attachment), so return it
+    // through the normal materialisation/reporting path.  Callers can then
+    // inspect the actual coordinates and per-site VMM/steric diagnostics
+    // instead of receiving only a failure artifact.  Strict callers retain
+    // their policy through `SearchConfig::require_clash_free`, which is
+    // enforced after the complete candidate has been materialised.
+    let _ = repaired;
+    Ok(cookbook_search_result(
+        &best,
+        best_generation,
+        history,
+        first_feasible_score,
+        (policy == SearchSelectionPolicy::JointPriorV1).then_some(best.fitness),
+        valid_candidates,
+        search_budget,
+        "budget_exhausted_no_feasible".into(),
+        evaluations,
+        &geometry,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -3603,7 +3530,39 @@ where
     } else {
         ClashStatus::BestCompleteClashing
     };
-    if config.require_clash_free && status != ClashStatus::ClashFree {
+    let vmm_gate_satisfied = if config.scoring_mode != SearchScoringMode::StericPrior {
+        true
+    } else {
+        strict_components.as_ref().is_some_and(|(phi, psi)| {
+            outcome
+                .best_state
+                .iter()
+                .zip(sites)
+                .enumerate()
+                .all(|(index, (gene, site))| {
+                    let conformer = &site.ensemble.conformers[gene.conformer];
+                    let priors = resolved_priors(protein, site, &conformer.priors);
+                    phi.get(index).is_some_and(|component| {
+                        vmm_angle_within_95(
+                            VmmAngle {
+                                degrees: gene.phi,
+                                component: *component,
+                            },
+                            &priors.phi,
+                        )
+                    }) && psi.get(index).is_some_and(|component| {
+                        vmm_angle_within_95(
+                            VmmAngle {
+                                degrees: gene.psi,
+                                component: *component,
+                            },
+                            &priors.psi,
+                        )
+                    })
+                })
+        })
+    };
+    if config.require_clash_free && (status != ClashStatus::ClashFree || !vmm_gate_satisfied) {
         return Err(ReGlycoError::ClashFreeRequired.into());
     }
     let selected = energy_context
@@ -3639,16 +3598,22 @@ where
                 .as_ref()
                 .and_then(|(_, psi)| psi.get(index).copied());
             let phi_within_vmm95 = phi_component.and_then(|component| {
-                priors
-                    .phi
-                    .get(component)
-                    .map(|prior| vmm_component_within_95(gene.phi, prior))
+                Some(vmm_angle_within_95(
+                    VmmAngle {
+                        degrees: gene.phi,
+                        component,
+                    },
+                    &priors.phi,
+                ))
             });
             let psi_within_vmm95 = psi_component.and_then(|component| {
-                priors
-                    .psi
-                    .get(component)
-                    .map(|prior| vmm_component_within_95(gene.psi, prior))
+                Some(vmm_angle_within_95(
+                    VmmAngle {
+                        degrees: gene.psi,
+                        component,
+                    },
+                    &priors.psi,
+                ))
             });
             let (conformer_probability, attachment_log_density, joint_prior_score) = problem
                 .site_prior_breakdown(index, gene)
@@ -3693,6 +3658,13 @@ where
             }
         })
         .collect();
+    let termination_reason = if !vmm_polish.termination_reason.is_empty() {
+        vmm_polish.termination_reason.clone()
+    } else if status == ClashStatus::ClashFree && vmm_gate_satisfied {
+        "completed".into()
+    } else {
+        "budget_exhausted_no_feasible".into()
+    };
     let energy_analysis = selected
         .as_ref()
         .zip(energy_context.as_ref())
@@ -3701,11 +3673,15 @@ where
         })
         .transpose()?;
     Ok(SearchOutcome {
-        sites: site_results,
+        sites: site_results.clone(),
         total_score: outcome.best_score,
         seed: config.seed,
         generations: outcome.generations,
         clash_status: status,
+        complete_output: true,
+        vmm_gate_satisfied,
+        termination_reason,
+        clash_partners: clash_partner_labels(&built, config.clash_distance),
         history: outcome
             .history
             .into_iter()
@@ -3720,8 +3696,25 @@ where
             .collect(),
         warnings: {
             let mut warnings = Vec::new();
-            if status == ClashStatus::BestCompleteClashing {
-                warnings.push("GA exhausted with a complete but clashing result".into());
+            if status == ClashStatus::BestCompleteClashing || !vmm_gate_satisfied {
+                let unresolved = site_results
+                    .iter()
+                    .filter(|site| {
+                        site.steric_score > 1.1
+                            || (config.scoring_mode == SearchScoringMode::StericPrior
+                                && (!site.phi_within_vmm95.unwrap_or(false)
+                                    || !site.psi_within_vmm95.unwrap_or(false)))
+                    })
+                    .map(|site| site.site.residue.to_string())
+                    .collect::<Vec<_>>();
+                warnings.push(if unresolved.is_empty() {
+                    "GA exhausted with a complete result that did not satisfy every acceptance gate".into()
+                } else {
+                    format!(
+                        "GA exhausted with a complete diagnostic result; unresolved attachment sites: {}",
+                        unresolved.join(", ")
+                    )
+                });
             }
             warnings
         },
@@ -5270,6 +5263,74 @@ pub fn steric_site_scores(structure: &Structure, clash_distance: f64) -> Vec<f64
         .collect()
 }
 
+/// Return compact residue-level partners for the hard steric contacts in a
+/// complete exported structure.  The fast Cookbook score remains the search
+/// gate; this one-time diagnostic pass explains which protein residues or
+/// other attachment sites are responsible for an unresolved score.  A
+/// glycan--glycan contact is inserted into both sites' lists.
+pub fn clash_partner_labels(structure: &Structure, clash_distance: f64) -> Vec<Vec<String>> {
+    let atoms = structure.atoms();
+    let trees = &structure.metadata().glycan_trees;
+    let all_glycan_residues = trees
+        .iter()
+        .flat_map(|tree| tree.residue_ids.iter().cloned())
+        .collect::<HashSet<_>>();
+    let groups = trees
+        .iter()
+        .map(|tree| {
+            let residues = tree.residue_ids.iter().cloned().collect::<HashSet<_>>();
+            atoms
+                .iter()
+                .filter(|atom| residues.contains(&atom.residue))
+                .skip(3)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let protein_atoms = atoms
+        .iter()
+        .filter(|atom| !all_glycan_residues.contains(&atom.residue))
+        .collect::<Vec<_>>();
+    let mut labels = vec![BTreeSet::<String>::new(); groups.len()];
+    let threshold_squared = clash_distance * clash_distance;
+    for (index, group) in groups.iter().enumerate() {
+        for first in group {
+            for second in &protein_atoms {
+                if squared_distance(first.position, second.position) < threshold_squared {
+                    labels[index].insert(format!("protein:{}", second.residue));
+                }
+            }
+            for (other_index, other) in groups.iter().enumerate().skip(index + 1) {
+                if other.iter().any(|second| {
+                    squared_distance(first.position, second.position) < threshold_squared
+                }) {
+                    labels[index].insert(format!(
+                        "glycan:{}",
+                        trees[other_index]
+                            .attachment_site
+                            .as_ref()
+                            .or_else(|| trees[other_index].residue_ids.first())
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| format!("site-{}", other_index + 1))
+                    ));
+                    labels[other_index].insert(format!(
+                        "glycan:{}",
+                        trees[index]
+                            .attachment_site
+                            .as_ref()
+                            .or_else(|| trees[index].residue_ids.first())
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| format!("site-{}", index + 1))
+                    ));
+                }
+            }
+        }
+    }
+    labels
+        .into_iter()
+        .map(|values| values.into_iter().collect())
+        .collect()
+}
+
 fn pair_steric_score(
     first: &[&glysys::StructureAtom],
     second: &[&glysys::StructureAtom],
@@ -5553,14 +5614,6 @@ fn vmm_component_within_95(angle: f64, component: &VonMisesComponent) -> bool {
     circular_angle_distance_degrees(angle, component.mean_degrees).abs()
         <= probability_half_width_degrees(component)
 }
-fn vmm_component_bounds_95(component: &VonMisesComponent) -> Option<(f64, f64)> {
-    let width = probability_half_width_degrees(component);
-    Some((
-        wrap_degrees(component.mean_degrees - width),
-        wrap_degrees(component.mean_degrees + width),
-    ))
-}
-
 fn vmm_angle_within_95(angle: VmmAngle, components: &[VonMisesComponent]) -> bool {
     components
         .get(angle.component)
@@ -5687,6 +5740,12 @@ fn sample_rotamer(
     }
 }
 
+/// Convert the repair-loop pass (zero is the deposited sidechain) to the
+/// zero-based Dunbrack index without evaluating a subtract for pass zero.
+fn rotamer_pass_index(pass: usize) -> Option<usize> {
+    pass.checked_sub(1)
+}
+
 /// Pick a rotamer with the same ordering/bias as the Cookbook mutation path.
 /// Index zero represents the deposited sidechain; the bundled Dunbrack table
 /// is stored in descending probability order.  Keeping the deposited pose in
@@ -5708,7 +5767,7 @@ fn sample_rotamer_biased(
     weights.push(max_probability * 1.5);
     weights.extend(choices.iter().map(|rotamer| rotamer.probability.max(0.0)));
     let selected = weighted_index(&weights, rng);
-    (selected > 0).then_some(selected - 1)
+    rotamer_pass_index(selected)
 }
 
 fn weighted_index(weights: &[f64], rng: &mut ChaCha8Rng) -> usize {
@@ -6157,6 +6216,8 @@ mod tests {
                 .flatten()
                 .all(|index| *index < dunbrack::rotamers(&protein, &site).len())
         );
+        assert_eq!(rotamer_pass_index(0), None);
+        assert_eq!(rotamer_pass_index(1), Some(0));
     }
 
     #[test]

@@ -2356,12 +2356,16 @@ pub async fn execute_with_control(
                 Err(EnsembleError::Cancelled) => return Err(WorkflowError::Cancelled),
                 Err(error) => return Err(error.into()),
             };
-            if outcome.clash_status == ClashStatus::BestCompleteClashing {
+            if outcome.clash_status == ClashStatus::BestCompleteClashing
+                || !outcome.vmm_gate_satisfied
+            {
                 status = WorkflowStatus::Partial;
                 if outcome.warnings.is_empty() {
-                    warnings.push(
-                        "The requested search budget ended with the best complete structure still showing steric clashes; the structure and diagnostics are available for review.".into(),
-                    );
+                    warnings.push(if outcome.clash_status == ClashStatus::BestCompleteClashing {
+                        "The requested search budget ended with the best complete structure still showing steric clashes; the structure and diagnostics are available for review.".into()
+                    } else {
+                        "The complete structure is outside the requested VMM acceptance gate; the structure and diagnostics are available for review.".into()
+                    });
                 }
             }
             // Preserve the engine's structured steric diagnostics, including
@@ -2393,13 +2397,58 @@ pub async fn execute_with_control(
                 .map(|assignment| ReportSite {
                     site: assignment.site.clone(),
                     glycan_id: Some(assignment.glycan_id.clone()),
-                    status: "built".into(),
+                    status: outcome
+                        .sites
+                        .iter()
+                        .find(|result| result.site.residue == assignment.site.residue_id())
+                        .map(|result| {
+                            if result.steric_score <= 1.1
+                                && result.phi_within_vmm95.unwrap_or(true)
+                                && result.psi_within_vmm95.unwrap_or(true)
+                            {
+                                "built"
+                            } else {
+                                "unresolved"
+                            }
+                        })
+                        .unwrap_or("missing")
+                        .into(),
                     score: None,
-                    details: BTreeMap::new(),
+                    details: outcome
+                        .sites
+                        .iter()
+                        .find(|result| result.site.residue == assignment.site.residue_id())
+                        .map(|result| {
+                            let result_index = outcome.sites.iter().position(|candidate| {
+                                candidate.site.residue == result.site.residue
+                            });
+                            BTreeMap::from([
+                                ("stericScore".into(), json!(result.steric_score)),
+                                ("phiWithinVmm95".into(), json!(result.phi_within_vmm95)),
+                                ("psiWithinVmm95".into(), json!(result.psi_within_vmm95)),
+                                ("conformerId".into(), json!(result.conformer_id)),
+                                (
+                                    "clashPartners".into(),
+                                    json!(
+                                        result_index
+                                            .and_then(|index| outcome.clash_partners.get(index))
+                                            .cloned()
+                                            .unwrap_or_default()
+                                    ),
+                                ),
+                            ])
+                        })
+                        .unwrap_or_default(),
                 })
                 .collect();
             analysis = serde_json::to_value(&outcome)?;
-            append_build_search_diagnostics(&mut analysis, &outcome, &config, &sites);
+            append_build_search_diagnostics(
+                &mut analysis,
+                &outcome,
+                &config,
+                &sites,
+                &outcome.clash_partners,
+            );
             append_attachment_reference_data(&mut analysis, &protein, &sites, &outcome.sites);
             protein = built.structure;
             append_attachment_observations_from_results(
@@ -3156,10 +3205,10 @@ fn finish_workflow(
     })
 }
 
-/// Assemble a failed-but-inspectable bundle for the strict steric solver.
-/// The best candidate is deliberately stored as an analysis artifact only;
-/// `primary_structure` stays empty so follow-up workflows cannot treat an
-/// out-of-contract pose as a valid parent.
+/// Assemble a strict-search fallback bundle. Build workflows retain the
+/// complete candidate as a partial primary result; statistical Ensemble keeps
+/// its historical failed status because its sampler contract requires a
+/// valid target state.
 fn finish_strict_failure(
     request: &ReGlycoRunRequestV1,
     input: &str,
@@ -3171,6 +3220,10 @@ fn finish_strict_failure(
     mut extra_artifacts: Vec<WorkflowArtifact>,
     control: &mut impl WorkflowControl,
 ) -> Result<WorkflowBundle> {
+    let build_partial = matches!(
+        request.workflow,
+        WorkflowId::Uniprot | WorkflowId::SiteBuild
+    ) && !diagnostics.best_candidate_pdb.trim().is_empty();
     emit(
         control,
         "validate",
@@ -3178,9 +3231,11 @@ fn finish_strict_failure(
         None,
         None,
     )?;
-    warnings.push(
-        "No candidate satisfied both clash-free sterics and the selected VMM circular 95% gate. The best candidate is available as a diagnostic artifact only.".into(),
-    );
+    warnings.push(if build_partial {
+        "No candidate satisfied both clash-free sterics and the selected VMM circular 95% gate; the best complete candidate is retained as a partial Build result.".into()
+    } else {
+        "No candidate satisfied both clash-free sterics and the selected VMM circular 95% gate. The best candidate is available as a diagnostic artifact only.".into()
+    });
     let diagnostics_value = serde_json::to_value(&diagnostics)?;
     let conversions = converted_proline_sites(request, input, &protein);
     if !conversions.is_empty() {
@@ -3224,7 +3279,11 @@ fn finish_strict_failure(
     let report = WorkflowReport {
         workflow: request.workflow,
         title: report_title(request.workflow).into(),
-        summary: "Strict steric search failed; no valid final structure was produced.".into(),
+        summary: if build_partial {
+            "Build completed partially; the best complete structure was retained with unresolved steric/VMM diagnostics.".into()
+        } else {
+            "Strict steric search failed; no valid final structure was produced.".into()
+        },
         generated_at: request.created_at.clone(),
         engine_version: ENGINE_VERSION.into(),
         input_sha256: format!("{:x}", Sha256::digest(input.as_bytes())),
@@ -3310,22 +3369,34 @@ fn finish_strict_failure(
     ];
     if !diagnostics.best_candidate_pdb.trim().is_empty() {
         artifacts.push(text_artifact(
-            "strict-search-best-candidate.pdb",
+            if build_partial {
+                "result.pdb"
+            } else {
+                "strict-search-best-candidate.pdb"
+            },
             "chemical/x-pdb",
-            ArtifactRole::Analysis,
+            if build_partial {
+                ArtifactRole::Structure
+            } else {
+                ArtifactRole::Analysis
+            },
             diagnostics.best_candidate_pdb.clone(),
         ));
     }
     artifacts.append(&mut extra_artifacts);
     Ok(WorkflowBundle {
         schema_version: SCHEMA_VERSION,
-        status: WorkflowStatus::Failed,
+        status: if build_partial {
+            WorkflowStatus::Partial
+        } else {
+            WorkflowStatus::Failed
+        },
         workflow: request.workflow,
-        primary_structure: None,
+        primary_structure: build_partial.then_some(diagnostics.best_candidate_pdb.clone()),
         report,
         artifacts,
         warnings,
-        error: Some(
+        error: (!build_partial).then_some(
             "Strict steric search failed: no VMM-95%-compliant clash-free structure was found."
                 .into(),
         ),
@@ -4165,6 +4236,7 @@ fn append_build_search_diagnostics(
     outcome: &SearchOutcome,
     config: &SearchConfig,
     search_sites: &[SearchSite],
+    clash_partners: &[Vec<String>],
 ) {
     if config.selection_policy != SearchSelectionPolicy::JointPriorV1 {
         return;
@@ -4191,7 +4263,13 @@ fn append_build_search_diagnostics(
                 "jointPriorScore": site.joint_prior_score,
                 "phiDegrees": site.phi_degrees,
                 "psiDegrees": site.psi_degrees,
+                "phiWithinVmm95": site.phi_within_vmm95,
+                "psiWithinVmm95": site.psi_within_vmm95,
                 "stericScore": site.steric_score,
+                "clashPartners": clash_partners.get(index).cloned().unwrap_or_default(),
+                "status": if site.steric_score <= 1.1
+                    && site.phi_within_vmm95.unwrap_or(true)
+                    && site.psi_within_vmm95.unwrap_or(true) { "clear" } else { "unresolved" },
                 "populationSource": population_source,
             })
         })
@@ -4206,15 +4284,22 @@ fn append_build_search_diagnostics(
                     ConformerPopulationSource::AssetMetadata => "asset_metadata",
                     ConformerPopulationSource::EqualFallback => "equal_weight_fallback",
                 }).collect::<Vec<_>>(),
-                "description": "best found within the configured search budget; complete sterics are required",
+                "description": if outcome.complete_output && (outcome.clash_status == ClashStatus::BestCompleteClashing || !outcome.vmm_gate_satisfied) {
+                    "best complete result within the configured search budget; unresolved steric/VMM sites are reported below"
+                } else {
+                    "best found within the configured search budget"
+                },
                 "populationSize": config.population_size,
                 "generationLimit": config.generations,
                 "searchBudget": polish.search_budget,
                 "evaluations": polish.evaluations,
                 "validCandidates": polish.valid_candidates,
+                "completeOutput": outcome.complete_output,
+                "vmmGateSatisfied": outcome.vmm_gate_satisfied,
+                "clashStatus": serde_json::to_value(outcome.clash_status).unwrap_or(Value::Null),
                 "firstFeasibleScore": polish.first_feasible_score,
                 "finalPriorScore": final_score,
-                "terminationReason": if polish.termination_reason.is_empty() { "unknown" } else { polish.termination_reason.as_str() },
+                "terminationReason": if outcome.termination_reason.is_empty() { "unknown" } else { outcome.termination_reason.as_str() },
                 "geometryGpuEvaluations": polish.geometry_gpu_evaluations,
                 "geometryCpuEvaluations": polish.geometry_cpu_evaluations,
                 "geometryGpuSeconds": polish.geometry_gpu_seconds,
@@ -7042,7 +7127,7 @@ END
     }
 
     #[test]
-    fn strict_failure_bundle_keeps_candidate_out_of_primary_structure() {
+    fn strict_build_fallback_promotes_complete_candidate_to_partial_result() {
         let options = BuildOptions {
             add_water: false,
             add_ions: false,
@@ -7094,15 +7179,15 @@ END
             &mut control,
         )
         .unwrap();
-        assert!(matches!(bundle.status, WorkflowStatus::Failed));
-        assert!(bundle.primary_structure.is_none());
+        assert!(matches!(bundle.status, WorkflowStatus::Partial));
+        assert!(bundle.primary_structure.is_some());
         assert!(
             bundle
                 .artifacts
                 .iter()
-                .any(|artifact| artifact.name == "strict-search-best-candidate.pdb")
+                .any(|artifact| artifact.name == "result.pdb")
         );
-        assert!(bundle.error.as_deref().unwrap().contains("VMM-95%"));
+        assert!(bundle.error.is_none());
     }
 
     #[test]

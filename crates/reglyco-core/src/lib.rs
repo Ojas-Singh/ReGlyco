@@ -1069,6 +1069,25 @@ pub struct SearchOutcome {
     pub seed: u64,
     pub generations: usize,
     pub clash_status: ClashStatus,
+    /// True when the selected chromosome produced coordinates for every
+    /// requested attachment.  This is independent from `clash_status`:
+    /// diagnostic Builds may be complete while still clashing.
+    #[serde(default = "default_true")]
+    pub complete_output: bool,
+    /// Whether the selected attachment angles satisfy the applicable VMM
+    /// gate.  A complete output can intentionally be outside this gate for
+    /// diagnostic Build reporting.
+    #[serde(default = "default_true")]
+    pub vmm_gate_satisfied: bool,
+    /// Search termination is reported separately from scientific status so
+    /// budget exhaustion does not look like an input or execution failure.
+    #[serde(default)]
+    pub termination_reason: String,
+    /// Residue-level partners for steric contacts in the exported complete
+    /// structure.  Entries are prefixed with `protein:` or `glycan:` so a
+    /// glycan–glycan contact can be attributed to both attachment sites.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clash_partners: Vec<Vec<String>>,
     pub history: Vec<SearchGeneration>,
     pub warnings: Vec<String>,
     #[serde(default)]
@@ -1183,6 +1202,10 @@ fn default_energy_cutoff() -> f64 {
 }
 fn default_minimization_radius() -> f64 {
     5.0
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(test)]
