@@ -1,0 +1,27 @@
+[package]
+name = "reglyco-density"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license.workspace = true
+description = "Density-refinement interfaces for ReGlyco"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
+
+[dependencies]
+glysys.workspace = true
+nalgebra.workspace = true
+mrc.workspace = true
+open-bcif.workspace = true
+reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
+rayon.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+serde_json.workspace = true
+tempfile = "3"

@@ -1,0 +1,18 @@
+[package]
+name = "reglyco-saxs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license.workspace = true
+description = "SAXS-refinement interfaces for ReGlyco"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
+
+[dependencies]
+crabsaxs = { package = "crabsaxs", version = "0.1.0", path = "../../../crabSAXS" }
+glysys.workspace = true
+nalgebra = "0.33"
+rayon.workspace = true
+reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

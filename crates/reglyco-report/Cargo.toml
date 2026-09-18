@@ -1,0 +1,32 @@
+[package]
+name = "reglyco-report"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license.workspace = true
+description = "Machine-readable ReGlyco workflow reports"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
+
+[dependencies]
+base64.workspace = true
+crabwurcs-iupac.workspace = true
+crabwurcs-core.workspace = true
+crabwurcs-pdb.workspace = true
+crabwurcs-snfg.workspace = true
+contour.workspace = true
+crabsaxs = { package = "crabsaxs", version = "0.1.0", path = "../../../crabSAXS" }
+petgraph.workspace = true
+glysys.workspace = true
+glysys-energy.workspace = true
+plotters.workspace = true
+reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
+reglyco-relax = { version = "0.1.0", path = "../reglyco-relax" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+typst-as-lib.workspace = true
+typst-layout.workspace = true
+typst-pdf.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

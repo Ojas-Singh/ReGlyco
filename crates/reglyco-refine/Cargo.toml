@@ -1,0 +1,27 @@
+[package]
+name = "reglyco-refine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license.workspace = true
+description = "Search, build, and relaxation orchestration for ReGlyco"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
+
+[dependencies]
+glysys.workspace = true
+glysys-opt.workspace = true
+reglyco-build = { version = "0.1.0", path = "../reglyco-build" }
+reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
+reglyco-density = { version = "0.1.0", path = "../reglyco-density" }
+reglyco-ensemble = { version = "0.1.0", path = "../reglyco-ensemble" }
+reglyco-relax = { version = "0.1.0", path = "../reglyco-relax" }
+reglyco-report = { version = "0.1.0", path = "../reglyco-report" }
+reglyco-validate = { version = "0.1.0", path = "../reglyco-validate" }
+serde.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+glysys-opt.workspace = true
+mrc.workspace = true
+tempfile = "3"

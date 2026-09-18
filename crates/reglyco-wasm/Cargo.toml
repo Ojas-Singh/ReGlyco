@@ -1,0 +1,43 @@
+[package]
+name = "reglyco-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license.workspace = true
+description = "Browser WASM bindings for ReGlyco workflows"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+webgpu = ["full", "reglyco-workflow/webgpu", "dep:wasm-bindgen-futures", "dep:reglyco-ensemble"]
+default = ["public"]
+public = ["reglyco-workflow/public"]
+full = ["reglyco-workflow/full"]
+threaded = ["dep:wasm-bindgen-rayon"]
+
+[dependencies]
+wasm-bindgen-futures = { version = "0.4", optional = true }
+reglyco-ensemble = { version = "0.1.0", path = "../reglyco-ensemble", optional = true }
+getrandom.workspace = true
+js-sys.workspace = true
+reglyco-workflow = { version = "0.1.0", path = "../reglyco-workflow", default-features = false }
+serde-wasm-bindgen.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true
+# Browser release assets are imported directly from the versioned release
+# directory rather than processed by Vite/Rollup, so use Rayon’s native
+# no-bundler worker bootstrap. The default helper assumes a bundler transform
+# and attempts to structured-clone WebAssembly.Memory in Chromium.
+wasm-bindgen-rayon = { version = "1.3", optional = true, features = ["no-bundler"] }
+
+# Full builds include crabSAXS/Typst dependencies that still use getrandom 0.2.
+# A direct target dependency enables their browser entropy backend through
+# Cargo's feature unification without pulling it into native builds.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+# argmin's transitive timer otherwise imports a native `now` symbol. Enabling
+# the browser backend here keeps native crates untouched and fixes full WASM.
+instant = { version = "0.1.13", features = ["wasm-bindgen"] }

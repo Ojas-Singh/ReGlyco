@@ -1,0 +1,40 @@
+[package]
+name = "reglyco-ensemble"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license.workspace = true
+description = "Glycan ensemble providers and deterministic conformational search"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
+include = ["/src/**", "/data/**", "/Cargo.toml"]
+
+[features]
+webgpu = ["dep:glysys-gpu", "dep:glysys-runtime"]
+
+[dependencies]
+glysys-gpu = { version = "0.1.0", path = "../../../GlySys/crates/glysys-gpu", optional = true }
+glysys-runtime = { version = "0.1.0", path = "../../../GlySys/crates/glysys-runtime", optional = true }
+maybe-async-cfg = "0.2.5"
+glysys.workspace = true
+glysys-energy.workspace = true
+glysys-opt.workspace = true
+flate2.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rayon.workspace = true
+reglyco-build = { version = "0.1.0", path = "../reglyco-build" }
+reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
+reglyco-relax = { version = "0.1.0", path = "../reglyco-relax" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1.1"
+
+[dev-dependencies]
+pollster = "0.4"
+tempfile = "3"

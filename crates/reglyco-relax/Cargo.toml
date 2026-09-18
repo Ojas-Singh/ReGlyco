@@ -1,0 +1,16 @@
+[package]
+name = "reglyco-relax"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license.workspace = true
+description = "Force-field and OBC2 minimization for ReGlyco structures"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
+
+[dependencies]
+glysys.workspace = true
+glysys-energy.workspace = true
+glysys-opt.workspace = true
+reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
+serde.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "reglyco-validate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license.workspace = true
+description = "Structural validation interfaces for ReGlyco"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
+
+[features]
+default = ["density"]
+density = ["dep:reglyco-density"]
+
+[dependencies]
+glysys.workspace = true
+reglyco-density = { version = "0.1.0", path = "../reglyco-density", optional = true }
+reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
+serde.workspace = true

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97"
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
+
+  browser-profiles:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97"
+          targets: wasm32-unknown-unknown
+          components: rust-src
+      - run: cargo check -p reglyco-wasm --target wasm32-unknown-unknown --no-default-features --features public
+      - run: cargo check -p reglyco-wasm --target wasm32-unknown-unknown --no-default-features --features full
+      - run: cargo check -p reglyco-pdf-wasm --target wasm32-unknown-unknown
+      - run: RUSTC_BOOTSTRAP=1 cargo check -Z build-std=panic_abort,std --config 'target.wasm32-unknown-unknown.rustflags=["-C","target-feature=+atomics,+bulk-memory,+mutable-globals","--cfg","getrandom_backend=\"custom\""]' -p reglyco-wasm --target wasm32-unknown-unknown --no-default-features --features full,threaded
+      - name: Assert public capability boundary
+        run: cargo test -p reglyco-workflow --no-default-features --features public public_capabilities_exclude_unpublished_workflows
+      - name: Assert public dependency boundary
+        shell: bash
+        run: |
+          # Refine is intentionally part of the public/action bundle. Only
+          # unpublished Density and SAXS capabilities (and their crabsaxs
+          # adapter) must stay out of the public dependency graph.
+          if cargo tree -p reglyco-workflow --no-default-features --features public | grep -E 'reglyco-(density|saxs)|crabsaxs'; then
+            echo "public workflow unexpectedly includes a full-only dependency"
+            exit 1
+          fi

@@ -1,0 +1,16 @@
+[package]
+name = "reglyco-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license.workspace = true
+description = "Shared domain types for ReGlyco"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
+
+[dependencies]
+glysys.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
