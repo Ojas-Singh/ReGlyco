@@ -747,6 +747,51 @@ pub struct LinkagePrior {
     pub psi: Vec<VonMisesComponent>,
 }
 
+/// How an attachment search budget is selected at the request boundary.
+///
+/// `Auto` is resolved only after the glycan assets and the receptor-dependent
+/// conflict graph have been prepared. `Manual` preserves the concrete
+/// population/generation values supplied by historical requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBudgetMode {
+    Auto,
+    Manual,
+}
+
+impl Default for SearchBudgetMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Search-space measurements and the deterministic budget selected from them.
+/// This is deliberately independent of a browser or command-line adapter so
+/// every client reports the same resolution for the same prepared inputs.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchBudgetResolution {
+    pub version: String,
+    pub requested_mode: SearchBudgetMode,
+    pub population_size: usize,
+    pub generations: usize,
+    pub total_budget: usize,
+    pub required_work: usize,
+    pub auto_cap_population: usize,
+    pub auto_cap_generations: usize,
+    pub capped: bool,
+    pub site_count: usize,
+    pub component_sizes: Vec<usize>,
+    pub graph_edges: usize,
+    pub maximum_degree: usize,
+    pub largest_component_size: usize,
+    pub site_pose_needs: Vec<usize>,
+    pub conformer_counts: Vec<usize>,
+    pub vmm_basin_counts: Vec<usize>,
+    pub rotamer_counts: Vec<usize>,
+    pub termination_reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EnsembleConformer {
     pub id: String,
@@ -1069,6 +1114,25 @@ pub struct SearchOutcome {
     pub seed: u64,
     pub generations: usize,
     pub clash_status: ClashStatus,
+    /// True when the selected chromosome produced coordinates for every
+    /// requested attachment.  This is independent from `clash_status`:
+    /// diagnostic Builds may be complete while still clashing.
+    #[serde(default = "default_true")]
+    pub complete_output: bool,
+    /// Whether the selected attachment angles satisfy the applicable VMM
+    /// gate.  A complete output can intentionally be outside this gate for
+    /// diagnostic Build reporting.
+    #[serde(default = "default_true")]
+    pub vmm_gate_satisfied: bool,
+    /// Search termination is reported separately from scientific status so
+    /// budget exhaustion does not look like an input or execution failure.
+    #[serde(default)]
+    pub termination_reason: String,
+    /// Residue-level partners for steric contacts in the exported complete
+    /// structure.  Entries are prefixed with `protein:` or `glycan:` so a
+    /// glycan–glycan contact can be attributed to both attachment sites.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clash_partners: Vec<Vec<String>>,
     pub history: Vec<SearchGeneration>,
     pub warnings: Vec<String>,
     #[serde(default)]
@@ -1144,6 +1208,29 @@ pub struct VmmPolishDiagnostics {
     pub geometry_cpu_seconds: f64,
     #[serde(default)]
     pub geometry_transform_seconds: f64,
+    /// Joint feasibility coordinator diagnostics. These are additive and
+    /// default cleanly for reports produced before compatibility search was
+    /// introduced.
+    #[serde(default)]
+    pub compatibility_algorithm: String,
+    #[serde(default)]
+    pub compatibility_seeded_states: usize,
+    #[serde(default)]
+    pub compatibility_pose_attempts: usize,
+    #[serde(default)]
+    pub compatibility_pool_sizes: Vec<usize>,
+    #[serde(default)]
+    pub compatibility_pool_expansions: usize,
+    #[serde(default)]
+    pub compatibility_checks: usize,
+    #[serde(default)]
+    pub compatibility_backtracks: usize,
+    #[serde(default)]
+    pub compatibility_graph_edges: usize,
+    #[serde(default)]
+    pub compatibility_attempts_per_site: Vec<usize>,
+    #[serde(default)]
+    pub compatibility_proposal_budget: usize,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1183,6 +1270,10 @@ fn default_energy_cutoff() -> f64 {
 }
 fn default_minimization_radius() -> f64 {
     5.0
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(test)]

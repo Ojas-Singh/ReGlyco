@@ -71,6 +71,10 @@ fn independent_chain_gpu_geometry_preserves_seeded_transitions() {
             assert!(report["gpuEvaluations"].as_u64().unwrap() > 0, "{report}");
             assert_eq!(cd.mh_proposals, gd.mh_proposals);
             assert_eq!(cd.mh_accepts, gd.mh_accepts);
+            assert!(
+                gd.mh_accepts > 0,
+                "GPU steric proposals never committed: {report}"
+            );
             for (a, b) in cpu.iter().zip(actual) {
                 assert_eq!(a.structure.to_pdb_string(), b.structure.to_pdb_string());
             }

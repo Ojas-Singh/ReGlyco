@@ -105,9 +105,24 @@ pub struct PreparedEvaluation {
 /// every rejected joint draw (the fast Cookbook ensemble path).
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedSitePose {
-    coordinates: Vec<Vec3>,
+    coordinates: Arc<Vec<Vec3>>,
     excluded_prefix: usize,
-    grid: SpatialGrid,
+    grid: Arc<SpatialGrid>,
+    bounds: Option<([f64; 3], [f64; 3])>,
+}
+
+fn pose_bounds(coordinates: &[Vec3], excluded_prefix: usize) -> Option<([f64; 3], [f64; 3])> {
+    let mut atoms = coordinates.iter().skip(excluded_prefix);
+    let first = atoms.next()?;
+    let mut low = [first.x, first.y, first.z];
+    let mut high = low;
+    for position in atoms {
+        for (axis, value) in [position.x, position.y, position.z].into_iter().enumerate() {
+            low[axis] = low[axis].min(value);
+            high[axis] = high[axis].max(value);
+        }
+    }
+    Some((low, high))
 }
 
 #[derive(Debug, Clone)]
@@ -119,7 +134,15 @@ pub struct PreparedAttachmentContext {
 }
 
 impl PreparedAttachmentContext {
-    pub fn new(protein: &Structure, sites: &[SearchSite]) -> Result<Self, ReGlycoError> {
+    pub(crate) fn site_count(&self) -> usize {
+        self.sites.len()
+    }
+
+    pub fn new(
+        protein: &Structure,
+        sites: &[SearchSite],
+        include_rotamers: bool,
+    ) -> Result<Self, ReGlycoError> {
         if sites.is_empty() || sites.iter().any(|site| site.ensemble.conformers.is_empty()) {
             return Err(ReGlycoError::MissingGlycanAtom("empty ensemble".into()));
         }
@@ -180,23 +203,28 @@ impl PreparedAttachmentContext {
                     })?,
             ];
 
-            let mut rotamer_updates = vec![Vec::new()];
-            let mut rotamer_probabilities = Vec::new();
-            let rotamers = super::dunbrack::rotamers(protein, &site.site.residue);
-            for (rotamer_index, rotamer) in rotamers.iter().enumerate() {
-                let mut rotated = protein.clone();
-                super::dunbrack::apply(&mut rotated, &site.site.residue, rotamer_index)?;
-                let updates = atoms
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, atom)| {
-                        let position = rotated.atom_position(atom.id)?;
-                        (position != atom.position).then_some((index, position))
-                    })
-                    .collect::<Vec<_>>();
-                rotamer_updates.push(updates);
-                rotamer_probabilities.push(rotamer.probability);
-            }
+            let (rotamer_updates, rotamer_probabilities) = if include_rotamers {
+                let mut updates_by_rotamer = vec![Vec::new()];
+                let mut probabilities = Vec::new();
+                let rotamers = super::dunbrack::rotamers(protein, &site.site.residue);
+                for (rotamer_index, rotamer) in rotamers.iter().enumerate() {
+                    let mut rotated = protein.clone();
+                    super::dunbrack::apply(&mut rotated, &site.site.residue, rotamer_index)?;
+                    let updates = atoms
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, atom)| {
+                            let position = rotated.atom_position(atom.id)?;
+                            (position != atom.position).then_some((index, position))
+                        })
+                        .collect::<Vec<_>>();
+                    updates_by_rotamer.push(updates);
+                    probabilities.push(rotamer.probability);
+                }
+                (updates_by_rotamer, probabilities)
+            } else {
+                (vec![Vec::new()], Vec::new())
+            };
 
             let mut poses = Vec::with_capacity(rotamer_updates.len());
             for (_rotamer_slot, updates) in rotamer_updates.iter().enumerate() {
@@ -313,32 +341,34 @@ impl PreparedAttachmentContext {
             // no-rotamer path.
             let dynamic_grid =
                 SpatialGrid::build(&protein_coordinates, self.protein_indices.iter().copied());
-            return Ok((protein_score(
+            let score = protein_score(
                 &coordinates,
                 pose.excluded_prefix,
                 &protein_coordinates,
                 &dynamic_grid,
                 clash_distance,
-            ) <= 1.1)
-                .then(|| PreparedSitePose {
-                    grid: SpatialGrid::build(&coordinates, 0..coordinates.len()),
-                    coordinates,
-                    excluded_prefix: pose.excluded_prefix,
-                }));
+            );
+            return Ok((score <= 1.1).then(|| PreparedSitePose {
+                grid: Arc::new(SpatialGrid::build(&coordinates, 0..coordinates.len())),
+                bounds: pose_bounds(&coordinates, pose.excluded_prefix),
+                coordinates: Arc::new(coordinates),
+                excluded_prefix: pose.excluded_prefix,
+            }));
         }
 
-        Ok((protein_score(
+        let score = protein_score(
             &coordinates,
             pose.excluded_prefix,
             &self.protein_coordinates,
             &self.static_grid,
             clash_distance,
-        ) <= 1.1)
-            .then(|| PreparedSitePose {
-                grid: SpatialGrid::build(&coordinates, 0..coordinates.len()),
-                coordinates,
-                excluded_prefix: pose.excluded_prefix,
-            }))
+        );
+        Ok((score <= 1.1).then(|| PreparedSitePose {
+            grid: Arc::new(SpatialGrid::build(&coordinates, 0..coordinates.len())),
+            bounds: pose_bounds(&coordinates, pose.excluded_prefix),
+            coordinates: Arc::new(coordinates),
+            excluded_prefix: pose.excluded_prefix,
+        }))
     }
 
     pub(crate) fn site_poses_compatible(
@@ -347,6 +377,20 @@ impl PreparedAttachmentContext {
         second: &PreparedSitePose,
         clash_distance: f64,
     ) -> bool {
+        // The full atom/grid test is expensive for the dense all-site pose
+        // tables. Disjoint bounding boxes cannot contain a clashing atom pair.
+        if let (Some((first_low, first_high)), Some((second_low, second_high))) =
+            (first.bounds, second.bounds)
+        {
+            if (0..3).any(|axis| {
+                first_high[axis] + clash_distance <= second_low[axis]
+                    || second_high[axis] + clash_distance <= first_low[axis]
+            }) {
+                return true;
+            }
+        } else {
+            return true;
+        }
         let cell_radius = (clash_distance / GRID_CELL).ceil().max(1.0) as i32;
         pair_score(
             &first.coordinates,
@@ -356,6 +400,7 @@ impl PreparedAttachmentContext {
             clash_distance,
             cell_radius,
             &second.grid,
+            second.bounds,
         ) <= 1.1
     }
 
@@ -570,6 +615,7 @@ impl PreparedAttachmentContext {
                         clash_distance,
                         cell_radius,
                         &glycan_grids[other_index],
+                        None,
                     ));
                 }
                 score
@@ -604,6 +650,44 @@ impl PreparedAttachmentContext {
                 transform_pose(pose, gene.phi, gene.psi)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    fn candidate(points: &[[f64; 3]], excluded_prefix: usize) -> PreparedSitePose {
+        let coordinates = points
+            .iter()
+            .map(|point| Vec3 {
+                x: point[0],
+                y: point[1],
+                z: point[2],
+            })
+            .collect::<Vec<_>>();
+        PreparedSitePose {
+            bounds: pose_bounds(&coordinates, excluded_prefix),
+            grid: Arc::new(SpatialGrid::build(&coordinates, 0..coordinates.len())),
+            coordinates: Arc::new(coordinates),
+            excluded_prefix,
+        }
+    }
+
+    #[test]
+    fn pair_bounds_preserve_clash_decisions_and_ignore_attachment_prefix() {
+        let context = PreparedAttachmentContext {
+            protein_coordinates: Vec::new(),
+            protein_indices: Vec::new(),
+            static_grid: SpatialGrid::build(&[], std::iter::empty()),
+            sites: Vec::new(),
+        };
+        let first = candidate(&[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], 1);
+        let far = candidate(&[[10.0, 0.0, 0.0], [20.0, 0.0, 0.0]], 1);
+        let near = candidate(&[[0.0, 0.0, 0.0], [10.5, 0.0, 0.0]], 1);
+        assert!(context.site_poses_compatible(&first, &far, 1.7));
+        assert!(!context.site_poses_compatible(&first, &near, 1.7));
+        assert!(context.site_poses_compatible(&first, &candidate(&[[10.0, 0.0, 0.0]], 1), 1.7));
     }
 }
 
@@ -733,10 +817,11 @@ fn pair_score(
     first: &[Vec3],
     excluded_first: usize,
     second: &[Vec3],
-    _excluded_second: Option<usize>,
+    excluded_second: Option<usize>,
     threshold: f64,
     cell_radius: i32,
     grid: &SpatialGrid,
+    second_bounds: Option<([f64; 3], [f64; 3])>,
 ) -> f64 {
     let mut candidates = Vec::with_capacity(64);
     let threshold2 = threshold * threshold;
@@ -745,9 +830,23 @@ fn pair_score(
         if first_index < excluded_first {
             continue;
         }
+        if let Some((low, high)) = second_bounds {
+            if first_position.x + threshold <= low[0]
+                || first_position.x - threshold >= high[0]
+                || first_position.y + threshold <= low[1]
+                || first_position.y - threshold >= high[1]
+                || first_position.z + threshold <= low[2]
+                || first_position.z - threshold >= high[2]
+            {
+                continue;
+            }
+        }
         candidates.clear();
         grid.append_candidates(*first_position, cell_radius, &mut candidates);
         for &second_index in &candidates {
+            if second_index < excluded_second.unwrap_or(0) {
+                continue;
+            }
             let second_position = &second[second_index];
             let distance2 = squared_distance(*first_position, *second_position);
             if distance2 < threshold2 {
@@ -884,13 +983,22 @@ impl PreparedAttachmentContext {
         let mut offsets = Vec::new();
         for site in &self.sites {
             offsets.push(library.candidate_atoms);
-            let count = site.poses[0][0].coordinates.len();
+            let Some(default_rotamer) = site.poses.first() else {
+                return Err(ReGlycoError::InvalidGeometry);
+            };
+            let Some(first_pose) = default_rotamer.first() else {
+                return Err(ReGlycoError::InvalidGeometry);
+            };
+            let count = first_pose.coordinates.len();
             library.candidate_atoms += count as u32;
             let mut rotations = Vec::new();
             for (rotamer, poses) in site.poses.iter().enumerate() {
                 let mut conformers = Vec::new();
                 let start = library.updates.len() as u32;
-                for &(index, p) in &site.rotamer_updates[rotamer] {
+                let Some(updates) = site.rotamer_updates.get(rotamer) else {
+                    return Err(ReGlycoError::InvalidGeometry);
+                };
+                for &(index, p) in updates {
                     library.updates.push(ReceptorUpdate {
                         value: point(p),
                         indices: [index as u32, 0, 0, 0],

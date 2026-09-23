@@ -3570,6 +3570,7 @@ dependencies = [
  "reglyco-report",
  "reglyco-saxs",
  "reglyco-validate",
+ "reglyco-workflow",
  "reqwest",
  "serde",
  "serde_json",
@@ -3729,6 +3730,7 @@ name = "reglyco-wasm"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
+ "futures-util",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "instant",
@@ -3761,6 +3763,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.19",
+ "web-time",
 ]
 
 [[package]]

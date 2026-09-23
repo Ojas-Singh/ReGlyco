@@ -4,12 +4,24 @@ use reglyco_workflow::{
     analyze_torsions as workflow_analyze_torsions, capabilities as workflow_capabilities,
     execute_with_control,
 };
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use wasm_bindgen::prelude::*;
 
 #[inline]
 fn install_panic_hook() {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
+}
+
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown Rust panic".into()
 }
 
 #[cfg(feature = "threaded")]
@@ -75,8 +87,16 @@ pub fn execute(request: JsValue, assets: JsValue, progress: Function) -> Result<
     let assets: InputAssets = serde_wasm_bindgen::from_value(assets)
         .map_err(|error| JsValue::from_str(&format!("invalid ReGlyco assets: {error}")))?;
     let mut control = JsControl { callback: progress };
-    let result = execute_with_control(&request, &assets, &mut control)
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        execute_with_control(&request, &assets, &mut control)
+    }))
+    .map_err(|panic| {
+        JsValue::from_str(&format!(
+            "ReGlyco execution panic: {}",
+            panic_message(panic)
+        ))
+    })?
+    .map_err(|error| JsValue::from_str(&error.to_string()))?;
     serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
@@ -115,78 +135,95 @@ pub async fn execute_async(
     progress: Function,
 ) -> Result<JsValue, JsValue> {
     install_panic_hook();
-    let request: ReGlycoRunRequestV1 =
-        serde_wasm_bindgen::from_value(request).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let assets: InputAssets =
-        serde_wasm_bindgen::from_value(assets).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let eligible = matches!(
-        request.workflow,
-        reglyco_workflow::WorkflowId::Uniprot
-            | reglyco_workflow::WorkflowId::SiteBuild
-            | reglyco_workflow::WorkflowId::Ensemble
-    );
-    reglyco_ensemble::gpu::configure(if eligible {
-        &request.options.compute_backend
-    } else {
-        "cpu"
-    });
-    let callback = progress.clone();
-    reglyco_ensemble::gpu::set_progress(move |backend| {
-        let event = ProgressEvent {
-            stage: format!("compute_{backend}"),
-            message: if backend == "webgpu" {
-                "Compute: GPU".into()
-            } else {
-                "Compute: CPU fallback".into()
-            },
-            current: None,
-            total: None,
-            fraction: None,
-        };
-        if let Ok(value) = serde_wasm_bindgen::to_value(&event) {
-            let _ = callback.call1(&JsValue::NULL, &value);
+    // Keep the entire adapter body inside one unwind boundary.  The previous
+    // boundary covered only the workflow future, leaving setup, diagnostics,
+    // and report serialization able to escape as an opaque wasm `unreachable`
+    // trap.  A trapped GPU wasm instance cannot be called again, so the worker
+    // needs the original panic classified as a recoverable GPU failure.
+    let outcome = futures_util::FutureExt::catch_unwind(AssertUnwindSafe(async move {
+        let request: ReGlycoRunRequestV1 = serde_wasm_bindgen::from_value(request)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let assets: InputAssets = serde_wasm_bindgen::from_value(assets)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let eligible = matches!(
+            request.workflow,
+            reglyco_workflow::WorkflowId::NScan
+                | reglyco_workflow::WorkflowId::Uniprot
+                | reglyco_workflow::WorkflowId::SiteBuild
+                | reglyco_workflow::WorkflowId::Ensemble
+        );
+        reglyco_ensemble::gpu::configure(if eligible {
+            &request.options.compute_backend
+        } else {
+            "cpu"
+        });
+        let callback = progress.clone();
+        reglyco_ensemble::gpu::set_progress(move |backend| {
+            let event = ProgressEvent {
+                stage: format!("compute_{backend}"),
+                message: if backend == "webgpu" {
+                    "Compute: GPU".into()
+                } else {
+                    "Compute: CPU fallback".into()
+                },
+                current: None,
+                total: None,
+                fraction: None,
+            };
+            if let Ok(value) = serde_wasm_bindgen::to_value(&event) {
+                let _ = callback.call1(&JsValue::NULL, &value);
+            }
+        });
+        let mut control = JsControl { callback: progress };
+        let result = reglyco_workflow::execute_with_control_async(&request, &assets, &mut control)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let diagnostics = reglyco_ensemble::gpu::finish();
+        let mut bundle = result;
+        if let Some(analysis) = bundle.report.analysis.as_object_mut() {
+            if let Some(energy) = analysis
+                .get_mut("energyAnalysis")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                energy.insert(
+                    "backend".into(),
+                    diagnostics
+                        .get("actualBackend")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::Value::String("CPU".into())),
+                );
+            }
         }
-    });
-    let mut control = JsControl { callback: progress };
-    let result =
-        reglyco_workflow::execute_with_control_async(&request, &assets, &mut control).await;
-    let diagnostics = reglyco_ensemble::gpu::finish();
-    let mut bundle = result.map_err(|e| JsValue::from_str(&e.to_string()))?;
-    if let Some(analysis) = bundle.report.analysis.as_object_mut() {
-        if let Some(energy) = analysis
-            .get_mut("energyAnalysis")
-            .and_then(serde_json::Value::as_object_mut)
+        // The workflow assembled the CSV before the asynchronous GPU session
+        // published its final backend classification. Refresh it so JSON and
+        // CSV carry the same actual execution label.
+        if let Some(artifact) = bundle
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.name == "energy.csv")
         {
-            energy.insert(
-                "backend".into(),
-                diagnostics
-                    .get("actualBackend")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::Value::String("CPU".into())),
+            artifact.data = reglyco_workflow::AssetData::Text(
+                reglyco_workflow::energy_analysis_csv(&bundle.report.analysis),
             );
         }
-    }
-    // The workflow assembled the CSV before the asynchronous GPU session
-    // published its final backend classification. Refresh it so JSON and CSV
-    // carry the same actual execution label.
-    if let Some(artifact) = bundle
-        .artifacts
-        .iter_mut()
-        .find(|artifact| artifact.name == "energy.csv")
-    {
-        artifact.data = reglyco_workflow::AssetData::Text(reglyco_workflow::energy_analysis_csv(
-            &bundle.report.analysis,
-        ));
-    }
-    bundle.report.analysis["compute"] = diagnostics;
-    let report = serde_json::to_string_pretty(&bundle.report)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    for artifact in &mut bundle.artifacts {
-        if artifact.name == "report.json" {
-            artifact.data = reglyco_workflow::AssetData::Text(report.clone());
+        bundle.report.analysis["compute"] = diagnostics;
+        let report = serde_json::to_string_pretty(&bundle.report)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        for artifact in &mut bundle.artifacts {
+            if artifact.name == "report.json" {
+                artifact.data = reglyco_workflow::AssetData::Text(report.clone());
+            }
         }
+        serde_json::to_string(&bundle)
+            .map(|json| JsValue::from_str(&json))
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }))
+    .await;
+    match outcome {
+        Ok(result) => result,
+        Err(panic) => Err(JsValue::from_str(&format!(
+            "GPU execution panic: {}",
+            panic_message(panic)
+        ))),
     }
-    serde_json::to_string(&bundle)
-        .map(|json| JsValue::from_str(&json))
-        .map_err(|e| JsValue::from_str(&e.to_string()))
 }

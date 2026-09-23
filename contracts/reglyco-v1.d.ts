@@ -78,6 +78,16 @@ export interface SearchDiagnostics {
     phiDegrees?: number; psiDegrees?: number; stericScore?: number; populationSource?: string }>;
   populationSources?: string[];
 }
+export type SearchBudgetMode = 'auto' | 'manual';
+export interface SearchBudgetResolution {
+  version: string; requestedMode: SearchBudgetMode;
+  populationSize: number; generations: number; totalBudget: number;
+  requiredWork: number; autoCapPopulation: number; autoCapGenerations: number;
+  capped: boolean; siteCount: number; componentSizes: number[]; graphEdges: number;
+  maximumDegree: number; largestComponentSize: number; sitePoseNeeds: number[];
+  conformerCounts: number[]; vmmBasinCounts: number[]; rotamerCounts: number[];
+  terminationReason?: string | null;
+}
 export interface TorsionPopulation {
   index: number; level?: number; parentIndex?: number; color?: string; weight?: number;
   phiMean?: number; psiMean?: number; omegaMean?: number;
@@ -130,6 +140,7 @@ export interface ReportAnalysis {
   attachmentReferences?: AttachmentReference[]; attachmentObservations?: AttachmentTorsionObservation[];
   ensembleTorsion?: EnsembleTorsionSummary; clusterDistributions?: TorsionClusterDistribution[];
   searchDiagnostics?: SearchDiagnostics;
+  searchBudget?: SearchBudgetResolution;
   [key: string]: unknown;
 }
 export interface ReGlycoOptions {
@@ -144,6 +155,8 @@ export interface ReGlycoOptions {
   seed?: number;
   /** Provider residue-name convention for Build/Ensemble; omitted legacy requests mean PDB. */
   outputFormat?: 'PDB' | 'GLYCAM';
+  /** Search budget selection for attachment Build/Ensemble workflows. */
+  searchBudgetMode?: SearchBudgetMode;
   postRelax: boolean; scanRotamers: boolean;
   ensembleFrames: number; ensembleTemperatureK: number;
   ensembleMhChains: number; ensembleBurnInSweeps: number;

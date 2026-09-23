@@ -432,22 +432,33 @@ impl Runtime {
             gradients: gradient,
             ..Default::default()
         };
-        let result = match self
-            .scoring
-            .as_mut()
-            .expect("scoring session initialized")
-            .evaluate(&poses, &request)
-            .await
-        {
-            Ok(result) => result,
-            Err(error) if self.report.requested == "auto" => {
-                self.fallback(error.to_string());
-                return self.cpu_batch(c, points, active, gradient, interaction);
+        let result = match self.scoring.as_mut() {
+            Some(scoring) => match scoring.evaluate(&poses, &request).await {
+                Ok(result) => result,
+                Err(error) if self.report.requested == "auto" => {
+                    self.fallback(error.to_string());
+                    return self.cpu_batch(c, points, active, gradient, interaction);
+                }
+                Err(error) => return Err(EnsembleError::Metadata(error.to_string())),
+            },
+            None => {
+                let reason = "GPU scoring session disappeared before evaluation";
+                if self.report.requested == "auto" {
+                    self.fallback(reason.into());
+                    return self.cpu_batch(c, points, active, gradient, interaction);
+                }
+                return Err(EnsembleError::Metadata(reason.into()));
             }
-            Err(error) => return Err(EnsembleError::Metadata(error.to_string())),
         };
         let (actual_gpu, fallback_reason) = {
-            let session = self.scoring.as_ref().expect("scoring session initialized");
+            let Some(session) = self.scoring.as_ref() else {
+                let reason = "GPU scoring session disappeared after evaluation";
+                if self.report.requested == "auto" {
+                    self.fallback(reason.into());
+                    return self.cpu_batch(c, points, active, gradient, interaction);
+                }
+                return Err(EnsembleError::Metadata(reason.into()));
+            };
             (
                 session
                     .diagnostics()
@@ -569,34 +580,56 @@ async fn evaluate_candidates_owned(
                 break;
             }
             let values = runtime.evaluate(c, &points, &masks, true, false).await?;
+            if values.len() != indices.len() {
+                return Err(EnsembleError::Metadata(format!(
+                    "energy evaluator returned {} results for {} minimization trials",
+                    values.len(),
+                    indices.len()
+                )));
+            }
             for (slot, mut value) in values.into_iter().enumerate() {
                 let index = indices[slot];
                 // Convergence is decided from f64 CPU gradients, never solely f32.
-                if value
-                    .gradients
-                    .as_ref()
-                    .unwrap()
+                let gradients = value.gradients.as_ref().ok_or_else(|| {
+                    EnsembleError::Metadata(
+                        "energy evaluator omitted gradients for a minimization trial".into(),
+                    )
+                })?;
+                if gradients
                     .iter()
                     .flat_map(|g| [g.x, g.y, g.z])
                     .all(|g| g.abs() <= config.gradient_tolerance)
                 {
                     value = cpu(c, &points[slot], &masks[slot], true, false)?;
                 }
+                let gradient_values = value.gradients.as_ref().ok_or_else(|| {
+                    EnsembleError::Metadata(
+                        "energy evaluator omitted gradients for a minimization trial".into(),
+                    )
+                })?;
                 let gradient = active[index]
                     .iter()
-                    .flat_map(|&i| {
-                        let g = value.gradients.as_ref().unwrap()[i];
-                        [g.x, g.y, g.z]
+                    .map(|&i| {
+                        gradient_values.get(i).ok_or_else(|| {
+                            EnsembleError::Metadata(format!(
+                                "energy evaluator returned no gradient for active atom {i}"
+                            ))
+                        })
                     })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flat_map(|g| [g.x, g.y, g.z])
                     .collect();
                 states[index].submit(value.total(), gradient)?;
             }
         }
         for ((p, state), mask) in coordinates.iter_mut().zip(states).zip(&active) {
-            for (&i, v) in mask
-                .iter()
-                .zip(state.outcome().unwrap().point.chunks_exact(3))
-            {
+            let Some(outcome) = state.outcome() else {
+                return Err(EnsembleError::Metadata(
+                    "minimizer ended without an outcome".into(),
+                ));
+            };
+            for (&i, v) in mask.iter().zip(outcome.point.chunks_exact(3)) {
                 p[i] = Vec3 {
                     x: v[0],
                     y: v[1],
@@ -720,7 +753,12 @@ where
                 scores[i] = problem.evaluate(state);
             }
             if !structures.is_empty() {
-                let context = problem.energy_context.unwrap();
+                let Some(context) = problem.energy_context else {
+                    for (i, _) in indices.iter().zip(&structures) {
+                        scores[*i] = problem.evaluate(&checkpoint.population()[*i]);
+                    }
+                    continue;
+                };
                 match evaluate_candidates(context, &structures, false).await {
                     Ok(values) => {
                         for (i, value) in indices.into_iter().zip(values) {
