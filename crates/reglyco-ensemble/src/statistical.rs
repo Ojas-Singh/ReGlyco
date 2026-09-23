@@ -371,6 +371,7 @@ pub(super) async fn sample_statistical<C>(
     config: &SearchConfig,
     builder: &glysys::SystemBuilder,
     mut cancelled: C,
+    mut progress: impl FnMut(usize, usize, usize, usize),
 ) -> Result<(Vec<SampledFrame>, EnsembleSamplingDiagnostics)>
 where
     C: FnMut() -> bool,
@@ -1093,6 +1094,9 @@ where
                     context.as_ref().map(|_| *energy),
                 ));
             }
+        }
+        if step.is_multiple_of(5) || result.len() == frames {
+            progress(step.min(final_step), final_step, result.len(), frames);
         }
         step = step.saturating_add(1);
     }

@@ -5657,6 +5657,10 @@ pub fn sample_attached_ensemble(
     sync(keep_self),
     async(feature = "webgpu"),
     idents(
+        sample_attached_ensemble_with_progress_cancel(
+            sync,
+            async = "sample_attached_ensemble_with_progress_cancel_async"
+        ),
         genetic_optimize_with_progress_cancelled(sync, async = "gpu_optimize"),
         evaluate_candidate(sync, async = "gpu_evaluate_candidate"),
         start_compute_stage(sync, async = "start_compute_stage_async"),
@@ -5673,10 +5677,52 @@ pub async fn sample_attached_ensemble_with_cancel<C>(
     frames: usize,
     config: &SearchConfig,
     builder: &glysys::SystemBuilder,
-    mut cancelled: C,
+    cancelled: C,
 ) -> Result<(Vec<SampledFrame>, EnsembleSamplingDiagnostics)>
 where
     C: FnMut() -> bool,
+{
+    sample_attached_ensemble_with_progress_cancel(
+        protein,
+        sites,
+        frames,
+        config,
+        builder,
+        cancelled,
+        |_, _, _, _| {},
+    )
+    .await
+}
+
+/// Sample an attached ensemble while reporting sampler-step progress.
+/// `step`/`total_steps` track MCMC work, while `frames_complete`/`frames_requested`
+/// track output materialization; this keeps the UI informative during burn-in.
+#[maybe_async_cfg::maybe(
+    sync(keep_self),
+    async(feature = "webgpu"),
+    idents(
+        genetic_optimize_with_progress_cancelled(sync, async = "gpu_optimize"),
+        evaluate_candidate(sync, async = "gpu_evaluate_candidate"),
+        start_compute_stage(sync, async = "start_compute_stage_async"),
+        sample_statistical(sync, async = "sample_statistical_async"),
+        cookbook_steric_search_with_cancel(
+            sync,
+            async = "cookbook_steric_search_with_cancel_async"
+        )
+    )
+)]
+pub async fn sample_attached_ensemble_with_progress_cancel<C, P>(
+    protein: &Structure,
+    sites: &[SearchSite],
+    frames: usize,
+    config: &SearchConfig,
+    builder: &glysys::SystemBuilder,
+    mut cancelled: C,
+    progress: P,
+) -> Result<(Vec<SampledFrame>, EnsembleSamplingDiagnostics)>
+where
+    C: FnMut() -> bool,
+    P: FnMut(usize, usize, usize, usize),
 {
     start_compute_stage().await;
     if cancelled() {
@@ -5710,7 +5756,8 @@ where
                 "sampled ensembles cannot minimize proposals; choose conformer_collection".into(),
             ));
         }
-        return sample_statistical(protein, sites, frames, config, builder, cancelled).await;
+        return sample_statistical(protein, sites, frames, config, builder, cancelled, progress)
+            .await;
     }
     validate_site_priors(protein, sites)?;
     let preparation_started = Instant::now();
@@ -6464,6 +6511,24 @@ fn sampled_frame_from_state(
 ) -> SampledFrame {
     let mut results = Vec::with_capacity(sites.len());
     let mut log_native_probability = 0.0;
+    // Stream atoms once and retain only glycan coordinates. Calling
+    // `Structure::atoms()` inside the site loop deep-cloned the complete
+    // multi-site structure (including every atom string) once per site,
+    // exhausting browser WASM memory while materializing larger ensembles.
+    let mut coordinates_by_site = vec![Vec::new(); sites.len()];
+    let mut residue_sites = HashMap::new();
+    for (site_index, tree) in structure.metadata().glycan_trees.iter().enumerate() {
+        for residue in &tree.residue_ids {
+            residue_sites.insert(residue.clone(), site_index);
+        }
+    }
+    for atom in structure.iter_atoms() {
+        if let Some(&site_index) = residue_sites.get(&atom.residue) {
+            if let Some(coordinates) = coordinates_by_site.get_mut(site_index) {
+                coordinates.push(atom.position);
+            }
+        }
+    }
     for (index, (gene, site)) in state.iter().zip(sites).enumerate() {
         let conformer = &site.ensemble.conformers[gene.conformer];
         let priors = resolved_priors(protein, site, &conformer.priors);
@@ -6486,14 +6551,10 @@ fn sampled_frame_from_state(
             f64::INFINITY
         };
         log_native_probability -= prior_score;
-        let tree = &structure.metadata().glycan_trees[index];
-        let residues = tree.residue_ids.iter().cloned().collect::<BTreeSet<_>>();
-        let coordinates = structure
-            .atoms()
-            .into_iter()
-            .filter(|atom| residues.contains(&atom.residue))
-            .map(|atom| atom.position)
-            .collect();
+        let coordinates = coordinates_by_site
+            .get_mut(index)
+            .map(std::mem::take)
+            .unwrap_or_default();
         let phi_component = phi_components.and_then(|components| components.get(index).copied());
         let psi_component = psi_components.and_then(|components| components.get(index).copied());
         let phi_within_vmm95 = phi_component.and_then(|component| {

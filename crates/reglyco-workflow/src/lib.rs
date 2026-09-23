@@ -1,9 +1,10 @@
 //! Pure, in-memory workflow boundary shared by native and browser clients.
 #[cfg(feature = "webgpu")]
 use reglyco_ensemble::{
-    sample_attached_ensemble_with_cancel_async, search_with_progress_cancelled_async,
+    sample_attached_ensemble_with_progress_cancel_async, search_with_progress_cancelled_async,
 };
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 /// `web_time` mirrors `std::time::Instant` on native targets while
@@ -24,7 +25,8 @@ use reglyco_core::{
 use reglyco_ensemble::{
     EnsembleError, SearchPhase, SearchProgress, StrictSearchDiagnostics, build_from_outcome,
     calculate_sasa, ensemble_from_pdb, linkage_priors_for_glycan, resolve_search_budget,
-    sample_attached_ensemble_with_cancel, search_with_progress_cancelled, steric_site_scores,
+    sample_attached_ensemble_with_progress_cancel, search_with_progress_cancelled,
+    steric_site_scores,
 };
 use reglyco_relax::{MovableSelection, RelaxOptions, RelaxProgress, relax_with_progress};
 use reglyco_validate::{Severity, StericPolicy, ValidationFinding as NativeFinding, validate};
@@ -193,7 +195,7 @@ fn default_ensemble_temperature_k() -> f64 {
 }
 
 fn default_ensemble_mh_chains() -> usize {
-    4
+    8
 }
 
 fn default_ensemble_burn_in_sweeps() -> usize {
@@ -2326,9 +2328,9 @@ fn split_pdb_models(pdb: &str) -> Vec<String> {
     async(feature = "webgpu"),
     idents(
         search_with_progress_cancelled(sync, async = "search_with_progress_cancelled_async"),
-        sample_attached_ensemble_with_cancel(
+        sample_attached_ensemble_with_progress_cancel(
             sync,
-            async = "sample_attached_ensemble_with_cancel_async"
+            async = "sample_attached_ensemble_with_progress_cancel_async"
         )
     )
 )]
@@ -2690,16 +2692,32 @@ pub async fn execute_with_control(
                 Some(0),
                 Some(request.options.ensemble_frames),
             )?;
-            let (mut frames, diagnostics) = match sample_attached_ensemble_with_cancel(
+            let control_cell = RefCell::new(&mut *control);
+            let sampling_result = sample_attached_ensemble_with_progress_cancel(
                 &protein,
                 &sites,
                 request.options.ensemble_frames,
                 &config,
                 &builder,
-                || control.cancelled(),
+                || control_cell.borrow().cancelled(),
+                |step, total_steps, frames_complete, frames_requested| {
+                    let total = total_steps.max(1);
+                    let message = format!(
+                        "Sampling {}-site ensemble: step {step}/{total_steps}; {frames_complete}/{frames_requested} frames",
+                        sites.len()
+                    );
+                    control_cell.borrow_mut().progress(ProgressEvent {
+                        stage: "ensemble".into(),
+                        message,
+                        current: Some(step),
+                        total: Some(total),
+                        fraction: Some(step as f64 / total as f64),
+                    });
+                },
             )
-            .await
-            {
+            .await;
+            drop(control_cell);
+            let (mut frames, diagnostics) = match sampling_result {
                 Ok(result) => result,
                 Err(EnsembleError::StrictVmmFailure { diagnostics }) => {
                     return finish_strict_failure(
@@ -6854,7 +6872,7 @@ END
         assert_eq!(request.options.ensemble_frames, 50);
         assert!(!request.options.scan_rotamers);
         assert_eq!(request.options.ensemble_temperature_k, 300.0);
-        assert_eq!(request.options.ensemble_mh_chains, 4);
+        assert_eq!(request.options.ensemble_mh_chains, 8);
         assert_eq!(request.options.ensemble_burn_in_sweeps, 250);
         assert_eq!(request.options.ensemble_thinning_accepted, 50);
         assert_eq!(serde_json::to_value(request).unwrap()["schemaVersion"], 1);
