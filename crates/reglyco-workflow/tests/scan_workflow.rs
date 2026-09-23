@@ -85,7 +85,10 @@ fn two_site_scan_checks_joint_compatibility_directly() {
     let assets = scan_assets(PROTEIN_TWO_SITES);
     let bundle = execute(&request, &assets).expect("two-site scan executes");
     let analysis = &bundle.report.analysis;
-    assert_eq!(analysis["structuralAccessibilityComputed"], true, "{analysis}");
+    assert_eq!(
+        analysis["structuralAccessibilityComputed"], true,
+        "{analysis}"
+    );
     assert_eq!(analysis["jointlyCompatibleCount"], 2, "{analysis}");
 }
 

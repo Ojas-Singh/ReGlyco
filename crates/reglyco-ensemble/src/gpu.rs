@@ -805,6 +805,19 @@ where
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geometry_fallback_notifies_cpu_backend() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = events.clone();
+        set_progress(move |backend| observed.borrow_mut().push(backend.to_owned()));
+
+        geometry_fallback("GPU test fallback".into());
+
+        assert_eq!(events.borrow().as_slice(), &[String::from("cpu")]);
+        let _ = finish();
+    }
+
     #[test]
     #[ignore = "requires a Vulkan adapter; software is correctness evidence only"]
     fn attached_energy_batches_and_minimization_are_cpu_verified() {
@@ -971,4 +984,8 @@ pub(super) fn geometry_fallback(reason: String) {
             .fallback_reason = Some(reason.clone());
         r.report.fallback_reason = Some(reason);
     });
+    // Geometry can continue on the CPU without returning an error to the
+    // worker. Publish the transition so the UI does not remain at
+    // "Checking GPU" while CPU generations proceed.
+    notify("cpu");
 }

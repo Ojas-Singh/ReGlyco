@@ -660,7 +660,11 @@ mod bounds_tests {
     fn candidate(points: &[[f64; 3]], excluded_prefix: usize) -> PreparedSitePose {
         let coordinates = points
             .iter()
-            .map(|point| Vec3 { x: point[0], y: point[1], z: point[2] })
+            .map(|point| Vec3 {
+                x: point[0],
+                y: point[1],
+                z: point[2],
+            })
             .collect::<Vec<_>>();
         PreparedSitePose {
             bounds: pose_bounds(&coordinates, excluded_prefix),

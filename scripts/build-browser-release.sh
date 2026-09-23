@@ -27,7 +27,7 @@ build_threaded_variant() {
   target_dir="${workspace_dir}/target/browser-release-cache/${variant/full-gpu/full}"
   mkdir -p "${stage_dir}"
   CARGO_TARGET_DIR="${target_dir}" rustup run nightly-2026-07-15 cargo build -Z build-std=panic_abort,std \
-    --config 'target.wasm32-unknown-unknown.rustflags=["-C","target-feature=+atomics,+bulk-memory,+mutable-globals","-C","link-arg=--shared-memory","-C","link-arg=--import-memory","-C","link-arg=--max-memory=4294967296","-C","link-arg=--export=__wasm_init_tls","-C","link-arg=--export=__tls_size","-C","link-arg=--export=__tls_align","-C","link-arg=--export=__tls_base","--cfg","getrandom_backend=\"custom\""]' \
+    --config 'target.wasm32-unknown-unknown.rustflags=["-C","target-feature=+atomics,+bulk-memory,+mutable-globals","-C","link-arg=--shared-memory","-C","link-arg=--import-memory","-C","link-arg=--max-memory=4294967296","-C","link-arg=--export=__wasm_init_tls","-C","link-arg=--export=__tls_size","-C","link-arg=--export=__tls_align","-C","link-arg=--export=__tls_base","-C","link-arg=--export=__heap_base","-C","link-arg=--export=__data_end","-C","link-arg=--export=__stack_pointer","--cfg","getrandom_backend=\"custom\""]' \
     --manifest-path "${workspace_dir}/Cargo.toml" --release --target wasm32-unknown-unknown \
     -p reglyco-wasm --no-default-features --features "${features}"
   wasm-bindgen "${target_dir}/wasm32-unknown-unknown/release/reglyco_wasm.wasm" --target web --out-dir "${stage_dir}" --out-name reglyco
@@ -94,7 +94,7 @@ if [[ "${gpu_enabled}" == true ]]; then
 import hashlib,json,sys
 from pathlib import Path
 root=Path(sys.argv[1]);p=root/'manifest.json';m=json.loads(p.read_text())
-for variant,key in [('full-gpu-single','fullGpuSingle'),('full-gpu-threaded','fullGpuThreaded')]:
+for variant,key in [('full-gpu-single','fullGpuSingle')]:
     js=root/variant/'reglyco.js';wasm=root/variant/'reglyco_bg.wasm'
     if js.exists() and wasm.exists():
         m['artifacts'][key]={'js':str(js.relative_to(root)),'jsSha256':hashlib.sha256(js.read_bytes()).hexdigest(),'wasm':str(wasm.relative_to(root)),'wasmSha256':hashlib.sha256(wasm.read_bytes()).hexdigest()}

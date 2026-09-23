@@ -5044,6 +5044,13 @@ fn cookbook_compatible_pool_sample_once(
                 } else {
                     vec![None]
                 };
+                let coverage_offset = seed_round as usize;
+                let coverage_limit = max_attempts.saturating_mul(3) / 4;
+                // No conformer stream can consume more than the complete
+                // round allowance. Retain exactly the reachable prefix,
+                // preserving probe order without materializing unused grids.
+                let stream_limit = coverage_offset.saturating_add(coverage_limit.max(1));
+
                 let mut candidate_sets = Vec::with_capacity(conformers.len());
                 for (conformer_index, _) in &conformers {
                     let priors = resolved_priors(
@@ -5051,6 +5058,20 @@ fn cookbook_compatible_pool_sample_once(
                         site,
                         &site.ensemble.conformers[*conformer_index].priors,
                     );
+                    // Resolve widths once per component, outside the angular
+                    // grid. The shared width cache otherwise becomes a
+                    // contended lock for every probe in threaded WASM.
+                    let phi_widths = priors
+                        .phi
+                        .iter()
+                        .map(probability_half_width_degrees)
+                        .collect::<Vec<_>>();
+                    let psi_widths = priors
+                        .psi
+                        .iter()
+                        .map(probability_half_width_degrees)
+                        .collect::<Vec<_>>();
+
                     let mut component_pairs = priors
                         .phi
                         .iter()
@@ -5098,7 +5119,8 @@ fn cookbook_compatible_pool_sample_once(
                         }
                     }
                     let mut candidates = Vec::new();
-                    for &rotamer in &rotamers {
+                    'rotamers: for &rotamer in &rotamers {
+
                         // Balance the two discrete dimensions.  A simple
                         // component-major or offset-major nested loop can
                         // spend a small frontier on one dimension and miss a
@@ -5109,6 +5131,10 @@ fn cookbook_compatible_pool_sample_once(
                         let offset_count = offset_pairs.len().max(1);
                         let total = component_pairs.len().saturating_mul(offset_count);
                         for candidate_index in 0..total {
+                            if candidates.len() >= stream_limit {
+                                break 'rotamers;
+                            }
+
                             let component_index = candidate_index % component_count;
                             let offset_index = (candidate_index / component_count) % offset_count;
                             let (phi_component_index, psi_component_index, _) =
@@ -5125,13 +5151,12 @@ fn cookbook_compatible_pool_sample_once(
                                     conformer: *conformer_index,
                                     phi: wrap_degrees(
                                         phi_component.mean_degrees
-                                            + phi_offset
-                                                * probability_half_width_degrees(phi_component),
+                                            + phi_offset * phi_widths[phi_component_index],
                                     ),
                                     psi: wrap_degrees(
                                         psi_component.mean_degrees
-                                            + psi_offset
-                                                * probability_half_width_degrees(psi_component),
+                                            + psi_offset * psi_widths[psi_component_index],
+
                                     ),
                                     rotamer,
                                 },
@@ -5148,7 +5173,7 @@ fn cookbook_compatible_pool_sample_once(
                 // spend the entire new allowance replaying already-seen
                 // central component pairs and would never reach the angular
                 // basins needed by a later conformer.
-                let coverage_offset = seed_round as usize;
+
                 let mut cursors = candidate_sets
                     .iter()
                     .map(|candidates| coverage_offset.min(candidates.len()))
@@ -5157,7 +5182,7 @@ fn cookbook_compatible_pool_sample_once(
                 // supplementation. The grid guarantees broad conformer and
                 // component coverage, while seeded draws can still land in a
                 // narrow off-centre basin between those probes.
-                let coverage_limit = max_attempts.saturating_mul(3) / 4;
+
                 'coverage: loop {
                     let mut progressed = false;
                     for (candidates, cursor) in candidate_sets.iter().zip(&mut cursors) {
@@ -5639,6 +5664,10 @@ pub fn sample_attached_ensemble(
     sync(keep_self),
     async(feature = "webgpu"),
     idents(
+        sample_attached_ensemble_with_progress_cancel(
+            sync,
+            async = "sample_attached_ensemble_with_progress_cancel_async"
+        ),
         genetic_optimize_with_progress_cancelled(sync, async = "gpu_optimize"),
         evaluate_candidate(sync, async = "gpu_evaluate_candidate"),
         start_compute_stage(sync, async = "start_compute_stage_async"),
@@ -5655,10 +5684,52 @@ pub async fn sample_attached_ensemble_with_cancel<C>(
     frames: usize,
     config: &SearchConfig,
     builder: &glysys::SystemBuilder,
-    mut cancelled: C,
+    cancelled: C,
 ) -> Result<(Vec<SampledFrame>, EnsembleSamplingDiagnostics)>
 where
     C: FnMut() -> bool,
+{
+    sample_attached_ensemble_with_progress_cancel(
+        protein,
+        sites,
+        frames,
+        config,
+        builder,
+        cancelled,
+        |_, _, _, _| {},
+    )
+    .await
+}
+
+/// Sample an attached ensemble while reporting sampler-step progress.
+/// `step`/`total_steps` track MCMC work, while `frames_complete`/`frames_requested`
+/// track output materialization; this keeps the UI informative during burn-in.
+#[maybe_async_cfg::maybe(
+    sync(keep_self),
+    async(feature = "webgpu"),
+    idents(
+        genetic_optimize_with_progress_cancelled(sync, async = "gpu_optimize"),
+        evaluate_candidate(sync, async = "gpu_evaluate_candidate"),
+        start_compute_stage(sync, async = "start_compute_stage_async"),
+        sample_statistical(sync, async = "sample_statistical_async"),
+        cookbook_steric_search_with_cancel(
+            sync,
+            async = "cookbook_steric_search_with_cancel_async"
+        )
+    )
+)]
+pub async fn sample_attached_ensemble_with_progress_cancel<C, P>(
+    protein: &Structure,
+    sites: &[SearchSite],
+    frames: usize,
+    config: &SearchConfig,
+    builder: &glysys::SystemBuilder,
+    mut cancelled: C,
+    progress: P,
+) -> Result<(Vec<SampledFrame>, EnsembleSamplingDiagnostics)>
+where
+    C: FnMut() -> bool,
+    P: FnMut(usize, usize, usize, usize),
 {
     start_compute_stage().await;
     if cancelled() {
@@ -5692,7 +5763,8 @@ where
                 "sampled ensembles cannot minimize proposals; choose conformer_collection".into(),
             ));
         }
-        return sample_statistical(protein, sites, frames, config, builder, cancelled).await;
+        return sample_statistical(protein, sites, frames, config, builder, cancelled, progress)
+            .await;
     }
     validate_site_priors(protein, sites)?;
     let preparation_started = Instant::now();
@@ -6446,6 +6518,24 @@ fn sampled_frame_from_state(
 ) -> SampledFrame {
     let mut results = Vec::with_capacity(sites.len());
     let mut log_native_probability = 0.0;
+    // Stream atoms once and retain only glycan coordinates. Calling
+    // `Structure::atoms()` inside the site loop deep-cloned the complete
+    // multi-site structure (including every atom string) once per site,
+    // exhausting browser WASM memory while materializing larger ensembles.
+    let mut coordinates_by_site = vec![Vec::new(); sites.len()];
+    let mut residue_sites = HashMap::new();
+    for (site_index, tree) in structure.metadata().glycan_trees.iter().enumerate() {
+        for residue in &tree.residue_ids {
+            residue_sites.insert(residue.clone(), site_index);
+        }
+    }
+    for atom in structure.iter_atoms() {
+        if let Some(&site_index) = residue_sites.get(&atom.residue) {
+            if let Some(coordinates) = coordinates_by_site.get_mut(site_index) {
+                coordinates.push(atom.position);
+            }
+        }
+    }
     for (index, (gene, site)) in state.iter().zip(sites).enumerate() {
         let conformer = &site.ensemble.conformers[gene.conformer];
         let priors = resolved_priors(protein, site, &conformer.priors);
@@ -6468,14 +6558,10 @@ fn sampled_frame_from_state(
             f64::INFINITY
         };
         log_native_probability -= prior_score;
-        let tree = &structure.metadata().glycan_trees[index];
-        let residues = tree.residue_ids.iter().cloned().collect::<BTreeSet<_>>();
-        let coordinates = structure
-            .atoms()
-            .into_iter()
-            .filter(|atom| residues.contains(&atom.residue))
-            .map(|atom| atom.position)
-            .collect();
+        let coordinates = coordinates_by_site
+            .get_mut(index)
+            .map(std::mem::take)
+            .unwrap_or_default();
         let phi_component = phi_components.and_then(|components| components.get(index).copied());
         let psi_component = psi_components.and_then(|components| components.get(index).copied());
         let phi_within_vmm95 = phi_component.and_then(|component| {
