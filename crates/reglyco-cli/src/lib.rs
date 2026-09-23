@@ -14,8 +14,8 @@ use reglyco_build::{
     remove_glycan_at_site, scan_n_linked_sequons,
 };
 use reglyco_core::{
-    Anomer, GlycanQuery, GlycanSource, GlycosylationSite, ResidueNameFormat, SearchConfig,
-    SearchScoringMode, SearchSelectionPolicy, SearchSite,
+    Anomer, GlycanQuery, GlycanSource, GlycosylationSite, ResidueNameFormat, SearchBudgetMode,
+    SearchBudgetResolution, SearchConfig, SearchScoringMode, SearchSelectionPolicy, SearchSite,
 };
 use reglyco_density::rcsb::{RcsbMapAcquisition, fetch_2fo_fc_map};
 use reglyco_density::{
@@ -23,7 +23,7 @@ use reglyco_density::{
 };
 use reglyco_ensemble::{
     CachingProvider, EnsembleProvider, GlycoShapeProvider, LocalBundleProvider, SearchPhase,
-    SearchProgress, build_from_outcome, calculate_sasa, configure_threads,
+    SearchProgress, build_from_outcome, calculate_sasa, configure_threads, resolve_search_budget,
     sample_attached_ensemble, search, search_with_progress, steric_site_scores,
 };
 use reglyco_refine::{
@@ -96,6 +96,21 @@ impl OutputFormatArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SearchBudgetArg {
+    Auto,
+    Manual,
+}
+
+impl SearchBudgetArg {
+    fn mode(self) -> SearchBudgetMode {
+        match self {
+            Self::Auto => SearchBudgetMode::Auto,
+            Self::Manual => SearchBudgetMode::Manual,
+        }
+    }
+}
+
 impl std::fmt::Display for OutputFormatArg {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
@@ -130,10 +145,14 @@ struct BuildArgs {
     seed: u64,
     #[arg(long = "output-format", value_enum, default_value_t = OutputFormatArg::Pdb)]
     output_format: OutputFormatArg,
-    #[arg(long, default_value_t = 128)]
-    population: usize,
-    #[arg(long, default_value_t = 100)]
-    generations: usize,
+    /// Select a search budget automatically from the loaded site/conformer
+    /// conflict graph, or provide explicit population/generation values.
+    #[arg(long = "search-budget", value_enum)]
+    search_budget: Option<SearchBudgetArg>,
+    #[arg(long)]
+    population: Option<usize>,
+    #[arg(long)]
+    generations: Option<usize>,
     /// Number of worker threads for prepared scoring and pose preparation.
     #[arg(long)]
     threads: Option<usize>,
@@ -215,6 +234,14 @@ struct EnsembleArgs {
     calculate_hotspots: bool,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Select a search budget automatically from the loaded site/conformer
+    /// conflict graph, or provide explicit population/generation values.
+    #[arg(long = "search-budget", value_enum)]
+    search_budget: Option<SearchBudgetArg>,
+    #[arg(long)]
+    population: Option<usize>,
+    #[arg(long)]
+    generations: Option<usize>,
     #[arg(long = "output-format", value_enum, default_value_t = OutputFormatArg::Pdb)]
     output_format: OutputFormatArg,
     /// Number of worker threads for prepared scoring and pose preparation.
@@ -323,11 +350,11 @@ struct ScanArgs {
     output: PathBuf,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    /// Cookbook-compatible GA population size (valid range: 32..=512).
-    #[arg(long, default_value_t = 128)]
+    /// GlcNAc scan GA population size (valid range: 32..=512).
+    #[arg(long, default_value_t = 32)]
     population: usize,
-    /// Cookbook-compatible maximum GA generations (valid range: 1..=20000).
-    #[arg(long, default_value_t = 100)]
+    /// GlcNAc scan maximum GA generations (valid range: 1..=20000).
+    #[arg(long, default_value_t = 25)]
     generations: usize,
     #[arg(long)]
     rotamers: bool,
@@ -633,6 +660,61 @@ pub fn run() -> anyhow::Result<()> {
     }
 }
 
+fn resolve_cli_attachment_budget(
+    mode: Option<SearchBudgetArg>,
+    population: Option<usize>,
+    generations: Option<usize>,
+    protein: &glysys::Structure,
+    sites: &[SearchSite],
+    scan_rotamers: bool,
+) -> anyhow::Result<SearchBudgetResolution> {
+    let explicit_pair = population.is_some() || generations.is_some();
+    if population.is_some() != generations.is_some() {
+        anyhow::bail!("--population and --generations must be supplied together");
+    }
+    if matches!(mode, Some(SearchBudgetArg::Auto)) && explicit_pair {
+        anyhow::bail!("--search-budget auto cannot be combined with --population or --generations");
+    }
+    if matches!(mode, Some(SearchBudgetArg::Manual)) && !explicit_pair {
+        anyhow::bail!("--search-budget manual requires --population and --generations");
+    }
+    let resolved_mode = match (mode, explicit_pair) {
+        (Some(value), false) => value.mode(),
+        (Some(SearchBudgetArg::Manual), true) => SearchBudgetMode::Manual,
+        (Some(SearchBudgetArg::Auto), true) => unreachable!(),
+        (None, true) => SearchBudgetMode::Manual,
+        (None, false) => SearchBudgetMode::Auto,
+    };
+    let resolution = resolve_search_budget(
+        protein,
+        sites,
+        scan_rotamers,
+        Some(resolved_mode),
+        population.unwrap_or(128),
+        generations.unwrap_or(100),
+    )?;
+    Ok(resolution)
+}
+
+fn print_resolved_budget(resolution: &SearchBudgetResolution, quiet: bool) {
+    if !quiet {
+        eprintln!(
+            "search budget: {} → {} candidates × {} generations{}",
+            match resolution.requested_mode {
+                SearchBudgetMode::Auto => "auto",
+                SearchBudgetMode::Manual => "manual",
+            },
+            resolution.population_size,
+            resolution.generations,
+            if resolution.capped {
+                " (Auto ceiling reached)"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
 fn run_build(arguments: BuildArgs) -> anyhow::Result<()> {
     configure_threads(arguments.threads).map_err(anyhow::Error::msg)?;
     if !arguments.quiet {
@@ -662,11 +744,20 @@ fn run_build(arguments: BuildArgs) -> anyhow::Result<()> {
         &arguments.provider,
         arguments.output_format.residue_name_format(),
     )?;
+    let budget = resolve_cli_attachment_budget(
+        arguments.search_budget,
+        arguments.population,
+        arguments.generations,
+        &protein,
+        &sites,
+        arguments.rotamers,
+    )?;
+    print_resolved_budget(&budget, arguments.quiet);
     let search_builder = SystemBuilder::new(search_options)?;
     let mut config = SearchConfig {
         seed: arguments.seed,
-        population_size: arguments.population,
-        generations: arguments.generations,
+        population_size: budget.population_size,
+        generations: budget.generations,
         // Build always materialises the best complete candidate.  Strict
         // automation is enforced after artifacts are written below.
         require_clash_free: false,
@@ -698,6 +789,7 @@ fn run_build(arguments: BuildArgs) -> anyhow::Result<()> {
         system.write_bundle(&arguments.output)?;
     }
     write_json(arguments.output.join("search.json"), &outcome)?;
+    write_json(arguments.output.join("search-budget.json"), &budget)?;
     let mut warnings = outcome.warnings.clone();
     if sites
         .iter()
@@ -718,6 +810,7 @@ fn run_build(arguments: BuildArgs) -> anyhow::Result<()> {
             command: "build".into(),
             seed: Some(config.seed),
             output_format: Some(arguments.output_format.api_segment().into()),
+            search_budget: Some(budget.clone()),
             ensemble_sources: sites
                 .iter()
                 .map(|site| site.ensemble.provenance.clone())
@@ -728,6 +821,7 @@ fn run_build(arguments: BuildArgs) -> anyhow::Result<()> {
         diagnostics: Vec::new(),
         analysis: ReportAnalysis {
             energy_analysis: outcome.energy_analysis.clone(),
+            search_budget: Some(budget.clone()),
             ..ReportAnalysis::default()
         },
     };
@@ -787,10 +881,21 @@ fn run_ensemble(arguments: EnsembleArgs) -> anyhow::Result<()> {
             &arguments.provider,
             arguments.output_format.residue_name_format(),
         )?;
+        let budget = resolve_cli_attachment_budget(
+            arguments.search_budget,
+            arguments.population,
+            arguments.generations,
+            &protein,
+            &sites,
+            arguments.move_sidechains,
+        )?;
+        print_resolved_budget(&budget, arguments.quiet);
         let builder = SystemBuilder::new(options)?;
         let config = SearchConfig {
             seed: arguments.seed,
             ensemble_size: arguments.frames,
+            population_size: budget.population_size,
+            generations: budget.generations,
             scan_rotamers: arguments.move_sidechains,
             mh_chains: arguments.chains,
             mh_burn_in_sweeps: arguments.burn_in_sweeps,
@@ -863,6 +968,7 @@ fn run_ensemble(arguments: EnsembleArgs) -> anyhow::Result<()> {
             &serde_json::json!({
                 "outputFormat": arguments.output_format.api_segment(),
                 "seed": arguments.seed,
+                "searchBudget": budget,
                 "diagnostics": diagnostics,
                 "frames": frames.iter().enumerate().map(|(index, frame)| serde_json::json!({
                     "model": index + 1,
@@ -874,6 +980,7 @@ fn run_ensemble(arguments: EnsembleArgs) -> anyhow::Result<()> {
                 })).collect::<Vec<_>>(),
             }),
         )?;
+        write_json(arguments.output.join("search-budget.json"), &budget)?;
         let mut warnings = Vec::new();
         if sites
             .iter()
@@ -892,6 +999,7 @@ fn run_ensemble(arguments: EnsembleArgs) -> anyhow::Result<()> {
                 command: "ensemble".into(),
                 seed: Some(arguments.seed),
                 output_format: Some(arguments.output_format.api_segment().into()),
+                search_budget: Some(budget.clone()),
                 ensemble_sources: sites
                     .iter()
                     .map(|site| site.ensemble.provenance.clone())
@@ -904,6 +1012,7 @@ fn run_ensemble(arguments: EnsembleArgs) -> anyhow::Result<()> {
                 frames.len()
             )],
             analysis: ReportAnalysis {
+                search_budget: Some(budget.clone()),
                 ensemble: Some(EnsembleAnalysis {
                     requested_frames: diagnostics.requested_frames,
                     returned_frames: diagnostics.returned_frames,
@@ -3738,6 +3847,7 @@ fn print_search_progress_label(event: SearchProgress, quiet: bool, label: &str) 
             "{label}: {} generation {generation}: best={best_score:.4}, mean={mean_score:.4}, energy-evals={evaluations}, cache-hits={cache_hits}, steric-rejected={steric_rejections}, elapsed={elapsed_seconds:.1}s",
             match phase {
                 SearchPhase::Feasibility => "feasibility",
+                SearchPhase::Compatibility => "compatibility",
                 SearchPhase::ProbabilityImprovement => "probability",
             }
         ),
@@ -4104,13 +4214,13 @@ mod tests {
     }
 
     #[test]
-    fn scan_uses_cookbook_defaults() {
+    fn scan_uses_fixed_fast_defaults() {
         let cli = Cli::try_parse_from(["reglyco", "scan", "--output", "result"]).unwrap();
         let Command::Scan(arguments) = cli.command else {
             panic!("expected scan command");
         };
-        assert_eq!(arguments.population, 128);
-        assert_eq!(arguments.generations, 100);
+        assert_eq!(arguments.population, 32);
+        assert_eq!(arguments.generations, 25);
     }
 
     #[test]
@@ -4189,6 +4299,77 @@ mod tests {
         };
         assert_eq!(arguments.seed, 0);
         assert!(matches!(arguments.output_format, OutputFormatArg::Pdb));
+    }
+
+    #[test]
+    fn search_budget_cli_requires_a_complete_manual_pair_and_preserves_compatibility() {
+        let auto = Cli::try_parse_from([
+            "reglyco",
+            "build",
+            "--protein",
+            "protein.pdb",
+            "--site",
+            "A:42",
+            "--glycan",
+            "G00028MO",
+            "--output",
+            "result",
+        ])
+        .unwrap();
+        let Command::Build(auto) = auto.command else {
+            panic!("expected build command");
+        };
+        assert!(auto.search_budget.is_none());
+        assert!(auto.population.is_none());
+        assert!(auto.generations.is_none());
+
+        let manual = Cli::try_parse_from([
+            "reglyco",
+            "build",
+            "--protein",
+            "protein.pdb",
+            "--site",
+            "A:42",
+            "--glycan",
+            "G00028MO",
+            "--output",
+            "result",
+            "--population",
+            "37",
+            "--generations",
+            "19",
+        ])
+        .unwrap();
+        let Command::Build(manual) = manual.command else {
+            panic!("expected build command");
+        };
+        assert_eq!(manual.population, Some(37));
+        assert_eq!(manual.generations, Some(19));
+
+        let explicit_manual = Cli::try_parse_from([
+            "reglyco",
+            "build",
+            "--protein",
+            "protein.pdb",
+            "--site",
+            "A:42",
+            "--glycan",
+            "G00028MO",
+            "--output",
+            "result",
+            "--search-budget",
+            "manual",
+        ])
+        .unwrap();
+        let Command::Build(explicit_manual) = explicit_manual.command else {
+            panic!("expected build command");
+        };
+        assert!(matches!(
+            explicit_manual.search_budget,
+            Some(super::SearchBudgetArg::Manual)
+        ));
+        assert!(explicit_manual.population.is_none());
+        assert!(explicit_manual.generations.is_none());
     }
 
     #[test]

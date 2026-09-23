@@ -6,24 +6,29 @@ use reglyco_ensemble::{
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
+/// `web_time` mirrors `std::time::Instant` on native targets while
+/// remaining functional on wasm32-unknown-unknown, where the standard
+/// clock traps. The ensemble crate already uses it for the same reason.
+use web_time::Instant;
 
 use glysys::{BuildOptions, ResidueId, Structure, SystemBuilder, read_pdb_str};
 use reglyco_build::{
     GlycosylationSite, hydroxylate_proline, remove_glycan_at_site, scan_n_linked_sequons,
 };
 use reglyco_core::{
-    Anomer, ClashStatus, ConformerPopulationSource, GlycanQuery, GlycanSource, ReGlycoError,
-    ResidueNameFormat, SamplingTarget, SearchConfig, SearchOutcome, SearchScoringMode,
-    SearchSelectionPolicy, SearchSite, SearchSiteResult, VonMisesComponent,
+    Anomer, ClashStatus, ConformerPopulationSource, EnergySearchDiagnostics, GlycanQuery,
+    GlycanSource, ReGlycoError, ResidueNameFormat, SamplingTarget, SearchBudgetMode,
+    SearchBudgetResolution, SearchConfig, SearchOutcome, SearchScoringMode, SearchSelectionPolicy,
+    SearchSite, SearchSiteResult, VonMisesComponent,
 };
 use reglyco_ensemble::{
     EnsembleError, SearchPhase, SearchProgress, StrictSearchDiagnostics, build_from_outcome,
-    calculate_sasa, ensemble_from_pdb, linkage_priors_for_glycan,
-    sample_attached_ensemble_with_cancel, search_with_progress_cancelled,
+    calculate_sasa, ensemble_from_pdb, linkage_priors_for_glycan, resolve_search_budget,
+    sample_attached_ensemble_with_cancel, search_with_progress_cancelled, steric_site_scores,
 };
 use reglyco_relax::{MovableSelection, RelaxOptions, RelaxProgress, relax_with_progress};
 use reglyco_validate::{Severity, StericPolicy, ValidationFinding as NativeFinding, validate};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -42,6 +47,16 @@ use reglyco_saxs::{
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn deserialize_seed<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Browser requests created by older CE builds may encode an omitted
+    // optional seed as null/unit.  Keep the historical native default of 0
+    // instead of rejecting the entire scan request.
+    Ok(Option::<u64>::deserialize(deserializer)?.unwrap_or(0))
+}
 
 pub type Result<T> = std::result::Result<T, WorkflowError>;
 
@@ -219,6 +234,7 @@ pub struct ReGlycoOptions {
     #[serde(default)]
     pub sampling_target: Option<SamplingTarget>,
     pub pre_minimization: bool,
+    #[serde(default, deserialize_with = "deserialize_seed")]
     pub seed: u64,
     /// Residue-name convention used for fetched Build/Ensemble assets.
     /// This is a representation choice and does not alter force-field names.
@@ -248,6 +264,10 @@ pub struct ReGlycoOptions {
     pub scoring_mode: SearchScoringMode,
     pub use_obc2: bool,
     pub local_radius: f64,
+    /// New clients send `auto`. An omitted mode is normalized as historical
+    /// manual mode so persisted requests keep their original budget.
+    #[serde(default)]
+    pub search_budget_mode: Option<SearchBudgetMode>,
     pub population_size: usize,
     pub generations: usize,
     pub density_effort: DensityEffort,
@@ -281,6 +301,7 @@ impl Default for ReGlycoOptions {
             scoring_mode: SearchScoringMode::StericPrior,
             use_obc2: false,
             local_radius: 5.0,
+            search_budget_mode: Some(SearchBudgetMode::Auto),
             population_size: 128,
             generations: 100,
             density_effort: DensityEffort::Adaptive,
@@ -605,6 +626,70 @@ fn search_config(request: &ReGlycoRunRequestV1) -> SearchConfig {
     }
 }
 
+/// Fixed small search budget for GlcNAc accessibility scans.
+///
+/// A scan asks one cheap question per sequon (can a single GlcNAc sit here
+/// clash-free?) and must answer it for every sequon on the chain. Running the
+/// full Build/Ensemble budget -- or the large Auto budget -- once per sequon
+/// plus once per joint trial makes many-site scans unusable, while the extra
+/// work does not change the accessibility answer: feasible single-site poses
+/// are normally found in the initial population, and blocked sites exhaust
+/// any budget. Scan results therefore use this fixed first-feasible budget
+/// and never inherit the request's Build/Ensemble population, generations,
+/// or Auto mode.
+fn scan_search_config(request: &ReGlycoRunRequestV1) -> SearchConfig {
+    let mut config = search_config(request);
+    config.population_size = 32;
+    config.generations = 25;
+    config.require_clash_free = false;
+    config.scan_rotamers = false;
+    config.polish_attachment_vmm = false;
+    config.selection_policy = SearchSelectionPolicy::CookbookFirstFeasible;
+    config
+}
+
+/// Directly verify that previously accepted per-site scan results are jointly
+/// clash-free by materializing them together and re-scoring. This is one
+/// structure build plus one steric traversal, versus a complete search.
+fn scan_trial_compatible(
+    protein: &Structure,
+    sites: &[SearchSite],
+    results: &[SearchSiteResult],
+    config: &SearchConfig,
+    builder: &SystemBuilder,
+) -> Result<bool> {
+    let trial = SearchOutcome {
+        sites: results.to_vec(),
+        total_score: results.iter().map(|result| result.steric_score).sum(),
+        seed: config.seed,
+        generations: 0,
+        clash_status: ClashStatus::ClashFree,
+        complete_output: true,
+        vmm_gate_satisfied: true,
+        termination_reason: "scan_direct_combination".into(),
+        clash_partners: Vec::new(),
+        history: Vec::new(),
+        warnings: Vec::new(),
+        scoring_mode: SearchScoringMode::StericPrior,
+        selected_energy_kcal_per_mol: None,
+        interaction_energy_kcal_per_mol: None,
+        energy_evaluations: 0,
+        energy_cutoff_angstrom: config.energy_cutoff,
+        minimization_radius_angstrom: config.minimization_radius,
+        interaction_vdw_kcal_per_mol: None,
+        interaction_coulomb_kcal_per_mol: None,
+        energy_diagnostics: EnergySearchDiagnostics::default(),
+        minimized_coordinates: Vec::new(),
+        timings: Default::default(),
+        vmm_polish: Default::default(),
+        energy_analysis: None,
+    };
+    let product = build_from_outcome(protein, sites, &trial, builder, false)?;
+    Ok(steric_site_scores(&product.structure, config.clash_distance)
+        .iter()
+        .all(|score| *score <= 1.1))
+}
+
 fn attachment_search_config(request: &ReGlycoRunRequestV1) -> SearchConfig {
     let mut config = search_config(request);
     config.scan_rotamers = request.options.scan_rotamers;
@@ -620,6 +705,32 @@ fn attachment_search_config(request: &ReGlycoRunRequestV1) -> SearchConfig {
         config.selection_policy = SearchSelectionPolicy::JointPriorV1;
     }
     config
+}
+
+fn attachment_search_config_with_budget(
+    request: &ReGlycoRunRequestV1,
+    budget: &SearchBudgetResolution,
+) -> SearchConfig {
+    let mut config = attachment_search_config(request);
+    config.population_size = budget.population_size;
+    config.generations = budget.generations;
+    config
+}
+
+fn resolved_attachment_budget(
+    request: &ReGlycoRunRequestV1,
+    protein: &Structure,
+    sites: &[SearchSite],
+) -> Result<SearchBudgetResolution> {
+    resolve_search_budget(
+        protein,
+        sites,
+        request.options.scan_rotamers,
+        request.options.search_budget_mode,
+        request.options.population_size,
+        request.options.generations,
+    )
+    .map_err(WorkflowError::from)
 }
 
 fn ensemble_search_config(request: &ReGlycoRunRequestV1) -> SearchConfig {
@@ -769,6 +880,10 @@ fn method_metadata(request: &ReGlycoRunRequestV1) -> Value {
         method.insert(
             "outputFormat".into(),
             json!(effective_output_format(request)),
+        );
+        method.insert(
+            "searchBudgetMode".into(),
+            json!(request.options.search_budget_mode),
         );
     }
     if request.workflow == WorkflowId::Ensemble {
@@ -1343,6 +1458,7 @@ fn progress_search(event: SearchProgress) -> ProgressEvent {
                 "{} · generation {generation}",
                 match phase {
                     SearchPhase::Feasibility => "Finding a clash-free pose",
+                    SearchPhase::Compatibility => "Resolving neighboring glycans",
                     SearchPhase::ProbabilityImprovement => "Improving conformer probability",
                 }
             ),
@@ -2317,7 +2433,28 @@ pub async fn execute_with_control(
         }
         WorkflowId::Uniprot | WorkflowId::SiteBuild => {
             let sites = search_sites(request, assets, &protein)?;
-            let config = attachment_search_config(request);
+            let search_budget = resolved_attachment_budget(request, &protein, &sites)?;
+            emit(
+                control,
+                "search_budget_resolved",
+                format!(
+                    "Resolved {} search budget: {} candidates × {} generations{}",
+                    match search_budget.requested_mode {
+                        SearchBudgetMode::Auto => "Auto",
+                        SearchBudgetMode::Manual => "manual",
+                    },
+                    search_budget.population_size,
+                    search_budget.generations,
+                    if search_budget.capped {
+                        " (Auto ceiling reached)"
+                    } else {
+                        ""
+                    }
+                ),
+                None,
+                None,
+            )?;
+            let config = attachment_search_config_with_budget(request, &search_budget);
             emit(
                 control,
                 "search",
@@ -2442,6 +2579,7 @@ pub async fn execute_with_control(
                 })
                 .collect();
             analysis = serde_json::to_value(&outcome)?;
+            analysis["searchBudget"] = serde_json::to_value(&search_budget)?;
             append_build_search_diagnostics(
                 &mut analysis,
                 &outcome,
@@ -2516,7 +2654,33 @@ pub async fn execute_with_control(
         }
         WorkflowId::Ensemble => {
             let sites = search_sites(request, assets, &protein)?;
-            let config = ensemble_search_config(request);
+            let search_budget = resolved_attachment_budget(request, &protein, &sites)?;
+            emit(
+                control,
+                "search_budget_resolved",
+                format!(
+                    "Resolved {} search budget: {} candidates × {} generations{}",
+                    match search_budget.requested_mode {
+                        SearchBudgetMode::Auto => "Auto",
+                        SearchBudgetMode::Manual => "manual",
+                    },
+                    search_budget.population_size,
+                    search_budget.generations,
+                    if search_budget.capped {
+                        " (Auto ceiling reached)"
+                    } else {
+                        ""
+                    }
+                ),
+                None,
+                None,
+            )?;
+            let config = {
+                let mut config = ensemble_search_config(request);
+                config.population_size = search_budget.population_size;
+                config.generations = search_budget.generations;
+                config
+            };
             emit(
                 control,
                 "ensemble",
@@ -2659,6 +2823,7 @@ pub async fn execute_with_control(
                 })
                 .collect();
             analysis = serde_json::to_value(&diagnostics)?;
+            analysis["searchBudget"] = serde_json::to_value(&search_budget)?;
             // Energy decomposition is a post-sampling diagnostic.  It uses
             // the emitted (and, when requested, relaxed) coordinates and is
             // kept out of the acceptance loop.  Per-frame scalar energies
@@ -2806,8 +2971,12 @@ pub async fn execute_with_control(
                     })
                     .collect::<Vec<_>>();
                 let mut independent = Vec::with_capacity(scan_sites.len());
-                let mut compatible = Vec::new();
-                let config = search_config(request);
+                let mut compatible: Vec<SearchSite> = Vec::new();
+                let mut compatible_results: Vec<SearchSiteResult> = Vec::new();
+                let config = scan_search_config(request);
+                let scan_started = Instant::now();
+                let mut scan_seconds_per_site = Vec::with_capacity(scan_sites.len());
+                let mut joint_seconds = 0.0;
                 for (index, site) in scan_sites.iter().enumerate() {
                     emit(
                         control,
@@ -2818,6 +2987,7 @@ pub async fn execute_with_control(
                     )?;
                     let mut site_config = config.clone();
                     site_config.seed = config.seed.wrapping_add(index as u64);
+                    let site_started = Instant::now();
                     let outcome = search_with_progress_cancelled(
                         &protein,
                         std::slice::from_ref(site),
@@ -2827,36 +2997,74 @@ pub async fn execute_with_control(
                         || control.cancelled(),
                     )
                     .await;
-                    let (accessible, score) = match outcome {
+                    scan_seconds_per_site.push(site_started.elapsed().as_secs_f64());
+                    let (accessible, score, accepted) = match outcome {
                         Ok(outcome) => (
                             outcome.clash_status == ClashStatus::ClashFree,
                             outcome.sites.first().map(|result| result.steric_score),
+                            outcome.sites.into_iter().next(),
                         ),
                         Err(EnsembleError::Cancelled) => return Err(WorkflowError::Cancelled),
-                        Err(error) if blocked_scan_outcome(&error) => (false, None),
+                        Err(error) if blocked_scan_outcome(&error) => (false, None, None),
                         Err(error) => return Err(error.into()),
                     };
                     independent.push((accessible, score));
                     if accessible {
-                        let mut trial = compatible.clone();
-                        trial.push(site.clone());
-                        match search_with_progress_cancelled(
+                        let Some(accepted) = accepted else {
+                            continue;
+                        };
+                        // Fast path: directly combine the already accepted
+                        // per-site results and verify joint sterics without
+                        // another full search. This keeps many-site scans
+                        // proportional to the site count instead of quadratic
+                        // in full searches.
+                        let mut trial_sites = compatible.clone();
+                        trial_sites.push(site.clone());
+                        let mut trial_results = compatible_results.clone();
+                        trial_results.push(accepted);
+                        if scan_trial_compatible(
                             &protein,
-                            &trial,
+                            &trial_sites,
+                            &trial_results,
                             &config,
                             &builder,
-                            |_| {},
-                            || control.cancelled(),
-                        )
-                        .await
-                        {
-                            Ok(joint) if joint.clash_status == ClashStatus::ClashFree => {
-                                compatible = trial;
+                        )? {
+                            compatible = trial_sites;
+                            compatible_results = trial_results;
+                        } else {
+                            // Direct combination clashed; spend one bounded
+                            // search on the trial set before giving up, so a
+                            // different jointly compatible pose set can still
+                            // be found.
+                            let joint_started = Instant::now();
+                            let mut trial_config = config.clone();
+                            trial_config.seed = config.seed.wrapping_add(
+                                0x9e37_79b9_7f4a_7c15u64.wrapping_add(index as u64),
+                            );
+                            let joint = search_with_progress_cancelled(
+                                &protein,
+                                &trial_sites,
+                                &trial_config,
+                                &builder,
+                                |_| {},
+                                || control.cancelled(),
+                            )
+                            .await;
+                            joint_seconds += joint_started.elapsed().as_secs_f64();
+                            match joint {
+                                Ok(joint)
+                                    if joint.clash_status == ClashStatus::ClashFree =>
+                                {
+                                    compatible = trial_sites;
+                                    compatible_results = joint.sites;
+                                }
+                                Err(EnsembleError::Cancelled) => {
+                                    return Err(WorkflowError::Cancelled);
+                                }
+                                Err(error) if blocked_scan_outcome(&error) => {}
+                                Err(error) => return Err(error.into()),
+                                Ok(_) => {}
                             }
-                            Err(EnsembleError::Cancelled) => return Err(WorkflowError::Cancelled),
-                            Err(error) if blocked_scan_outcome(&error) => {}
-                            Err(error) => return Err(error.into()),
-                            Ok(_) => {}
                         }
                     }
                 }
@@ -2899,6 +3107,12 @@ pub async fn execute_with_control(
                     "structuralAccessibilityComputed": true,
                     "independentAccessibleCount": independent.iter().filter(|entry| entry.0).count(),
                     "jointlyCompatibleCount": compatible.len(),
+                    "scanBudget": {"populationSize": config.population_size, "generations": config.generations},
+                    "timings": {
+                        "totalSeconds": scan_started.elapsed().as_secs_f64(),
+                        "perSiteSeconds": scan_seconds_per_site,
+                        "jointSearchSeconds": joint_seconds,
+                    },
                     "interpretation": "Structural accessibility only; not evidence of biological glycosylation."
                 });
             } else {
@@ -3049,6 +3263,11 @@ fn finish_workflow(
             object.insert("replacements".into(), replacement_metadata.clone());
         }
     }
+    if let Some(search_budget) = analysis.get("searchBudget").cloned() {
+        if let Some(object) = method.as_object_mut() {
+            object.insert("searchBudget".into(), search_budget);
+        }
+    }
     if let Some(object) = analysis.as_object_mut() {
         object.insert("method".into(), method.clone());
         if replacement_metadata
@@ -3092,6 +3311,10 @@ fn finish_workflow(
             "method": method,
             "replacements": replacement_metadata,
             "prolineConversions": conversions,
+            "searchBudget": analysis
+                .get("searchBudget")
+                .cloned()
+                .unwrap_or(Value::Null),
         }),
     };
     emit(
@@ -3110,7 +3333,7 @@ fn finish_workflow(
             "request.json",
             "application/json",
             ArtifactRole::Provenance,
-            serde_json::to_string_pretty(request)?,
+            request_artifact_json(request, &analysis)?,
         ),
         text_artifact(
             "report.json",
@@ -3205,6 +3428,18 @@ fn finish_workflow(
     })
 }
 
+/// Serialize the submitted request together with the resolved attachment
+/// budget. The submitted numeric placeholders remain intact for replay, while
+/// this additive top-level field tells offline consumers exactly what Auto
+/// selected after assets and the conflict graph were loaded.
+fn request_artifact_json(request: &ReGlycoRunRequestV1, analysis: &Value) -> Result<String> {
+    let mut value = serde_json::to_value(request)?;
+    if let Some(search_budget) = analysis.get("searchBudget") {
+        value["resolvedSearchBudget"] = search_budget.clone();
+    }
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
 /// Assemble a strict-search fallback bundle. Build workflows retain the
 /// complete candidate as a partial primary result; statistical Ensemble keeps
 /// its historical failed status because its sampler contract requires a
@@ -3272,6 +3507,14 @@ fn finish_strict_failure(
             object.insert("replacements".into(), replacement_metadata.clone());
         }
     }
+    if let Some(search_budget) = analysis.get("searchBudget").cloned() {
+        if let Some(object) = method.as_object_mut() {
+            object.insert("searchBudget".into(), search_budget.clone());
+        }
+        if let Some(object) = analysis.as_object_mut() {
+            object.insert("method".into(), method.clone());
+        }
+    }
     if let Some(object) = analysis.as_object_mut() {
         object.insert("method".into(), method.clone());
         object.insert("replacements".into(), replacement_metadata.clone());
@@ -3320,7 +3563,7 @@ fn finish_strict_failure(
             "request.json",
             "application/json",
             ArtifactRole::Provenance,
-            serde_json::to_string_pretty(request)?,
+            request_artifact_json(request, &analysis)?,
         ),
         text_artifact(
             "report.json",
@@ -4305,6 +4548,18 @@ fn append_build_search_diagnostics(
                 "geometryGpuSeconds": polish.geometry_gpu_seconds,
                 "geometryCpuSeconds": polish.geometry_cpu_seconds,
                 "geometryTransformSeconds": polish.geometry_transform_seconds,
+                "compatibility": {
+                    "algorithm": polish.compatibility_algorithm,
+                    "seededStates": polish.compatibility_seeded_states,
+                    "poseAttempts": polish.compatibility_pose_attempts,
+                    "poolSizes": polish.compatibility_pool_sizes,
+                    "poolExpansions": polish.compatibility_pool_expansions,
+                    "checks": polish.compatibility_checks,
+                    "backtracks": polish.compatibility_backtracks,
+                    "graphEdges": polish.compatibility_graph_edges,
+                    "attemptsPerSite": polish.compatibility_attempts_per_site,
+                    "proposalBudget": polish.compatibility_proposal_budget,
+                },
                 "stoppingRule": "10 completed generations without >1e-4 joint-score improvement or configured budget",
                 "timings": {
                     "preparationSeconds": outcome.timings.preparation_seconds,
@@ -6439,6 +6694,22 @@ END
     }
 
     #[test]
+    fn scan_uses_a_fixed_small_budget_independent_of_build_settings() {
+        let mut request = replacement_request(WorkflowId::NScan, pro_assignment("PRO"));
+        request.options.population_size = 256;
+        request.options.generations = 500;
+        request.options.search_budget_mode = Some(SearchBudgetMode::Auto);
+        request.options.seed = 99;
+        let scan = scan_search_config(&request);
+        assert_eq!(scan.population_size, 32);
+        assert_eq!(scan.generations, 25);
+        assert_eq!(scan.seed, 99);
+        assert_eq!(scan.selection_policy, SearchSelectionPolicy::CookbookFirstFeasible);
+        assert!(!scan.polish_attachment_vmm);
+        assert!(!scan.scan_rotamers);
+    }
+
+    #[test]
     fn missing_output_format_is_backward_compatible_and_invalid_values_fail() {
         let mut encoded = serde_json::to_value(ReGlycoOptions::default()).unwrap();
         encoded.as_object_mut().unwrap().remove("outputFormat");
@@ -6449,6 +6720,22 @@ END
             "outputFormat": "XYZ"
         });
         assert!(serde_json::from_value::<ReGlycoOptions>(invalid).is_err());
+    }
+
+    #[test]
+    fn missing_or_null_seed_uses_historical_zero_default() {
+        let missing = serde_json::json!({});
+        assert_eq!(
+            serde_json::from_value::<ReGlycoOptions>(missing)
+                .unwrap()
+                .seed,
+            0
+        );
+        let null = serde_json::json!({ "seed": null });
+        assert_eq!(
+            serde_json::from_value::<ReGlycoOptions>(null).unwrap().seed,
+            0
+        );
     }
 
     const OCCUPIED_PROTEIN: &str = "\
@@ -6764,6 +7051,23 @@ END
         request.options.ensemble_frames = 50;
         request.options.ensemble_temperature_k = f64::NAN;
         assert!(validate_options(&request).is_err());
+    }
+
+    #[test]
+    fn search_budget_mode_defaults_to_auto_for_new_options_and_manual_for_legacy_json() {
+        assert_eq!(
+            ReGlycoOptions::default().search_budget_mode,
+            Some(SearchBudgetMode::Auto)
+        );
+        let mut value = serde_json::to_value(ReGlycoOptions::default()).unwrap();
+        value
+            .as_object_mut()
+            .expect("options object")
+            .remove("searchBudgetMode");
+        let decoded: ReGlycoOptions = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.search_budget_mode, None);
+        assert_eq!(decoded.population_size, 128);
+        assert_eq!(decoded.generations, 100);
     }
 
     #[test]

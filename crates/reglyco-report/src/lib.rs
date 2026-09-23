@@ -47,6 +47,10 @@ pub struct Provenance {
     /// Older reports omit this field and remain readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_format: Option<String>,
+    /// Resolved attachment-search budget, when a Build/Ensemble workflow used
+    /// the shared Auto/Manual resolver. Older reports omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_budget: Option<reglyco_core::SearchBudgetResolution>,
     pub ensemble_sources: Vec<String>,
     /// Wall-clock time recorded by workflows that measure their complete run.
     #[serde(default)]
@@ -61,6 +65,7 @@ impl Default for Provenance {
             command: String::new(),
             seed: None,
             output_format: None,
+            search_budget: None,
             ensemble_sources: Vec::new(),
             total_seconds: None,
         }
@@ -688,6 +693,9 @@ pub struct ReportAnalysis {
     /// component total.
     #[serde(default)]
     pub energy_analysis: Option<reglyco_core::EnergyAnalysis>,
+    /// Resolved attachment-search budget and search-space measurements.
+    #[serde(default)]
+    pub search_budget: Option<reglyco_core::SearchBudgetResolution>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

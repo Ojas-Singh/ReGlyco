@@ -33,6 +33,18 @@ pub(super) fn evaluate_population(
                     .prepared
                     .evaluate(&c.genes, problem.clash_distance)?;
                 c.steric_scores = e.site_scores.clone();
+                c.valid_mask.fill(true);
+                c.dirty.fill(false);
+                // Score-only evaluation deliberately does not materialize
+                // coordinates, but chromosome bookkeeping still has one slot
+                // per attachment site. Keep that layout intact for the next
+                // crossover/mutation pass.
+                if c.conformations.len() != problem.sites.len() {
+                    c.conformations.resize(problem.sites.len(), None);
+                }
+                if c.site_grids.len() != problem.sites.len() {
+                    c.site_grids.resize(problem.sites.len(), None);
+                }
                 Ok(e)
             } else {
                 evaluate_cookbook_chromosome(problem, c)
@@ -102,29 +114,65 @@ pub(super) async fn evaluate_population_async(
     if session.disabled {
         return evaluate_population(problem, population, session);
     }
+    let Some(resident) = session.resident.as_ref() else {
+        session.disabled = true;
+        super::gpu::geometry_fallback("GPU steric session was not initialized".into());
+        return evaluate_population(problem, population, session);
+    };
     let gpu_started = Instant::now();
-    let capacity = session.resident.as_ref().unwrap().capacity() as usize;
+    let capacity = resident.capacity() as usize;
     let sites = problem.sites.len();
+    // Validate the compact gene-to-library mapping before touching any GPU
+    // buffer.  Browser requests can be restored from an older run or can
+    // contain a newly selected rotamer/conformer; either case must become a
+    // scoped CPU fallback rather than a Rust index panic crossing WASM.
+    let valid_layout = session.ids.len() == sites
+        && session.offsets.len() == sites
+        && population.iter().all(|chromosome| {
+            chromosome.genes.len() == sites
+                && chromosome.genes.iter().enumerate().all(|(site, gene)| {
+                    let rotamer = match gene.rotamer {
+                        None => Some(0),
+                        Some(value) => value.checked_add(1),
+                    };
+                    rotamer
+                        .and_then(|slot| session.ids.get(site).and_then(|r| r.get(slot)))
+                        .and_then(|conformers| conformers.get(gene.conformer))
+                        .is_some()
+                })
+        });
+    if !valid_layout {
+        session.disabled = true;
+        session.resident = None;
+        super::gpu::geometry_fallback(
+            "GPU steric gene/library layout mismatch; using the CPU reference".into(),
+        );
+        return evaluate_population(problem, population, session);
+    }
     let mut scores = Vec::new();
     for chunk in population.chunks(capacity) {
         let mut genes = Vec::with_capacity(chunk.len() * sites);
         for chromosome in chunk {
             for (site, g) in chromosome.genes.iter().enumerate() {
+                let rotamer = g.rotamer.map_or(0, |r| r + 1);
                 genes.push([
-                    session.ids[site][g.rotamer.map_or(0, |r| r + 1)][g.conformer],
+                    session.ids[site][rotamer][g.conformer],
                     (g.phi.to_radians() as f32).to_bits(),
                     (g.psi.to_radians() as f32).to_bits(),
                     session.offsets[site],
                 ]);
             }
         }
-        match session
-            .resident
-            .as_mut()
-            .unwrap()
-            .evaluate(&genes, problem.clash_distance as f32)
-            .await
-        {
+        let result = match session.resident.as_mut() {
+            Some(resident) => resident
+                .evaluate(&genes, problem.clash_distance as f32)
+                .await
+                .map_err(|error| EnsembleError::Metadata(error.to_string())),
+            None => Err(EnsembleError::Metadata(
+                "GPU steric session disappeared during evaluation".into(),
+            )),
+        };
+        match result {
             Ok(values) if values.len() == chunk.len() * sites => scores.extend(values),
             Ok(_) => {
                 session.disabled = true;
@@ -173,6 +221,8 @@ pub(super) async fn evaluate_population_async(
                     .prepared
                     .evaluate(&c.genes, problem.clash_distance)?
                     .site_scores;
+                c.valid_mask.fill(true);
+                c.dirty.fill(false);
             } else {
                 evaluate_cookbook_chromosome(problem, c)?;
             }
@@ -184,7 +234,9 @@ pub(super) async fn evaluate_population_async(
         }
         c.steric_scores = values.iter().map(|v| *v as f64).collect();
         c.valid_mask.fill(true);
-        c.conformations = transformed.into_iter().map(Some).collect();
+        if !session.scores_only {
+            c.conformations = transformed.into_iter().map(Some).collect();
+        }
         c.dirty.fill(false);
         if !session.scores_only {
             c.fitness = problem.cookbook_fitness(c);
@@ -224,7 +276,7 @@ mod tests {
                 site: reglyco_core::GlycosylationSite::new("A", 1),
                 ensemble,
             }];
-            let prepared = PreparedAttachmentContext::new(&protein, &sites).unwrap();
+            let prepared = PreparedAttachmentContext::new(&protein, &sites, false).unwrap();
             let (library, ids, offsets) = prepared.gpu_library().unwrap();
             let context = super::gpu::shared_context().await.unwrap();
             let mut resident = glysys_runtime::StericSession::new(&context, &library, 32)

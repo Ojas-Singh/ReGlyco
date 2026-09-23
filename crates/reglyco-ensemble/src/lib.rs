@@ -58,9 +58,9 @@ use reglyco_core::{
     AtomCoordinateRecord, ClashStatus, ConformerPopulationSource, EnergyAnalysis,
     EnergyComponentBreakdown, EnergySearchDiagnostics, GlycanEnsemble, GlycanInteractionBreakdown,
     GlycanQuery, GlycanSource, GlycosidicTorsionContribution, LinkagePrior, ReGlycoError,
-    SamplingTarget, SearchConfig, SearchGeneration, SearchOutcome, SearchScoringMode,
-    SearchSelectionPolicy, SearchSite, SearchSiteResult, SearchTimingDiagnostics,
-    VmmPolishDiagnostics, VmmPolishSiteDiagnostics, VonMisesComponent,
+    SamplingTarget, SearchBudgetMode, SearchBudgetResolution, SearchConfig, SearchGeneration,
+    SearchOutcome, SearchScoringMode, SearchSelectionPolicy, SearchSite, SearchSiteResult,
+    SearchTimingDiagnostics, VmmPolishDiagnostics, VmmPolishSiteDiagnostics, VonMisesComponent,
 };
 use reglyco_relax::{MovableSelection, RelaxOptions, minimize_coordinates_once, relax};
 
@@ -1118,12 +1118,20 @@ struct SearchProblem<'a> {
     clash_distance: f64,
     scan_rotamers: bool,
     scoring_mode: SearchScoringMode,
+    selection_policy: SearchSelectionPolicy,
     use_obc2: bool,
     pre_minimization: bool,
     pre_minimization_iterations: usize,
     energy_context: Option<&'a EnergySearchContext>,
     prepared: &'a PreparedAttachmentContext,
     prior_cache: SearchPriorCache,
+    vmm_priors: Vec<Vec<LinkagePrior>>,
+    /// Optional feasible states prepared by the shared compatibility
+    /// coordinator.  The generic energy GA consumes these only for its
+    /// initial population; subsequent generations retain their existing
+    /// crossover/mutation and objective ranking.
+    initial_states: Arc<Vec<Vec<Gene>>>,
+    initial_state_cursor: AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -1200,6 +1208,19 @@ fn compile_prior_cache(protein: &Structure, sites: &[SearchSite]) -> Result<Sear
     Ok(SearchPriorCache {
         sites: compiled_sites,
     })
+}
+
+fn compile_vmm_prior_cache(protein: &Structure, sites: &[SearchSite]) -> Vec<Vec<LinkagePrior>> {
+    sites
+        .iter()
+        .map(|site| {
+            site.ensemble
+                .conformers
+                .iter()
+                .map(|conformer| resolved_priors(protein, site, &conformer.priors))
+                .collect()
+        })
+        .collect()
 }
 
 impl SearchProblem<'_> {
@@ -1314,15 +1335,26 @@ impl GeneticProblem for SearchProblem<'_> {
     type State = Vec<Gene>;
 
     fn generate(&self, rng: &mut ChaCha8Rng) -> Self::State {
+        let initial_index = self.initial_state_cursor.fetch_add(1, Ordering::Relaxed);
+        if let Some(state) = self.initial_states.get(initial_index) {
+            return state.clone();
+        }
         self.sites
             .iter()
             .map(|site| {
                 let conformer = weighted_conformer_index(&site.ensemble, rng);
-                let priors = resolved_priors(
-                    self.protein,
-                    site,
-                    &site.ensemble.conformers[conformer].priors,
-                );
+                let Some(conformer_data) = site.ensemble.conformers.get(conformer) else {
+                    // Invalid restored/provider metadata is reported by the
+                    // prepared evaluator as an invalid state instead of
+                    // trapping the WASM worker on a conformer index.
+                    return Gene {
+                        conformer,
+                        phi: 0.0,
+                        psi: 0.0,
+                        rotamer: None,
+                    };
+                };
+                let priors = resolved_priors(self.protein, site, &conformer_data.priors);
                 Gene {
                     conformer,
                     phi: sample_vmm(&priors.phi, rng),
@@ -1363,11 +1395,10 @@ impl GeneticProblem for SearchProblem<'_> {
                 gene.conformer = weighted_conformer_index(&site.ensemble, rng);
             }
             if rng.random_bool(rate) {
-                let priors = resolved_priors(
-                    self.protein,
-                    site,
-                    &site.ensemble.conformers[gene.conformer].priors,
-                );
+                let Some(conformer_data) = site.ensemble.conformers.get(gene.conformer) else {
+                    continue;
+                };
+                let priors = resolved_priors(self.protein, site, &conformer_data.priors);
                 // Preserve the Cookbook's local creep mutation. Sampling a
                 // fresh narrow VMM draw alone cannot escape a crowded basin;
                 // a bounded angular walk lets a site move outside its native
@@ -1379,11 +1410,10 @@ impl GeneticProblem for SearchProblem<'_> {
                 };
             }
             if rng.random_bool(rate) {
-                let priors = resolved_priors(
-                    self.protein,
-                    site,
-                    &site.ensemble.conformers[gene.conformer].priors,
-                );
+                let Some(conformer_data) = site.ensemble.conformers.get(gene.conformer) else {
+                    continue;
+                };
+                let priors = resolved_priors(self.protein, site, &conformer_data.priors);
                 gene.psi = if rng.random_bool(0.7) {
                     wrap_degrees(gene.psi + rng.random_range(-30.0..30.0))
                 } else {
@@ -1520,6 +1550,22 @@ impl CookbookStericChromosome {
             fitness: f64::INFINITY,
         }
     }
+
+    /// Keep the per-site bookkeeping arrays aligned with the gene state before
+    /// an operator indexes them.  GPU score-only evaluation and restored
+    /// browser jobs may legitimately omit coordinate caches; they must never
+    /// turn that omission into a WASM bounds trap during crossover or repair.
+    fn normalize_bookkeeping(&mut self) {
+        let count = self.genes.len();
+        self.phi_components.resize(count, 0);
+        self.psi_components.resize(count, 0);
+        self.frozen_mask.resize(count, false);
+        self.conformations.resize(count, None);
+        self.site_grids.resize(count, None);
+        self.dirty.resize(count, true);
+        self.valid_mask.resize(count, false);
+        self.steric_scores.resize(count, f64::INFINITY);
+    }
 }
 
 struct CookbookSearchResult {
@@ -1540,10 +1586,84 @@ struct CookbookSearchResult {
     geometry_gpu_seconds: f64,
     geometry_cpu_seconds: f64,
     geometry_transform_seconds: f64,
+    compatibility_algorithm: String,
+    compatibility_seeded_states: usize,
+    compatibility_pose_attempts: usize,
+    compatibility_pool_sizes: Vec<usize>,
+    compatibility_pool_expansions: usize,
+    compatibility_checks: usize,
+    compatibility_backtracks: usize,
+    compatibility_graph_edges: usize,
+    compatibility_attempts_per_site: Vec<usize>,
+    compatibility_proposal_budget: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CompatibilitySearchDiagnostics {
+    algorithm: String,
+    seeded_states: usize,
+    pose_attempts: usize,
+    pool_sizes: Vec<usize>,
+    pool_expansions: usize,
+    compatibility_checks: usize,
+    backtracks: usize,
+    graph_edges: usize,
+    attempts_per_site: Vec<usize>,
+    proposal_budget: usize,
 }
 
 fn cookbook_is_feasible(chromosome: &CookbookStericChromosome) -> bool {
     cookbook_fast_solution(chromosome)
+}
+
+fn cookbook_vmm_is_feasible(
+    problem: &SearchProblem<'_>,
+    chromosome: &CookbookStericChromosome,
+) -> bool {
+    if problem.selection_policy != SearchSelectionPolicy::JointPriorV1 {
+        return true;
+    }
+    chromosome
+        .genes
+        .iter()
+        .zip(problem.sites)
+        .enumerate()
+        .all(|(index, (gene, _site))| {
+            let Some(priors) = problem
+                .vmm_priors
+                .get(index)
+                .and_then(|conformers| conformers.get(gene.conformer))
+            else {
+                return false;
+            };
+            priors
+                .phi
+                .get(
+                    chromosome
+                        .phi_components
+                        .get(index)
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                )
+                .is_some_and(|component| vmm_component_within_95(gene.phi, component))
+                && priors
+                    .psi
+                    .get(
+                        chromosome
+                            .psi_components
+                            .get(index)
+                            .copied()
+                            .unwrap_or(usize::MAX),
+                    )
+                    .is_some_and(|component| vmm_component_within_95(gene.psi, component))
+        })
+}
+
+fn cookbook_candidate_is_feasible(
+    problem: &SearchProblem<'_>,
+    chromosome: &CookbookStericChromosome,
+) -> bool {
+    cookbook_is_feasible(chromosome) && cookbook_vmm_is_feasible(problem, chromosome)
 }
 
 fn selection_score(
@@ -1551,7 +1671,9 @@ fn selection_score(
     policy: SearchSelectionPolicy,
     chromosome: &CookbookStericChromosome,
 ) -> f64 {
-    if policy == SearchSelectionPolicy::JointPriorV1 && cookbook_is_feasible(chromosome) {
+    if policy == SearchSelectionPolicy::JointPriorV1
+        && cookbook_candidate_is_feasible(problem, chromosome)
+    {
         problem.joint_prior_score(&chromosome.genes)
     } else {
         problem.cookbook_fitness(chromosome)
@@ -1606,8 +1728,8 @@ fn compare_candidates(
     left: &CookbookStericChromosome,
     right: &CookbookStericChromosome,
 ) -> std::cmp::Ordering {
-    let left_feasible = cookbook_is_feasible(left);
-    let right_feasible = cookbook_is_feasible(right);
+    let left_feasible = cookbook_candidate_is_feasible(problem, left);
+    let right_feasible = cookbook_candidate_is_feasible(problem, right);
     right_feasible
         .cmp(&left_feasible)
         .then_with(|| {
@@ -1619,8 +1741,8 @@ fn compare_candidates(
         })
         .then_with(|| {
             if policy == SearchSelectionPolicy::JointPriorV1
-                && cookbook_is_feasible(left)
-                && cookbook_is_feasible(right)
+                && cookbook_candidate_is_feasible(problem, left)
+                && cookbook_candidate_is_feasible(problem, right)
             {
                 sidechain_tie_score(problem, left).total_cmp(&sidechain_tie_score(problem, right))
             } else {
@@ -1660,8 +1782,18 @@ fn cookbook_sample_gene(
     rng: &mut ChaCha8Rng,
     cutoff: f64,
 ) -> (Gene, usize, usize) {
-    let conformer = weighted_conformer_index(&site.ensemble, rng);
-    let priors = resolved_priors(protein, site, &site.ensemble.conformers[conformer].priors);
+    // Feasibility search must cover the represented conformer library rather
+    // than draw the common models repeatedly.  Population weights belong in
+    // the later joint-prior ranking (and in statistical Ensemble proposals),
+    // but using them here can starve a low-population model that is the only
+    // sterically compatible member of a coupled multi-site state.
+    let conformer = coverage_conformer_index(&site.ensemble, rng);
+    let priors = site
+        .ensemble
+        .conformers
+        .get(conformer)
+        .map(|conformer| resolved_priors(protein, site, &conformer.priors))
+        .unwrap_or_default();
     let phi = sample_uniform_from_top_region(&priors.phi, cutoff, rng);
     let psi = sample_uniform_from_top_region(&priors.psi, cutoff, rng);
     (
@@ -1702,7 +1834,12 @@ fn cookbook_generate_native(
     let mut chromosome = CookbookStericChromosome::new(sites);
     for site in sites {
         let conformer = weighted_conformer_index(&site.ensemble, rng);
-        let priors = resolved_priors(protein, site, &site.ensemble.conformers[conformer].priors);
+        let priors = site
+            .ensemble
+            .conformers
+            .get(conformer)
+            .map(|conformer| resolved_priors(protein, site, &conformer.priors))
+            .unwrap_or_default();
         let phi = sample_truncated_vmm(&priors.phi, rng);
         let psi = sample_truncated_vmm(&priors.psi, rng);
         chromosome.genes.push(Gene {
@@ -1744,6 +1881,15 @@ fn cookbook_crossover(
     rng: &mut ChaCha8Rng,
 ) -> CookbookStericChromosome {
     let count = first.genes.len();
+    // A score-only or interrupted evaluation can leave a partially populated
+    // bookkeeping vector on a parent.  The chromosome still has a valid gene
+    // layout, so crossover must repair the per-site arrays before indexing
+    // them.  An empty parent cannot produce a crossover point; keep it as-is
+    // and let the caller report an empty search state if that is not valid for
+    // the current problem.
+    if count == 0 {
+        return first.clone();
+    }
     let point = rng.random_range(0..count);
     // Match Cookbook's crossover semantics: the first parent is the child
     // template, and its frozen genes can never be overwritten.  Keeping its
@@ -1752,19 +1898,41 @@ fn cookbook_crossover(
     // score to infinity made every glycan look problematic and repeatedly
     // mutated already solved sites.
     let mut child = first.clone();
+    // Score-only GPU evaluation does not materialize site coordinates. Keep
+    // the chromosome layout valid even if a stale or partially evaluated
+    // parent reaches this operator; every site still needs a bookkeeping slot
+    // for later mutation and evaluation.
+    child.normalize_bookkeeping();
     for index in point..count {
-        if first.frozen_mask[index] {
+        if child.frozen_mask[index] {
             continue;
         }
-        child.genes[index] = second.genes[index].clone();
-        child.phi_components[index] = second.phi_components[index];
-        child.psi_components[index] = second.psi_components[index];
-        child.frozen_mask[index] = second.frozen_mask[index];
-        child.valid_mask[index] = second.valid_mask[index];
-        child.steric_scores[index] = second.steric_scores[index];
-        child.conformations[index] = second.conformations[index].clone();
-        child.site_grids[index] = second.site_grids[index].clone();
-        child.dirty[index] = second.dirty[index];
+        // Parents normally have the same number of sites.  Keep the first
+        // parent's value when a stale/partially evaluated second parent does
+        // not, rather than turning a recoverable bookkeeping mismatch into a
+        // WASM `unreachable` trap.
+        let Some(gene) = second.genes.get(index) else {
+            continue;
+        };
+        child.genes[index] = gene.clone();
+        if let Some(value) = second.phi_components.get(index) {
+            child.phi_components[index] = *value;
+        }
+        if let Some(value) = second.psi_components.get(index) {
+            child.psi_components[index] = *value;
+        }
+        if let Some(value) = second.frozen_mask.get(index) {
+            child.frozen_mask[index] = *value;
+        }
+        if let Some(value) = second.valid_mask.get(index) {
+            child.valid_mask[index] = *value;
+        }
+        if let Some(value) = second.steric_scores.get(index) {
+            child.steric_scores[index] = *value;
+        }
+        child.conformations[index] = second.conformations.get(index).cloned().unwrap_or(None);
+        child.site_grids[index] = second.site_grids.get(index).cloned().unwrap_or(None);
+        child.dirty[index] = second.dirty.get(index).copied().unwrap_or(true);
     }
     // The aggregate fitness is stale after combining parents and is always
     // recomputed by `evaluate_cookbook_chromosome`.
@@ -1805,6 +1973,7 @@ fn cookbook_mutate(
     scan_rotamers: bool,
     rng: &mut ChaCha8Rng,
 ) {
+    chromosome.normalize_bookkeeping();
     let cluster_mutation_rate: f64 = 0.03;
     let generation_ratio = if max_generations == 0 {
         1.0
@@ -1828,7 +1997,12 @@ fn cookbook_mutate(
         if !rng.random_bool(effective_rate) {
             continue;
         }
-        let site = &sites[index];
+        let Some(site) = sites.get(index) else {
+            // A restored chromosome with more genes than the prepared site
+            // list is invalid input. Leave it for the evaluator to reject
+            // rather than indexing the site slice in a WASM worker.
+            continue;
+        };
         let previous_conformer = chromosome.genes[index].conformer;
         if rng.random::<f64>()
             < if problematic {
@@ -1837,19 +2011,30 @@ fn cookbook_mutate(
                 cluster_mutation_rate
             }
         {
-            chromosome.genes[index].conformer = weighted_conformer_index(&site.ensemble, rng);
+            // Keep the steric operator coverage-oriented.  The selected
+            // chromosome is still ranked by its normalized prior after it
+            // passes the complete steric gate.
+            chromosome.genes[index].conformer = coverage_conformer_index(&site.ensemble, rng);
         }
         let conformer_changed = previous_conformer != chromosome.genes[index].conformer;
         if scan_rotamers && problematic && rng.random_bool(0.15) {
             chromosome.genes[index].rotamer =
                 sample_rotamer_biased(protein, &site.site.residue, rng);
         }
-        let priors = resolved_priors(
-            protein,
-            site,
-            &site.ensemble.conformers[chromosome.genes[index].conformer].priors,
-        );
-        let cutoff = if problematic { 0.75 } else { 0.85 };
+        let Some(conformer) = site
+            .ensemble
+            .conformers
+            .get(chromosome.genes[index].conformer)
+        else {
+            continue;
+        };
+        let priors = resolved_priors(protein, site, &conformer.priors);
+        // Once a site is clashing, search the complete declared VMM-95
+        // region instead of repeatedly drawing only the high-density 75%
+        // basin.  The prior remains the ranking objective after a joint
+        // feasible state is found; this branch only prevents a valid,
+        // lower-density escape basin from being unreachable.
+        let cutoff = if problematic { 0.95 } else { 0.85 };
         if rng.random::<f64>() < creep_probability {
             let phi = wrap_degrees(
                 chromosome.genes[index].phi + normal_delta_degrees(rng, creep_standard_deviation),
@@ -1990,7 +2175,7 @@ fn cookbook_strict_solution(chromosome: &CookbookStericChromosome) -> bool {
 }
 
 fn cookbook_strict_search_solution(
-    _problem: &SearchProblem<'_>,
+    problem: &SearchProblem<'_>,
     chromosome: &CookbookStericChromosome,
 ) -> bool {
     // The generation loop intentionally uses only the prepared Cookbook
@@ -2007,7 +2192,7 @@ fn cookbook_strict_search_solution(
     // continue for many more generations. Cookbook terminates on the prepared
     // steric score; retain component checks in diagnostics/tests, not in this
     // hot acceptance path.
-    cookbook_strict_solution(chromosome)
+    cookbook_candidate_is_feasible(problem, chromosome)
 }
 
 /// Find the best complete strict candidate in the current population.  The
@@ -2041,6 +2226,7 @@ fn cookbook_search_result(
     termination_reason: String,
     evaluations: usize,
     geometry: &GeometrySession,
+    compatibility: &CompatibilitySearchDiagnostics,
 ) -> CookbookSearchResult {
     CookbookSearchResult {
         best_state: chromosome.genes.clone(),
@@ -2060,6 +2246,16 @@ fn cookbook_search_result(
         geometry_gpu_seconds: geometry.gpu_seconds,
         geometry_cpu_seconds: geometry.cpu_seconds,
         geometry_transform_seconds: geometry.transform_seconds,
+        compatibility_algorithm: compatibility.algorithm.clone(),
+        compatibility_seeded_states: compatibility.seeded_states,
+        compatibility_pose_attempts: compatibility.pose_attempts,
+        compatibility_pool_sizes: compatibility.pool_sizes.clone(),
+        compatibility_pool_expansions: compatibility.pool_expansions,
+        compatibility_checks: compatibility.compatibility_checks,
+        compatibility_backtracks: compatibility.backtracks,
+        compatibility_graph_edges: compatibility.graph_edges,
+        compatibility_attempts_per_site: compatibility.attempts_per_site.clone(),
+        compatibility_proposal_budget: compatibility.proposal_budget,
     }
 }
 
@@ -2202,12 +2398,13 @@ where
         if cancelled() {
             return Err(EnsembleError::Cancelled);
         }
-        let site = &problem.sites[index];
-        let priors = resolved_priors(
-            problem.protein,
-            site,
-            &site.ensemble.conformers[current.genes[index].conformer].priors,
-        );
+        let Some(site) = problem.sites.get(index) else {
+            return Err(EnsembleError::ReGlyco(ReGlycoError::InvalidGeometry));
+        };
+        let Some(conformer) = site.ensemble.conformers.get(current.genes[index].conformer) else {
+            return Err(EnsembleError::ReGlyco(ReGlycoError::InvalidGeometry));
+        };
+        let priors = resolved_priors(problem.protein, site, &conformer.priors);
         let original_phi_component = current.phi_components[index];
         let original_psi_component = current.psi_components[index];
         let Some(_) = priors.phi.get(original_phi_component) else {
@@ -2246,11 +2443,11 @@ where
         };
         let mut pending = Vec::new();
         'proposals: for conformer_index in conformer_indices {
-            let candidate_priors = resolved_priors(
-                problem.protein,
-                site,
-                &site.ensemble.conformers[conformer_index].priors,
-            );
+            let Some(candidate_conformer) = site.ensemble.conformers.get(conformer_index) else {
+                continue;
+            };
+            let candidate_priors =
+                resolved_priors(problem.protein, site, &candidate_conformer.priors);
             let candidate_pairs = if policy == SearchSelectionPolicy::JointPriorV1 {
                 component_pair_candidates(
                     &candidate_priors.phi,
@@ -2668,12 +2865,11 @@ where
                     let mut candidate = original.clone();
                     candidate.frozen_mask[index] = false;
                     let site = &problem.sites[index];
-                    let conformer = weighted_conformer_index(&site.ensemble, &mut rng);
-                    let priors = resolved_priors(
-                        problem.protein,
-                        site,
-                        &site.ensemble.conformers[conformer].priors,
-                    );
+                    let conformer = coverage_conformer_index(&site.ensemble, &mut rng);
+                    let Some(conformer_data) = site.ensemble.conformers.get(conformer) else {
+                        continue;
+                    };
+                    let priors = resolved_priors(problem.protein, site, &conformer_data.priors);
                     let phi = match cutoff {
                         Some(cutoff) => {
                             sample_uniform_from_top_region(&priors.phi, cutoff, &mut rng)
@@ -2833,11 +3029,102 @@ where
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
     let search_started = Instant::now();
     let population_capacity = config.population_size.max(2);
-    let search_budget = population_capacity.saturating_mul(config.generations.saturating_add(1));
-    let mut population = (0..population_capacity)
-        .map(|_| cookbook_generate(problem.protein, problem.sites, &mut rng))
+    let base_search_budget =
+        population_capacity.saturating_mul(config.generations.saturating_add(1));
+    let search_budget = base_search_budget;
+    // Pose-pool construction runs before the GA so coupled feasible
+    // assignments can seed the population. Its local-pose allowance is
+    // explicit and reported separately; it is not a rescue pass after the GA
+    // has exhausted the complete-candidate budget.
+    let compatibility_budget = if policy == SearchSelectionPolicy::JointPriorV1 {
+        // Pose discovery and complete candidates share one resolved proposal
+        // ledger.  Reserve half for local pose/compatibility work so repair
+        // and GA proposals cannot silently exceed B = population ×
+        // (generations + 1).
+        base_search_budget / 2
+    } else {
+        0
+    };
+    // The remaining half of the shared ledger is installed after the local
+    // pose stage, using its actual consumed work rather than its reservation.
+    // This keeps easy cases from losing useful GA work while preserving one
+    // deterministic total cap.
+    if compatibility_budget > 0 && problem.sites.len() > 1 {
+        progress(SearchProgress::Generation {
+            phase: SearchPhase::Compatibility,
+            generation: 0,
+            best_score: f64::INFINITY,
+            mean_score: f64::INFINITY,
+            evaluations: 0,
+            cache_hits: 0,
+            steric_rejections: 0,
+            elapsed_seconds: search_started.elapsed().as_secs_f64(),
+            valid_candidates: 0,
+            first_feasible_score: None,
+        });
+    }
+    let compatibility_states = if compatibility_budget > 0 && problem.sites.len() > 1 {
+        cookbook_compatible_pool_coverage(
+            problem.protein,
+            problem.sites,
+            config,
+            problem.prepared,
+            population_capacity.min(4),
+            compatibility_budget,
+        )?
+    } else {
+        CompatiblePoolResult {
+            states: Vec::new(),
+            pools: vec![Vec::new(); problem.sites.len()],
+            proposals: 0,
+            attempts_per_site: vec![0; problem.sites.len()],
+            pool_sizes: Vec::new(),
+            pool_expansions: 0,
+            compatibility_checks: 0,
+            backtracks: 0,
+            graph_edges: 0,
+        }
+    };
+    let compatibility_diagnostics = CompatibilitySearchDiagnostics {
+        algorithm: (compatibility_budget > 0)
+            .then_some("arc_consistency_backtracking_v1".into())
+            .unwrap_or_default(),
+        seeded_states: compatibility_states.states.len(),
+        pose_attempts: compatibility_states.proposals,
+        pool_sizes: compatibility_states.pool_sizes.clone(),
+        pool_expansions: compatibility_states.pool_expansions,
+        compatibility_checks: compatibility_states.compatibility_checks,
+        backtracks: compatibility_states.backtracks,
+        graph_edges: compatibility_states.graph_edges,
+        attempts_per_site: compatibility_states.attempts_per_site.clone(),
+        proposal_budget: compatibility_budget,
+    };
+    let complete_search_budget = base_search_budget
+        .saturating_sub(compatibility_states.proposals)
+        .max(population_capacity);
+    let seeded_count = compatibility_states.states.len().min(population_capacity);
+    let mut population = compatibility_states
+        .states
+        .into_iter()
+        .take(seeded_count)
+        .map(|(state, phi_components, psi_components)| {
+            let mut chromosome = CookbookStericChromosome::new(problem.sites);
+            chromosome.genes = state;
+            chromosome.phi_components = phi_components;
+            chromosome.psi_components = psi_components;
+            chromosome
+        })
         .collect::<Vec<_>>();
+    population.extend(
+        (seeded_count..population_capacity)
+            .map(|_| cookbook_generate(problem.protein, problem.sites, &mut rng)),
+    );
     let mut geometry = GeometrySession::default();
+    // Joint-prior Build does not use Cookbook freezing, so complete
+    // transformed coordinate arrays are unnecessary in the hot loop. The
+    // resident GPU returns site scores and boundary candidates; coordinates
+    // are materialized only for selected output or CPU checks.
+    geometry.scores_only = policy == SearchSelectionPolicy::JointPriorV1;
     evaluate_population(problem, &mut population, &mut geometry).await?;
     population
         .iter_mut()
@@ -2866,7 +3153,7 @@ where
         population.sort_by(|left, right| compare_candidates(problem, policy, left, right));
         let generation_valid = population
             .iter()
-            .filter(|chromosome| cookbook_is_feasible(chromosome))
+            .filter(|chromosome| cookbook_candidate_is_feasible(problem, chromosome))
             .count();
         valid_candidates = valid_candidates.saturating_add(generation_valid);
         let best = &population[0];
@@ -2884,6 +3171,11 @@ where
         progress(SearchProgress::Generation {
             phase: if policy == SearchSelectionPolicy::JointPriorV1 && best_feasible.is_some() {
                 SearchPhase::ProbabilityImprovement
+            } else if policy == SearchSelectionPolicy::JointPriorV1
+                && generation == 0
+                && compatibility_diagnostics.seeded_states > 0
+            {
+                SearchPhase::Compatibility
             } else {
                 SearchPhase::Feasibility
             },
@@ -2907,7 +3199,7 @@ where
         if policy == SearchSelectionPolicy::JointPriorV1 {
             if let Some(candidate) = population
                 .iter()
-                .find(|candidate| cookbook_is_feasible(candidate))
+                .find(|candidate| cookbook_candidate_is_feasible(problem, candidate))
             {
                 let candidate_score = candidate.fitness;
                 if first_feasible_score.is_none() {
@@ -2934,8 +3226,14 @@ where
             }
             // Ten complete generations without a meaningful probability
             // improvement is the deterministic post-feasibility stop.
-            if best_feasible.is_some() && prior_stagnation >= 10 {
-                let accepted = best_feasible.as_ref().expect("incumbent");
+            if prior_stagnation >= 10 {
+                let Some(accepted) = best_feasible.as_ref() else {
+                    // The counter can only reach this branch after a
+                    // feasibility check, but keep the browser boundary
+                    // recoverable if a depleted population is restored from
+                    // an interrupted job.
+                    continue;
+                };
                 return Ok(cookbook_search_result(
                     accepted,
                     best_generation,
@@ -2947,6 +3245,7 @@ where
                     "stagnation".into(),
                     evaluations,
                     &geometry,
+                    &compatibility_diagnostics,
                 ));
             }
         } else if let Some(strict_index) = cookbook_strict_candidate_index(problem, &population) {
@@ -2962,6 +3261,7 @@ where
                 "first_feasible".into(),
                 evaluations,
                 &geometry,
+                &compatibility_diagnostics,
             ));
         }
 
@@ -2975,7 +3275,7 @@ where
                 problem,
                 &mut repaired,
                 config.seed ^ 0x726f_7461_6d65_7200,
-                search_budget.saturating_sub(evaluations),
+                complete_search_budget.saturating_sub(evaluations),
                 &mut geometry,
                 &mut cancelled,
             )
@@ -3013,6 +3313,7 @@ where
                             "first_feasible".into(),
                             evaluations,
                             &geometry,
+                            &compatibility_diagnostics,
                         ));
                     }
                 }
@@ -3047,7 +3348,7 @@ where
                 let inject = population.len() / 5;
                 let start = population.len().saturating_sub(inject);
                 for slot in &mut population[start..] {
-                    if evaluations >= search_budget {
+                    if evaluations >= complete_search_budget {
                         break;
                     }
                     *slot = cookbook_generate(problem.protein, problem.sites, &mut rng);
@@ -3062,7 +3363,7 @@ where
                 }
                 let keep = population.len() / 4;
                 for slot in &mut population[keep..] {
-                    if evaluations >= search_budget {
+                    if evaluations >= complete_search_budget {
                         break;
                     }
                     *slot = cookbook_generate(problem.protein, problem.sites, &mut rng);
@@ -3100,7 +3401,7 @@ where
         // Repair/restart work consumes the same finite proposal budget as
         // ordinary generations.  If it used the remaining slots, stop before
         // evaluating a hidden extra population.
-        if evaluations.saturating_add(needed) > search_budget {
+        if evaluations.saturating_add(needed) > complete_search_budget {
             break;
         }
         let generation_seed = splitmix64(config.seed ^ generation as u64);
@@ -3147,7 +3448,7 @@ where
         problem,
         &mut best,
         config.seed ^ 0x7265_7061_6972_0000,
-        search_budget.saturating_sub(evaluations),
+        complete_search_budget.saturating_sub(evaluations),
         &mut geometry,
         &mut cancelled,
     )
@@ -3172,8 +3473,10 @@ where
             "budget_exhausted".into(),
             evaluations,
             &geometry,
+            &compatibility_diagnostics,
         ));
     }
+
     // A strict gate miss is still a useful Build result.  The chromosome is
     // complete (one evaluated gene per requested attachment), so return it
     // through the normal materialisation/reporting path.  Callers can then
@@ -3193,6 +3496,7 @@ where
         "budget_exhausted_no_feasible".into(),
         evaluations,
         &geometry,
+        &compatibility_diagnostics,
     ))
 }
 
@@ -3220,6 +3524,7 @@ pub enum SearchProgress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchPhase {
     Feasibility,
+    Compatibility,
     ProbabilityImprovement,
 }
 
@@ -3285,11 +3590,77 @@ where
     }
     validate_site_priors(protein, sites)?;
     let preparation_started = Instant::now();
-    let prepared = PreparedAttachmentContext::new(protein, sites)?;
+    let prepared = PreparedAttachmentContext::new(protein, sites, config.scan_rotamers)?;
     let preparation_seconds = preparation_started.elapsed().as_secs_f64();
     if cancelled() {
         return Err(EnsembleError::Cancelled);
     }
+    // Energy objectives still use their established objective and GA
+    // operators, but they should not spend their entire initial population
+    // rediscovering whether a multi-site geometry is jointly constructible.
+    // Reuse the same bounded compatibility coordinator as steric Build and
+    // hand only complete, protein-compatible states to the first GA batch.
+    // The coordinator is deliberately skipped for one-site searches and for
+    // steric Build, which owns its probability-ranked compatibility phase.
+    let (energy_compatibility, initial_states) =
+        if config.scoring_mode != SearchScoringMode::StericPrior && sites.len() > 1 {
+            progress(SearchProgress::Generation {
+                phase: SearchPhase::Compatibility,
+                generation: 0,
+                best_score: f64::INFINITY,
+                mean_score: f64::INFINITY,
+                evaluations: 0,
+                cache_hits: 0,
+                steric_rejections: 0,
+                elapsed_seconds: preparation_started.elapsed().as_secs_f64(),
+                valid_candidates: 0,
+                first_feasible_score: None,
+            });
+            let population = config.population_size.max(2);
+            let budget = population
+                .saturating_mul(config.generations.saturating_add(1))
+                .saturating_mul(2);
+            if budget == 0 {
+                (
+                    CompatibilitySearchDiagnostics::default(),
+                    Arc::new(Vec::new()),
+                )
+            } else {
+                let result = cookbook_compatible_pool_coverage(
+                    protein,
+                    sites,
+                    config,
+                    &prepared,
+                    population.min(4),
+                    budget,
+                )?;
+                let diagnostics = CompatibilitySearchDiagnostics {
+                    algorithm: "arc_consistency_backtracking_v1".into(),
+                    seeded_states: result.states.len(),
+                    pose_attempts: result.proposals,
+                    pool_sizes: result.pool_sizes,
+                    pool_expansions: result.pool_expansions,
+                    compatibility_checks: result.compatibility_checks,
+                    backtracks: result.backtracks,
+                    graph_edges: result.graph_edges,
+                    attempts_per_site: result.attempts_per_site.clone(),
+                    proposal_budget: budget,
+                };
+                let states = Arc::new(
+                    result
+                        .states
+                        .into_iter()
+                        .map(|(genes, _, _)| genes)
+                        .collect::<Vec<_>>(),
+                );
+                (diagnostics, states)
+            }
+        } else {
+            (
+                CompatibilitySearchDiagnostics::default(),
+                Arc::new(Vec::new()),
+            )
+        };
     let energy_context = if config.scoring_mode != SearchScoringMode::StericPrior {
         progress(SearchProgress::PreparingTopology);
         let started = Instant::now();
@@ -3342,12 +3713,16 @@ where
         clash_distance: config.clash_distance,
         scan_rotamers: config.scan_rotamers,
         scoring_mode: config.scoring_mode,
+        selection_policy: config.selection_policy,
         use_obc2: config.use_obc2,
         pre_minimization: config.pre_minimization,
         pre_minimization_iterations: config.pre_minimization_iterations,
         energy_context: energy_context.as_ref(),
         prepared: &prepared,
         prior_cache: compile_prior_cache(protein, sites)?,
+        vmm_priors: compile_vmm_prior_cache(protein, sites),
+        initial_states,
+        initial_state_cursor: AtomicUsize::new(0),
     };
     let ga_started = Instant::now();
     let mut vmm_polish = VmmPolishDiagnostics::default();
@@ -3377,6 +3752,16 @@ where
             geometry_gpu_seconds: result.geometry_gpu_seconds,
             geometry_cpu_seconds: result.geometry_cpu_seconds,
             geometry_transform_seconds: result.geometry_transform_seconds,
+            compatibility_algorithm: result.compatibility_algorithm.clone(),
+            compatibility_seeded_states: result.compatibility_seeded_states,
+            compatibility_pose_attempts: result.compatibility_pose_attempts,
+            compatibility_pool_sizes: result.compatibility_pool_sizes.clone(),
+            compatibility_pool_expansions: result.compatibility_pool_expansions,
+            compatibility_checks: result.compatibility_checks,
+            compatibility_backtracks: result.compatibility_backtracks,
+            compatibility_graph_edges: result.compatibility_graph_edges,
+            compatibility_attempts_per_site: result.compatibility_attempts_per_site.clone(),
+            compatibility_proposal_budget: result.compatibility_proposal_budget,
             ..VmmPolishDiagnostics::default()
         };
         if config.polish_attachment_vmm {
@@ -3423,6 +3808,23 @@ where
                 search_diagnostics.geometry_cpu_seconds + polish_geometry.cpu_seconds;
             diagnostics.geometry_transform_seconds =
                 search_diagnostics.geometry_transform_seconds + polish_geometry.transform_seconds;
+            diagnostics.compatibility_algorithm =
+                search_diagnostics.compatibility_algorithm.clone();
+            diagnostics.compatibility_seeded_states =
+                search_diagnostics.compatibility_seeded_states;
+            diagnostics.compatibility_pose_attempts =
+                search_diagnostics.compatibility_pose_attempts;
+            diagnostics.compatibility_pool_sizes =
+                search_diagnostics.compatibility_pool_sizes.clone();
+            diagnostics.compatibility_pool_expansions =
+                search_diagnostics.compatibility_pool_expansions;
+            diagnostics.compatibility_checks = search_diagnostics.compatibility_checks;
+            diagnostics.compatibility_backtracks = search_diagnostics.compatibility_backtracks;
+            diagnostics.compatibility_graph_edges = search_diagnostics.compatibility_graph_edges;
+            diagnostics.compatibility_attempts_per_site =
+                search_diagnostics.compatibility_attempts_per_site.clone();
+            diagnostics.compatibility_proposal_budget =
+                search_diagnostics.compatibility_proposal_budget;
             vmm_polish = diagnostics;
         } else {
             vmm_polish = search_diagnostics;
@@ -3482,6 +3884,18 @@ where
     };
     if cancelled() {
         return Err(EnsembleError::Cancelled);
+    }
+    if !energy_compatibility.algorithm.is_empty() {
+        vmm_polish.compatibility_algorithm = energy_compatibility.algorithm.clone();
+        vmm_polish.compatibility_seeded_states = energy_compatibility.seeded_states;
+        vmm_polish.compatibility_pose_attempts = energy_compatibility.pose_attempts;
+        vmm_polish.compatibility_pool_sizes = energy_compatibility.pool_sizes.clone();
+        vmm_polish.compatibility_pool_expansions = energy_compatibility.pool_expansions;
+        vmm_polish.compatibility_checks = energy_compatibility.compatibility_checks;
+        vmm_polish.compatibility_backtracks = energy_compatibility.backtracks;
+        vmm_polish.compatibility_graph_edges = energy_compatibility.graph_edges;
+        vmm_polish.compatibility_attempts_per_site = energy_compatibility.attempts_per_site.clone();
+        vmm_polish.compatibility_proposal_budget = energy_compatibility.proposal_budget;
     }
 
     let ga_seconds = ga_started.elapsed().as_secs_f64();
@@ -3914,6 +4328,22 @@ pub struct EnsembleSamplingDiagnostics {
     #[serde(default)]
     pub mh_accepts: usize,
     #[serde(default)]
+    pub single_site_proposals: usize,
+    #[serde(default)]
+    pub pair_proposals: usize,
+    #[serde(default)]
+    pub group_proposals: usize,
+    #[serde(default)]
+    pub whole_state_proposals: usize,
+    #[serde(default)]
+    pub single_site_accepts: usize,
+    #[serde(default)]
+    pub pair_accepts: usize,
+    #[serde(default)]
+    pub group_accepts: usize,
+    #[serde(default)]
+    pub whole_state_accepts: usize,
+    #[serde(default)]
     pub burn_in_sweeps: usize,
     #[serde(default)]
     pub thinning_accepted: usize,
@@ -3959,7 +4389,301 @@ struct PooledSiteCandidate {
 #[derive(Debug)]
 struct CompatiblePoolResult {
     states: Vec<(Vec<Gene>, Vec<usize>, Vec<usize>)>,
+    /// Persistent protein-compatible poses.  Keeping these across expansion
+    /// rounds is essential: a later round must add coverage instead of
+    /// replacing the domain that the solver already inspected.
+    pools: Vec<Vec<PooledSiteCandidate>>,
     proposals: usize,
+    attempts_per_site: Vec<usize>,
+    pool_sizes: Vec<usize>,
+    pool_expansions: usize,
+    compatibility_checks: usize,
+    backtracks: usize,
+    graph_edges: usize,
+}
+
+/// Conservative site-dependency graph used by both compatibility assembly
+/// and statistical block proposals.  A fixed 100 Å cutoff made every site in
+/// a large oligomer a compatibility neighbour, which in turn forced the
+/// solver to allocate dense pose-pair tables for sites that cannot physically
+/// interact.  Derive a bound from the actual conformer reach instead.  An
+/// unknown frame or attachment geometry remains connected conservatively.
+fn conservative_site_graph(protein: &Structure, sites: &[SearchSite]) -> Vec<Vec<usize>> {
+    let positions = sites
+        .iter()
+        .map(|site| {
+            protein
+                .find_atom(&site.site.residue, "CA")
+                .and_then(|atom| protein.atom_position(atom))
+        })
+        .collect::<Vec<_>>();
+    let reaches = sites.iter().map(conformer_reach).collect::<Vec<_>>();
+    let mut graph = vec![Vec::new(); sites.len()];
+    for first in 0..sites.len() {
+        for second in (first + 1)..sites.len() {
+            let connected = positions[first]
+                .zip(positions[second])
+                .is_none_or(|(left, right)| {
+                    let margin = reaches[first] + reaches[second] + 2.0 * 1.7 + 6.0;
+                    squared_distance(left, right) <= margin * margin
+                });
+            if connected {
+                graph[first].push(second);
+                graph[second].push(first);
+            }
+        }
+    }
+    graph
+}
+
+/// Versioned, deterministic search-budget estimator shared by native and
+/// browser attachment workflows. The estimator sizes the compatibility pool
+/// work first because that is the part of a dense multi-site search that the
+/// legacy fixed 128x100 defaults consistently under-provisioned.
+pub const SEARCH_BUDGET_ESTIMATOR_VERSION: &str = "search_space_v1";
+pub const AUTO_BUDGET_MAX_POPULATION: usize = 256;
+pub const AUTO_BUDGET_MAX_GENERATIONS: usize = 500;
+
+pub fn resolve_search_budget(
+    protein: &Structure,
+    sites: &[SearchSite],
+    scan_rotamers: bool,
+    requested_mode: Option<SearchBudgetMode>,
+    manual_population: usize,
+    manual_generations: usize,
+) -> Result<SearchBudgetResolution> {
+    let mode = requested_mode.unwrap_or(SearchBudgetMode::Manual);
+    let graph = conservative_site_graph(protein, sites);
+    let components = connected_components(&graph);
+    let conformer_counts = sites
+        .iter()
+        .map(|site| {
+            site.ensemble
+                .conformers
+                .iter()
+                .filter(|conformer| {
+                    conformer.cluster_weight.is_finite() && conformer.cluster_weight > 0.0
+                })
+                .count()
+        })
+        .collect::<Vec<_>>();
+    let vmm_basin_counts = sites
+        .iter()
+        .map(|site| {
+            site.ensemble
+                .conformers
+                .iter()
+                .filter(|conformer| {
+                    conformer.cluster_weight.is_finite() && conformer.cluster_weight > 0.0
+                })
+                .map(|conformer| {
+                    let priors = resolved_priors(protein, site, &conformer.priors);
+                    let phi = positive_vmm_count(&priors.phi);
+                    let psi = positive_vmm_count(&priors.psi);
+                    phi.saturating_mul(psi).max(1)
+                })
+                .max()
+                .unwrap_or(1)
+        })
+        .collect::<Vec<_>>();
+    let rotamer_counts = sites
+        .iter()
+        .map(|site| {
+            if scan_rotamers {
+                // Pass zero is the deposited side chain; the Dunbrack
+                // entries are the additional choices used by repair.
+                dunbrack::rotamers(protein, &site.site.residue)
+                    .len()
+                    .min(5)
+                    .saturating_add(1)
+            } else {
+                1
+            }
+        })
+        .collect::<Vec<_>>();
+    let site_pose_needs = conformer_counts
+        .iter()
+        .zip(&vmm_basin_counts)
+        .zip(&rotamer_counts)
+        .map(|((conformers, basins), rotamers)| {
+            conformers
+                .saturating_mul((*basins).min(4))
+                .saturating_mul(*rotamers)
+                .clamp(16, 192)
+        })
+        .collect::<Vec<_>>();
+    let graph_edges = graph.iter().map(Vec::len).sum::<usize>() / 2;
+    let maximum_degree = graph.iter().map(Vec::len).max().unwrap_or(0);
+    let largest_component_size = components.iter().map(Vec::len).max().unwrap_or(0);
+    let mut required_compatibility_work = 0usize;
+    for component in &components {
+        let component_edges = component
+            .iter()
+            .map(|&index| {
+                graph[index]
+                    .iter()
+                    .filter(|neighbor| component.binary_search(neighbor).is_ok())
+                    .count()
+            })
+            .sum::<usize>()
+            / 2;
+        let pool_target = component
+            .iter()
+            .map(|&index| site_pose_needs.get(index).copied().unwrap_or(16))
+            .max()
+            .unwrap_or(16)
+            .max(16usize.saturating_add(10usize.saturating_mul(component.len())))
+            .min(192);
+        let edge_work = ceil_div(
+            component_edges
+                .saturating_mul(pool_target)
+                .saturating_mul(pool_target),
+            32,
+        );
+        let local_work = component
+            .iter()
+            .map(|&index| site_pose_needs.get(index).copied().unwrap_or(16))
+            .sum::<usize>()
+            .saturating_mul(4);
+        required_compatibility_work =
+            required_compatibility_work.saturating_add(edge_work.max(local_work));
+    }
+    let required_work = 128usize
+        .saturating_mul(101)
+        .max(required_compatibility_work.saturating_mul(2));
+
+    let (population_size, generations, capped) = match mode {
+        SearchBudgetMode::Manual => {
+            if manual_population == 0 || manual_generations == 0 {
+                return Err(EnsembleError::Metadata(
+                    "manual search budgets require positive population and generation values"
+                        .into(),
+                ));
+            }
+            (manual_population, manual_generations, false)
+        }
+        SearchBudgetMode::Auto => {
+            let raw_population = 64usize
+                .saturating_add(largest_component_size.saturating_mul(8))
+                .saturating_add(maximum_degree);
+            let population_capped = raw_population > AUTO_BUDGET_MAX_POPULATION;
+            let population =
+                next_power_of_two(raw_population.clamp(128, AUTO_BUDGET_MAX_POPULATION))
+                    .min(AUTO_BUDGET_MAX_POPULATION);
+            let requested_generations = if required_work <= 128usize.saturating_mul(101) {
+                100
+            } else {
+                ceil_div(required_work, population).max(100)
+            };
+            (
+                population,
+                requested_generations.min(AUTO_BUDGET_MAX_GENERATIONS),
+                population_capped || requested_generations > AUTO_BUDGET_MAX_GENERATIONS,
+            )
+        }
+    };
+    let total_budget = population_size.saturating_mul(generations.saturating_add(1));
+    Ok(SearchBudgetResolution {
+        version: SEARCH_BUDGET_ESTIMATOR_VERSION.into(),
+        requested_mode: mode,
+        population_size,
+        generations,
+        total_budget,
+        required_work,
+        auto_cap_population: AUTO_BUDGET_MAX_POPULATION,
+        auto_cap_generations: AUTO_BUDGET_MAX_GENERATIONS,
+        capped,
+        site_count: sites.len(),
+        component_sizes: components.iter().map(Vec::len).collect(),
+        graph_edges,
+        maximum_degree,
+        largest_component_size,
+        site_pose_needs,
+        conformer_counts,
+        vmm_basin_counts,
+        rotamer_counts,
+        termination_reason: capped.then(|| "auto_cap_reached".into()),
+    })
+}
+
+fn positive_vmm_count(components: &[VonMisesComponent]) -> usize {
+    components
+        .iter()
+        .filter(|component| {
+            component.weight.is_finite()
+                && component.weight > 0.0
+                && component.concentration.is_finite()
+                && component.concentration >= 0.0
+        })
+        .count()
+        .max(1)
+}
+
+fn ceil_div(numerator: usize, denominator: usize) -> usize {
+    if denominator == 0 {
+        return usize::MAX;
+    }
+    numerator.saturating_add(denominator.saturating_sub(1)) / denominator
+}
+
+fn next_power_of_two(value: usize) -> usize {
+    if value <= 1 {
+        return 1;
+    }
+    value.checked_next_power_of_two().unwrap_or(usize::MAX)
+}
+
+fn connected_components(graph: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut visited = vec![false; graph.len()];
+    let mut components = Vec::new();
+    for start in 0..graph.len() {
+        if visited[start] {
+            continue;
+        }
+        let mut stack = vec![start];
+        let mut component = Vec::new();
+        visited[start] = true;
+        while let Some(index) = stack.pop() {
+            component.push(index);
+            for &neighbor in &graph[index] {
+                if !visited[neighbor] {
+                    visited[neighbor] = true;
+                    stack.push(neighbor);
+                }
+            }
+        }
+        component.sort_unstable();
+        components.push(component);
+    }
+    components
+}
+
+/// Maximum distance from the first anomeric carbon in the represented
+/// conformer library.  Pose rotations preserve this radius, so it is a
+/// conservative bound for deciding whether two attachment frames could ever
+/// produce a glycan/glycan contact.  A missing C1 is treated as unknown and
+/// keeps the graph edge instead of claiming independence.
+fn conformer_reach(site: &SearchSite) -> f64 {
+    let mut maximum = 0.0_f64;
+    let mut found_root = false;
+    for conformer in &site.ensemble.conformers {
+        let atoms = conformer.structure.atoms();
+        let Some(root) = atoms.iter().find(|atom| atom.name == "C1") else {
+            return f64::INFINITY;
+        };
+        found_root = true;
+        maximum = maximum.max(
+            atoms
+                .iter()
+                .map(|atom| squared_distance(root.position, atom.position).sqrt())
+                .fold(0.0_f64, f64::max),
+        );
+    }
+    if found_root {
+        maximum + 3.0
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// Cookbook's fast ensemble path: build a protein-compatible native pool for
@@ -3976,31 +4700,536 @@ fn cookbook_compatible_pool_sample(
     config: &SearchConfig,
     prepared: &PreparedAttachmentContext,
 ) -> Result<CompatiblePoolResult> {
-    let pool_target = frames.clamp(16, 64);
-    let max_attempts = pool_target.saturating_mul(100);
+    let base_budget = config
+        .population_size
+        .max(2)
+        .saturating_mul(config.generations.saturating_add(1));
+    // Ensemble initialization is feasibility work, so it uses the same
+    // resolved search budget as Build instead of a hidden `frames * 100`
+    // rejection limit.  The sampler still owns all subsequent burn-in and
+    // thinning transitions.
+    let global_attempt_budget = base_budget
+        .max(frames.saturating_mul(100))
+        .max(sites.len().saturating_mul(64));
+    let pool_target = compatible_pool_target(protein, sites, global_attempt_budget, frames);
+    let per_site_attempt_budget =
+        global_attempt_budget.saturating_add(sites.len().max(1) - 1) / sites.len().max(1);
+    cookbook_compatible_pool_sample_with_options(
+        protein,
+        sites,
+        frames,
+        config,
+        prepared,
+        pool_target,
+        per_site_attempt_budget,
+        false,
+        Vec::new(),
+    )
+}
+
+/// Resolve a retained pose-domain size from the caller's work and memory
+/// policy.  Compatibility tables are quadratic in neighbouring pool sizes;
+/// deriving the target from the explicit pair budget keeps large ensembles
+/// bounded without restoring the old arbitrary 32/128-pose ceiling.
+fn compatible_pool_target(
+    protein: &Structure,
+    sites: &[SearchSite],
+    proposal_budget: usize,
+    minimum: usize,
+) -> usize {
+    let per_site_budget = proposal_budget / sites.len().max(1);
+    let graph = conservative_site_graph(protein, sites);
+    let edge_count = graph.iter().map(Vec::len).sum::<usize>() / 2;
+    let pair_budget = proposal_budget.saturating_mul(32).max(16 * 16);
+    let table_target = if edge_count == 0 {
+        per_site_budget
+    } else {
+        ((pair_budget / edge_count).max(16 * 16) as f64).sqrt() as usize
+    };
+    per_site_budget.min(table_target.max(minimum.max(16)))
+}
+
+/// Build-only coverage rescue.  Unlike the native ensemble pool, this path
+/// deliberately samples every represented conformer and the full declared
+/// VMM-95 region before solving the joint pairwise constraints.  It is a
+/// bounded feasibility search; it never supplies proposals to statistical
+/// Ensemble sampling.
+fn cookbook_compatible_pool_coverage(
+    protein: &Structure,
+    sites: &[SearchSite],
+    config: &SearchConfig,
+    prepared: &PreparedAttachmentContext,
+    frames: usize,
+    proposal_budget: usize,
+) -> Result<CompatiblePoolResult> {
+    let site_count = sites.len().max(1);
+    let per_site_budget = proposal_budget / site_count;
+    // Keep enough alternatives for compatibility propagation to recover from
+    // a locally attractive but globally blocked pose.  The old fixed 32-pose
+    // pool was particularly brittle for dense tetramers: one unlucky batch
+    // could remove the only compatible basin before the solver ran.
+    // The retained-domain budget is derived from the caller's resolved work
+    // budget.  There is no fixed 32/128-pose search ceiling; allocation and
+    // pair-table checks remain bounded by the caller's resource policy.
+    // Pose-pair tables are part of the explicit compatibility budget.  Their
+    // target is derived from the number of possible edges and the caller's
+    // work allowance, rather than from a global 32/128 pose constant.  Pose
+    // discovery may still spend the full per-site attempt budget; only the
+    // retained domain is bounded when a dense table would exceed the policy.
+    let pool_target = compatible_pool_target(protein, sites, proposal_budget, 16);
+    let max_attempts = per_site_budget.max(pool_target);
+    if pool_target == 0 || max_attempts == 0 {
+        return Ok(CompatiblePoolResult {
+            states: Vec::new(),
+            pools: vec![Vec::new(); sites.len()],
+            proposals: 0,
+            attempts_per_site: vec![0; sites.len()],
+            pool_sizes: Vec::new(),
+            pool_expansions: 0,
+            compatibility_checks: 0,
+            backtracks: 0,
+            graph_edges: conservative_site_graph(protein, sites)
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+                / 2,
+        });
+    }
+    cookbook_compatible_pool_sample_with_options(
+        protein,
+        sites,
+        frames.max(1),
+        config,
+        prepared,
+        pool_target,
+        max_attempts,
+        true,
+        Vec::new(),
+    )
+}
+
+fn cookbook_compatible_pool_sample_with_options(
+    protein: &Structure,
+    sites: &[SearchSite],
+    frames: usize,
+    config: &SearchConfig,
+    prepared: &PreparedAttachmentContext,
+    pool_target: usize,
+    max_attempts: usize,
+    coverage: bool,
+    existing_pools: Vec<Vec<PooledSiteCandidate>>,
+) -> Result<CompatiblePoolResult> {
+    if !coverage || pool_target <= 16 || sites.is_empty() {
+        return cookbook_compatible_pool_sample_once(
+            protein,
+            sites,
+            frames,
+            config,
+            prepared,
+            pool_target,
+            max_attempts,
+            coverage,
+            0,
+            existing_pools,
+        );
+    }
+
+    // Grow compatible domains in deterministic rounds.  The first round is
+    // deliberately small so easy cases return a seed quickly; only a failed
+    // compatibility solve consumes the next round.  This replaces the old
+    // fixed rescue pool without making a difficult case pay the largest
+    // quadratic pair table up front.
+    let mut target = pool_target.min(16).max(1);
+    let mut remaining = vec![max_attempts; sites.len()];
+    let mut total_proposals = 0usize;
+    let mut total_attempts_per_site = vec![0usize; sites.len()];
+    let mut total_checks = 0usize;
+    let mut total_backtracks = 0usize;
+    let mut pool_expansions = 0usize;
+    let mut latest = CompatiblePoolResult {
+        states: Vec::new(),
+        pools: existing_pools.clone(),
+        proposals: 0,
+        attempts_per_site: vec![0; sites.len()],
+        pool_sizes: vec![0; sites.len()],
+        pool_expansions: 0,
+        compatibility_checks: 0,
+        backtracks: 0,
+        graph_edges: 0,
+    };
+
+    loop {
+        let rounds_remaining = std::iter::successors(Some(target), |value| {
+            (*value < pool_target).then_some(value.saturating_mul(2).min(pool_target))
+        })
+        .count()
+        .max(1);
+        // Reserve attempts for the larger domains.  Without this reservation
+        // a heavily clashing first batch could consume the entire per-site
+        // allowance before any expansion was attempted.
+        let round_limit = if target >= pool_target {
+            max_attempts
+        } else {
+            (remaining.iter().copied().min().unwrap_or(0) / rounds_remaining).max(target)
+        };
+        let per_site_limit = remaining
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(0)
+            .min(round_limit);
+        if per_site_limit == 0 {
+            break;
+        }
+        let consumed =
+            max_attempts.saturating_sub(remaining.iter().copied().min().unwrap_or(max_attempts));
+        let round = cookbook_compatible_pool_sample_once(
+            protein,
+            sites,
+            frames,
+            config,
+            prepared,
+            target,
+            per_site_limit,
+            coverage,
+            consumed as u64,
+            latest.pools.clone(),
+        )?;
+        total_proposals = total_proposals.saturating_add(round.proposals);
+        total_checks = total_checks.saturating_add(round.compatibility_checks);
+        total_backtracks = total_backtracks.saturating_add(round.backtracks);
+        for (site, attempts) in round.attempts_per_site.iter().copied().enumerate() {
+            total_attempts_per_site[site] = total_attempts_per_site[site].saturating_add(attempts);
+            remaining[site] = remaining[site].saturating_sub(attempts);
+        }
+        latest = round;
+        // A complete compatible state is already sufficient to seed Build
+        // and to initialize every ensemble chain (additional chains may
+        // reuse that start with independent RNG streams).  The previous
+        // loop ignored `round.states` and kept doubling every site pool up
+        // to the full Auto budget even after a valid joint state had been
+        // found.  On dense structures this made both CPU and GPU requests
+        // appear frozen at generation 0 while the GPU was still idle in the
+        // CPU compatibility pre-pass.
+        if !latest.states.is_empty() {
+            break;
+        }
+        if target >= pool_target {
+            break;
+        }
+        pool_expansions = pool_expansions.saturating_add(1);
+        target = target.saturating_mul(2).min(pool_target);
+    }
+
+    latest.proposals = total_proposals;
+    latest.attempts_per_site = total_attempts_per_site;
+    latest.compatibility_checks = total_checks;
+    latest.backtracks = total_backtracks;
+    latest.pool_expansions = pool_expansions;
+    Ok(latest)
+}
+
+fn cookbook_compatible_pool_sample_once(
+    protein: &Structure,
+    sites: &[SearchSite],
+    frames: usize,
+    config: &SearchConfig,
+    prepared: &PreparedAttachmentContext,
+    pool_target: usize,
+    max_attempts: usize,
+    coverage: bool,
+    seed_round: u64,
+    existing_pools: Vec<Vec<PooledSiteCandidate>>,
+) -> Result<CompatiblePoolResult> {
     let pools_with_attempts = (0..sites.len())
         .into_par_iter()
         .map(|site_index| -> Result<(Vec<PooledSiteCandidate>, usize)> {
             let mut rng = ChaCha8Rng::seed_from_u64(splitmix64(
-                config.seed ^ 0x504f_4f4c_5f53_4954 ^ site_index as u64,
+                config.seed ^ 0x504f_4f4c_5f53_4954 ^ site_index as u64 ^ seed_round,
             ));
-            let mut pool = Vec::with_capacity(pool_target);
+            let mut pool = existing_pools.get(site_index).cloned().unwrap_or_default();
+            let mut seen = pool
+                .iter()
+                .map(|candidate| pose_key(&candidate.gene))
+                .collect::<HashSet<_>>();
             let mut attempts = 0usize;
+            if coverage {
+                // Deterministic coverage comes before random supplementation.
+                // Every represented positive-population conformer and VMM
+                // component pair gets angular probes at the component centre
+                // and at symmetric points in its declared 95% region.  This
+                // makes a rare compatible basin reproducible instead of
+                // depending on a random draw landing there.
+                let site = &sites[site_index];
+                let mut conformers = site
+                    .ensemble
+                    .conformers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, conformer)| {
+                        conformer.cluster_weight.is_finite() && conformer.cluster_weight > 0.0
+                    })
+                    .map(|(index, conformer)| (index, conformer.cluster_weight))
+                    .collect::<Vec<_>>();
+                conformers.sort_by(|(left, weight_left), (right, weight_right)| {
+                    weight_right
+                        .total_cmp(weight_left)
+                        .then_with(|| left.cmp(right))
+                });
+                // Build a per-conformer stream and consume it round-robin.
+                // The previous nested order exhausted all component/angle
+                // probes for the most populated conformer before visiting
+                // the rest of the library, so a small local-pose budget could
+                // report an empty pool even when a lower-population conformer
+                // had the only protein-compatible basin.
+                // Put the component centre first, then symmetric offsets.
+                // This gives every conformer a useful central probe before a
+                // bounded round moves into the tails of its VMM region.
+                // Visit the full rectangle in a deterministic, balanced
+                // order.  Radial sorting put every small offset before the
+                // escape edge of a VMM component; a site whose compatible
+                // basin was near -0.6 sigma therefore received hundreds of
+                // repeated central probes before that basin was considered.
+                // Axis escapes come first, followed by the remaining grid
+                // points.  This is still a proposal grid, not a change to
+                // the declared VMM gate or its probability model.
+                // Keep structured probes just inside the declared circular
+                // 95% boundary.  At very high concentration the wrapped
+                // endpoint can round a few ulps outside the component even
+                // though it was generated from the same half-width, causing
+                // a sterically valid compatibility start to fail the strict
+                // VMM gate.
+                let offsets: [f64; 9] = [-0.95, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 0.95];
+                let mut offset_pairs = Vec::with_capacity(offsets.len() * offsets.len());
+                offset_pairs.push((0.0, 0.0));
+                // The first non-central shell spans the diagonal escape
+                // commonly needed by the tetramer witness (phi negative,
+                // psi positive), then the two individual axes.  A conformer
+                // receives the complete component-pair set at each shell.
+                for pair in [
+                    (-0.75, 0.25),
+                    (0.0, 0.25),
+                    (0.75, 0.25),
+                    (-0.75, 0.0),
+                    (0.75, 0.0),
+                ] {
+                    offset_pairs.push(pair);
+                }
+                for &offset in &offsets {
+                    if offset != 0.0 && !offset_pairs.contains(&(offset, 0.0)) {
+                        offset_pairs.push((offset, 0.0));
+                    }
+                }
+                for &offset in &offsets {
+                    if offset != 0.0 && !offset_pairs.contains(&(0.0, offset)) {
+                        offset_pairs.push((0.0, offset));
+                    }
+                }
+                for &phi_offset in &offsets {
+                    for &psi_offset in &offsets {
+                        if phi_offset != 0.0 && psi_offset != 0.0 {
+                            offset_pairs.push((phi_offset, psi_offset));
+                        }
+                    }
+                }
+                let rotamers = if config.scan_rotamers {
+                    std::iter::once(None)
+                        .chain(
+                            dunbrack::rotamers(protein, &site.site.residue)
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, _)| Some(index)),
+                        )
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![None]
+                };
+                let mut candidate_sets = Vec::with_capacity(conformers.len());
+                for (conformer_index, _) in &conformers {
+                    let priors = resolved_priors(
+                        protein,
+                        site,
+                        &site.ensemble.conformers[*conformer_index].priors,
+                    );
+                    let mut component_pairs = priors
+                        .phi
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(phi_index, phi)| {
+                            priors.psi.iter().enumerate().map(move |(psi_index, psi)| {
+                                (
+                                    phi_index,
+                                    psi_index,
+                                    (phi.weight.max(0.0) * psi.weight.max(0.0)),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    component_pairs.sort_by(|left, right| {
+                        right
+                            .2
+                            .total_cmp(&left.2)
+                            .then_with(|| left.0.cmp(&right.0))
+                            .then_with(|| left.1.cmp(&right.1))
+                    });
+                    // The first alternative after the dominant pair should
+                    // cover both a different phi and a different psi basin.
+                    // Pure product-weight ordering can spend the whole small
+                    // pose budget in one marginal island, while a valid pose
+                    // often needs the less-populated combination at the
+                    // other marginal mode.
+                    if let Some(&(dominant_phi, dominant_psi, _)) = component_pairs.first() {
+                        if let Some(diverse_index) = component_pairs
+                            .iter()
+                            .enumerate()
+                            .skip(1)
+                            .filter(|(_, (phi, psi, _))| {
+                                *phi != dominant_phi && *psi != dominant_psi
+                            })
+                            .max_by(|(_, left), (_, right)| {
+                                left.2
+                                    .total_cmp(&right.2)
+                                    .then_with(|| right.0.cmp(&left.0))
+                                    .then_with(|| right.1.cmp(&left.1))
+                            })
+                            .map(|(index, _)| index)
+                        {
+                            component_pairs.swap(1, diverse_index);
+                        }
+                    }
+                    let mut candidates = Vec::new();
+                    for &rotamer in &rotamers {
+                        // Balance the two discrete dimensions.  A simple
+                        // component-major or offset-major nested loop can
+                        // spend a small frontier on one dimension and miss a
+                        // compatible combination in the other.  The coprime
+                        // stride visits different VMM pairs at each angular
+                        // shell while retaining stable, reproducible order.
+                        let component_count = component_pairs.len().max(1);
+                        let offset_count = offset_pairs.len().max(1);
+                        let total = component_pairs.len().saturating_mul(offset_count);
+                        for candidate_index in 0..total {
+                            let component_index = candidate_index % component_count;
+                            let offset_index = (candidate_index / component_count) % offset_count;
+                            let (phi_component_index, psi_component_index, _) =
+                                component_pairs[component_index];
+                            let (phi_offset, psi_offset) = offset_pairs[offset_index];
+                            let Some(phi_component) = priors.phi.get(phi_component_index) else {
+                                continue;
+                            };
+                            let Some(psi_component) = priors.psi.get(psi_component_index) else {
+                                continue;
+                            };
+                            candidates.push((
+                                Gene {
+                                    conformer: *conformer_index,
+                                    phi: wrap_degrees(
+                                        phi_component.mean_degrees
+                                            + phi_offset
+                                                * probability_half_width_degrees(phi_component),
+                                    ),
+                                    psi: wrap_degrees(
+                                        psi_component.mean_degrees
+                                            + psi_offset
+                                                * probability_half_width_degrees(psi_component),
+                                    ),
+                                    rotamer,
+                                },
+                                phi_component_index,
+                                psi_component_index,
+                            ));
+                        }
+                    }
+                    candidate_sets.push(candidates);
+                }
+                // The expansion round receives the number of structured
+                // probes consumed by earlier rounds.  Reusing that offset is
+                // the persistent cursor: starting every round at zero would
+                // spend the entire new allowance replaying already-seen
+                // central component pairs and would never reach the angular
+                // basins needed by a later conformer.
+                let coverage_offset = seed_round as usize;
+                let mut cursors = candidate_sets
+                    .iter()
+                    .map(|candidates| coverage_offset.min(candidates.len()))
+                    .collect::<Vec<_>>();
+                // Reserve part of every round for weighted random
+                // supplementation. The grid guarantees broad conformer and
+                // component coverage, while seeded draws can still land in a
+                // narrow off-centre basin between those probes.
+                let coverage_limit = max_attempts.saturating_mul(3) / 4;
+                'coverage: loop {
+                    let mut progressed = false;
+                    for (candidates, cursor) in candidate_sets.iter().zip(&mut cursors) {
+                        if attempts >= coverage_limit.max(1) || pool.len() >= pool_target {
+                            break 'coverage;
+                        }
+                        let Some((gene, phi_component, psi_component)) = candidates.get(*cursor)
+                        else {
+                            continue;
+                        };
+                        *cursor += 1;
+                        attempts += 1;
+                        progressed = true;
+                        let key = pose_key(gene);
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        if let Some(pose) =
+                            prepared.prepare_site_pose(site_index, gene, config.clash_distance)?
+                        {
+                            pool.push(PooledSiteCandidate {
+                                gene: gene.clone(),
+                                phi_component: *phi_component,
+                                psi_component: *psi_component,
+                                pose,
+                            });
+                        }
+                    }
+                    if !progressed {
+                        break;
+                    }
+                }
+            }
+            // Random supplementation preserves variation when the structured
+            // grid has not yet filled the requested pool (and keeps the native
+            // sampler's historical weighted proposal distribution intact).
             while pool.len() < pool_target && attempts < max_attempts {
                 attempts += 1;
-                let chromosome = cookbook_generate_native(
-                    protein,
-                    std::slice::from_ref(&sites[site_index]),
-                    &mut rng,
-                );
-                let gene = chromosome.genes[0].clone();
+                let chromosome = if coverage {
+                    let mut chromosome =
+                        CookbookStericChromosome::new(std::slice::from_ref(&sites[site_index]));
+                    let (gene, phi_component, psi_component) =
+                        cookbook_sample_gene(protein, &sites[site_index], &mut rng, 0.85);
+                    chromosome.genes.push(gene);
+                    chromosome.phi_components.push(phi_component);
+                    chromosome.psi_components.push(psi_component);
+                    chromosome
+                } else {
+                    cookbook_generate_native(
+                        protein,
+                        std::slice::from_ref(&sites[site_index]),
+                        &mut rng,
+                    )
+                };
+                // A malformed or partially restored one-site chromosome must
+                // be reported as an empty proposal, never as a WASM bounds
+                // trap.  This path is reached during dense multi-site
+                // ensemble initialization where a pool may be depleted.
+                let Some(gene) = chromosome.genes.first().cloned() else {
+                    continue;
+                };
+                let key = pose_key(&gene);
+                if !seen.insert(key) {
+                    continue;
+                }
                 if let Some(pose) =
                     prepared.prepare_site_pose(site_index, &gene, config.clash_distance)?
                 {
                     pool.push(PooledSiteCandidate {
                         gene,
-                        phi_component: chromosome.phi_components[0],
-                        psi_component: chromosome.psi_components[0],
+                        phi_component: chromosome.phi_components.first().copied().unwrap_or(0),
+                        psi_component: chromosome.psi_components.first().copied().unwrap_or(0),
                         pose,
                     });
                 }
@@ -4012,20 +5241,49 @@ fn cookbook_compatible_pool_sample(
         .iter()
         .map(|(_, attempts)| *attempts)
         .sum();
+    let attempts_per_site = pools_with_attempts
+        .iter()
+        .map(|(_, attempts)| *attempts)
+        .collect::<Vec<_>>();
     let pools = pools_with_attempts
         .into_iter()
         .map(|(pool, _)| pool)
         .collect::<Vec<_>>();
     if pools.iter().any(Vec::is_empty) {
+        let pool_sizes = pools.iter().map(Vec::len).collect();
         return Ok(CompatiblePoolResult {
             states: Vec::new(),
+            pools,
             proposals,
+            attempts_per_site,
+            pool_sizes,
+            pool_expansions: 0,
+            compatibility_checks: 0,
+            backtracks: 0,
+            graph_edges: conservative_site_graph(protein, sites)
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+                / 2,
         });
     }
 
-    let pairs = (0..sites.len())
-        .flat_map(|first| ((first + 1)..sites.len()).map(move |second| (first, second)))
+    let graph = conservative_site_graph(protein, sites);
+    let pairs = graph
+        .iter()
+        .enumerate()
+        .flat_map(|(first, neighbours)| {
+            neighbours
+                .iter()
+                .copied()
+                .filter(move |second| *second > first)
+                .map(move |second| (first, second))
+        })
         .collect::<Vec<_>>();
+    let compatibility_checks = pairs
+        .iter()
+        .map(|(first, second)| pools[*first].len().saturating_mul(pools[*second].len()))
+        .sum();
     let computed = pairs
         .into_par_iter()
         .map(|(first, second)| {
@@ -4059,65 +5317,216 @@ fn cookbook_compatible_pool_sample(
         second_site: usize,
         second_candidate: usize,
     ) -> bool {
+        let Some(row) = tables.get(first_site.min(second_site)) else {
+            return false;
+        };
+        let table = row
+            .get(first_site.max(second_site))
+            .and_then(Option::as_ref);
+        let Some(matrix) = table else {
+            // Sites without a conservative edge are independent.  A missing
+            // row for an otherwise valid site is malformed solver state and
+            // must reject the branch rather than trap the WASM worker.
+            return tables.get(first_site).is_some() && tables.get(second_site).is_some();
+        };
         if first_site < second_site {
-            tables[first_site][second_site]
-                .as_ref()
-                .is_none_or(|matrix| matrix[first_candidate][second_candidate])
+            matrix
+                .get(first_candidate)
+                .and_then(|row| row.get(second_candidate))
+                .copied()
+                .unwrap_or(false)
         } else {
-            tables[second_site][first_site]
-                .as_ref()
-                .is_none_or(|matrix| matrix[second_candidate][first_candidate])
+            matrix
+                .get(second_candidate)
+                .and_then(|row| row.get(first_candidate))
+                .copied()
+                .unwrap_or(false)
+        }
+    }
+
+    // Enforce arc consistency before branching.  The old recursive solver
+    // only compared a candidate with already assigned sites, so it could
+    // spend thousands of nodes exploring values that had already lost all
+    // support in an unassigned neighbouring pool.  Keeping the domains as
+    // pose indices makes the propagation cheap and leaves the expensive
+    // geometry checks in the precomputed compatibility tables.
+    fn propagate_domains(
+        domains: &mut [Vec<usize>],
+        tables: &[Vec<Option<Vec<Vec<bool>>>>],
+    ) -> bool {
+        loop {
+            let mut changed = false;
+            for site in 0..domains.len() {
+                let retained = domains[site]
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        (0..domains.len()).all(|other_site| {
+                            other_site == site
+                                || domains[other_site].iter().any(|other_candidate| {
+                                    compatible(
+                                        tables,
+                                        site,
+                                        *candidate,
+                                        other_site,
+                                        *other_candidate,
+                                    )
+                                })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if retained.is_empty() {
+                    return false;
+                }
+                if retained.len() != domains[site].len() {
+                    domains[site] = retained;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return true;
+            }
         }
     }
 
     fn choose_set(
-        pools: &[Vec<PooledSiteCandidate>],
         tables: &[Vec<Option<Vec<Vec<bool>>>>],
+        domains: Vec<Vec<usize>>,
         selected: &mut [Option<usize>],
         rng: &mut ChaCha8Rng,
         backtracks: &mut usize,
         max_backtracks: usize,
     ) -> bool {
-        if selected.iter().all(Option::is_some) {
-            return true;
-        }
         if *backtracks >= max_backtracks {
             return false;
         }
-        let mut best_site = None;
-        let mut best_domain = Vec::new();
-        for site in 0..pools.len() {
-            if selected[site].is_some() {
-                continue;
-            }
-            let domain = (0..pools[site].len())
-                .filter(|candidate| {
-                    selected.iter().enumerate().all(|(other_site, other)| {
-                        other.is_none_or(|other_candidate| {
-                            compatible(tables, site, *candidate, other_site, other_candidate)
-                        })
-                    })
-                })
-                .collect::<Vec<_>>();
-            if domain.is_empty() {
-                return false;
-            }
-            if best_site.is_none() || domain.len() < best_domain.len() {
-                best_site = Some(site);
-                best_domain = domain;
-            }
+        let mut domains = domains;
+        if !propagate_domains(&mut domains, tables) {
+            return false;
         }
-        let Some(site) = best_site else {
+        if domains.iter().all(|domain| domain.len() == 1) {
+            for (site, domain) in domains.iter().enumerate() {
+                selected[site] = domain.first().copied();
+            }
             return true;
+        }
+
+        // MRV chooses the smallest remaining domain.  Among equal domains,
+        // prefer the site with the greatest number of constrained neighbours;
+        // this exposes a failing coupled region earlier than stable site
+        // order alone.
+        let Some(site) = (0..domains.len())
+            .filter(|site| domains[*site].len() > 1)
+            .min_by(|left, right| {
+                domains[*left]
+                    .len()
+                    .cmp(&domains[*right].len())
+                    .then_with(|| {
+                        let left_degree =
+                            tables[*left].iter().filter(|entry| entry.is_some()).count();
+                        let right_degree = tables[*right]
+                            .iter()
+                            .filter(|entry| entry.is_some())
+                            .count();
+                        right_degree.cmp(&left_degree)
+                    })
+                    .then_with(|| left.cmp(right))
+            })
+        else {
+            // Propagation should have returned above when all domains became
+            // singleton.  Treat any inconsistent intermediate state as a
+            // failed branch instead of relying on an invariant that can be
+            // violated by a depleted browser search pool.
+            return false;
         };
-        best_domain.shuffle(rng);
-        for candidate in best_domain {
-            selected[site] = Some(candidate);
-            if choose_set(pools, tables, selected, rng, backtracks, max_backtracks) {
+
+        let mut candidates = domains[site].clone();
+        // Try poses with the most remaining support first.  This is only a
+        // search ordering heuristic; probability remains a secondary tie
+        // breaker and never changes the steric compatibility gate.
+        candidates.sort_by_key(|candidate| {
+            let support = (0..domains.len())
+                .filter(|other_site| *other_site != site)
+                .map(|other_site| {
+                    domains[other_site]
+                        .iter()
+                        .filter(|other_candidate| {
+                            compatible(tables, site, *candidate, other_site, **other_candidate)
+                        })
+                        .count()
+                })
+                .sum::<usize>();
+            std::cmp::Reverse(support)
+        });
+        // Randomize only exact support ties so seeded runs retain coverage
+        // diversity without sacrificing the deterministic ordering of the
+        // compatibility heuristic.
+        let mut start = 0;
+        while start < candidates.len() {
+            let support = (0..domains.len())
+                .filter(|other_site| *other_site != site)
+                .map(|other_site| {
+                    domains[other_site]
+                        .iter()
+                        .filter(|other_candidate| {
+                            compatible(
+                                tables,
+                                site,
+                                candidates[start],
+                                other_site,
+                                **other_candidate,
+                            )
+                        })
+                        .count()
+                })
+                .sum::<usize>();
+            let end = (start + 1..=candidates.len())
+                .find(|end| {
+                    *end == candidates.len() || {
+                        let value = (0..domains.len())
+                            .filter(|other_site| *other_site != site)
+                            .map(|other_site| {
+                                domains[other_site]
+                                    .iter()
+                                    .filter(|other_candidate| {
+                                        compatible(
+                                            tables,
+                                            site,
+                                            candidates[*end],
+                                            other_site,
+                                            **other_candidate,
+                                        )
+                                    })
+                                    .count()
+                            })
+                            .sum::<usize>();
+                        value != support
+                    }
+                })
+                .unwrap_or(candidates.len());
+            if end > start + 1 {
+                candidates[start..end].shuffle(rng);
+            }
+            start = end;
+        }
+
+        for candidate in candidates {
+            let mut branch = domains.clone();
+            branch[site] = vec![candidate];
+            let mut branch_selected = selected.to_vec();
+            branch_selected[site] = Some(candidate);
+            if choose_set(
+                tables,
+                branch,
+                &mut branch_selected,
+                rng,
+                backtracks,
+                max_backtracks,
+            ) {
+                selected.copy_from_slice(&branch_selected);
                 return true;
             }
-            selected[site] = None;
-            *backtracks += 1;
+            *backtracks = (*backtracks).saturating_add(1);
             if *backtracks >= max_backtracks {
                 return false;
             }
@@ -4128,27 +5537,36 @@ fn cookbook_compatible_pool_sample(
     let mut rng = ChaCha8Rng::seed_from_u64(splitmix64(config.seed ^ 0x434f_4d42_494e_4500));
     let mut states = Vec::with_capacity(frames);
     let mut seen = HashSet::new();
-    let max_restarts = frames.saturating_mul(50).max(100);
+    let mut solver_backtracks = 0usize;
+    let max_restarts = frames.saturating_mul(8).max(8);
     for _ in 0..max_restarts {
         if states.len() >= frames {
             break;
         }
         let mut selected = vec![None; sites.len()];
         let mut backtracks = 0usize;
-        if !choose_set(
-            &pools,
+        let domains = pools
+            .iter()
+            .map(|pool| (0..pool.len()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let found = choose_set(
             &compatibility,
+            domains,
             &mut selected,
             &mut rng,
             &mut backtracks,
             10_000,
-        ) {
+        );
+        solver_backtracks = solver_backtracks.saturating_add(backtracks);
+        if !found {
             continue;
         }
-        let indices = selected
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .expect("complete compatible set");
+        let Some(indices) = selected.into_iter().collect::<Option<Vec<_>>>() else {
+            // A solver branch may report success after propagation while a
+            // stale/partially expanded domain did not populate every slot.
+            // Keep searching from the next deterministic restart.
+            continue;
+        };
         if !seen.insert(indices.clone()) {
             continue;
         }
@@ -4172,7 +5590,26 @@ fn cookbook_compatible_pool_sample(
                 .collect(),
         ));
     }
-    Ok(CompatiblePoolResult { states, proposals })
+    Ok(CompatiblePoolResult {
+        states,
+        pools: pools.clone(),
+        proposals,
+        attempts_per_site,
+        pool_sizes: pools.iter().map(Vec::len).collect(),
+        pool_expansions: 0,
+        compatibility_checks,
+        backtracks: solver_backtracks,
+        graph_edges: graph.iter().map(Vec::len).sum::<usize>() / 2,
+    })
+}
+
+fn pose_key(gene: &Gene) -> (usize, u64, u64, Option<usize>) {
+    (
+        gene.conformer,
+        gene.phi.to_bits(),
+        gene.psi.to_bits(),
+        gene.rotamer,
+    )
 }
 
 fn default_sampling_temperature_k() -> f64 {
@@ -4259,7 +5696,7 @@ where
     }
     validate_site_priors(protein, sites)?;
     let preparation_started = Instant::now();
-    let prepared = PreparedAttachmentContext::new(protein, sites)?;
+    let prepared = PreparedAttachmentContext::new(protein, sites, config.scan_rotamers)?;
     let preparation_seconds = preparation_started.elapsed().as_secs_f64();
     let sampling_started = Instant::now();
     let energy_context = if config.scoring_mode != SearchScoringMode::StericPrior {
@@ -4298,6 +5735,38 @@ where
     } else {
         None
     };
+    let initial_states = if config.scoring_mode != SearchScoringMode::StericPrior && sites.len() > 1
+    {
+        // Refined conformer collections use the same compatibility starts as
+        // energy Build. This is only an initialization aid; subsequent
+        // collection proposals and minimization retain their existing
+        // semantics and are not treated as statistical transitions.
+        let budget = config
+            .population_size
+            .max(2)
+            .saturating_mul(config.generations.saturating_add(1))
+            .saturating_mul(2);
+        if budget == 0 {
+            Arc::new(Vec::new())
+        } else {
+            Arc::new(
+                cookbook_compatible_pool_coverage(
+                    protein,
+                    sites,
+                    config,
+                    &prepared,
+                    config.population_size.max(2).min(4),
+                    budget,
+                )?
+                .states
+                .into_iter()
+                .map(|(genes, _, _)| genes)
+                .collect::<Vec<_>>(),
+            )
+        }
+    } else {
+        Arc::new(Vec::new())
+    };
     let problem = SearchProblem {
         protein,
         sites,
@@ -4305,12 +5774,16 @@ where
         clash_distance: config.clash_distance,
         scan_rotamers: config.scan_rotamers,
         scoring_mode: config.scoring_mode,
+        selection_policy: config.selection_policy,
         use_obc2: config.use_obc2,
         pre_minimization: config.pre_minimization,
         pre_minimization_iterations: config.pre_minimization_iterations,
         energy_context: energy_context.as_ref(),
         prepared: &prepared,
         prior_cache: compile_prior_cache(protein, sites)?,
+        vmm_priors: compile_vmm_prior_cache(protein, sites),
+        initial_states,
+        initial_state_cursor: AtomicUsize::new(0),
     };
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
     let mut accepted = Vec::with_capacity(frames);
@@ -4772,6 +6245,14 @@ where
         native_accepts,
         mh_proposals,
         mh_accepts,
+        single_site_proposals: 0,
+        pair_proposals: 0,
+        group_proposals: 0,
+        whole_state_proposals: 0,
+        single_site_accepts: 0,
+        pair_accepts: 0,
+        group_accepts: 0,
+        whole_state_accepts: 0,
         burn_in_sweeps: config.mh_burn_in_sweeps,
         thinning_accepted: config.mh_thinning_accepted,
         temperature_k: config.temperature_k,
@@ -5771,6 +7252,9 @@ fn sample_rotamer_biased(
 }
 
 fn weighted_index(weights: &[f64], rng: &mut ChaCha8Rng) -> usize {
+    if weights.is_empty() {
+        return 0;
+    }
     let total = weights
         .iter()
         .filter(|weight| weight.is_finite() && **weight > 0.0)
@@ -5791,6 +7275,9 @@ fn weighted_index(weights: &[f64], rng: &mut ChaCha8Rng) -> usize {
 }
 
 fn weighted_index_by<T>(items: &[T], weight: impl Fn(&T) -> f64, rng: &mut ChaCha8Rng) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
     let total = items
         .iter()
         .map(&weight)
@@ -5818,6 +7305,40 @@ fn weighted_conformer_index(ensemble: &GlycanEnsemble, rng: &mut ChaCha8Rng) -> 
         |conformer| conformer.cluster_weight,
         rng,
     )
+}
+
+/// Select a represented conformer uniformly for a steric feasibility draw.
+///
+/// This is deliberately separate from `weighted_conformer_index`: a Build
+/// first has to discover a jointly clash-free state, so population-weighted
+/// draws can hide a rare but geometrically necessary conformer.  Once a
+/// feasible state exists, the normal joint-prior comparator applies the
+/// recorded populations.  Statistical Ensemble proposals continue to use
+/// `weighted_conformer_index` and therefore keep their target distribution.
+fn coverage_conformer_index(ensemble: &GlycanEnsemble, rng: &mut ChaCha8Rng) -> usize {
+    if ensemble.conformers.is_empty() {
+        return 0;
+    }
+    let positive = ensemble
+        .conformers
+        .iter()
+        .filter(|conformer| conformer.cluster_weight.is_finite() && conformer.cluster_weight > 0.0)
+        .count();
+    if positive == 0 {
+        return rng.random_range(0..ensemble.conformers.len());
+    }
+    let mut rank = rng.random_range(0..positive);
+    for (index, conformer) in ensemble.conformers.iter().enumerate() {
+        if conformer.cluster_weight.is_finite() && conformer.cluster_weight > 0.0 {
+            if rank == 0 {
+                return index;
+            }
+            rank -= 1;
+        }
+    }
+    // `positive` was counted from this same predicate, so this is only a
+    // defensive fallback for a concurrently-mutated test value.
+    ensemble.conformers.len() - 1
 }
 
 fn weighted_vmm_component_index(components: &[VonMisesComponent], rng: &mut ChaCha8Rng) -> usize {
@@ -5913,6 +7434,160 @@ mod tests {
 
     const GLYCAN: &str = include_str!("../../../tests/fixtures/glycan.pdb");
     const PROTEIN: &str = include_str!("../../../tests/fixtures/protein.pdb");
+
+    #[test]
+    fn score_only_crossover_preserves_site_layout_when_coordinates_are_absent() {
+        let gene = Gene {
+            conformer: 0,
+            phi: 0.0,
+            psi: 0.0,
+            rotamer: None,
+        };
+        let first = CookbookStericChromosome {
+            genes: vec![gene.clone(), gene.clone()],
+            phi_components: vec![0, 0],
+            psi_components: vec![0, 0],
+            frozen_mask: vec![false, false],
+            conformations: vec![None, None],
+            site_grids: vec![None, None],
+            dirty: vec![true, true],
+            valid_mask: vec![true, true],
+            steric_scores: vec![1.0, 1.0],
+            fitness: 1.0,
+        };
+        let mut second = first.clone();
+        // This is the state produced by the old score-only GPU bookkeeping
+        // path. It must be treated as “no coordinates for these sites”, not as
+        // a chromosome with zero sites.
+        second.conformations.clear();
+        second.site_grids.clear();
+        for seed in 0..8 {
+            let child = cookbook_crossover(&first, &second, &mut ChaCha8Rng::seed_from_u64(seed));
+            assert_eq!(child.genes.len(), 2);
+            assert_eq!(child.conformations.len(), 2);
+            assert_eq!(child.site_grids.len(), 2);
+        }
+    }
+
+    #[test]
+    fn crossover_repairs_partial_parent_bookkeeping_without_trapping() {
+        let gene = Gene {
+            conformer: 0,
+            phi: 0.0,
+            psi: 0.0,
+            rotamer: None,
+        };
+        let first = CookbookStericChromosome {
+            genes: vec![gene.clone(), gene.clone()],
+            phi_components: Vec::new(),
+            psi_components: Vec::new(),
+            frozen_mask: Vec::new(),
+            conformations: Vec::new(),
+            site_grids: Vec::new(),
+            dirty: Vec::new(),
+            valid_mask: Vec::new(),
+            steric_scores: Vec::new(),
+            fitness: f64::INFINITY,
+        };
+        let mut second = first.clone();
+        // A stale score-only parent can also have fewer genes than the current
+        // problem layout.  The crossover must retain the first parent's site
+        // value for that suffix instead of indexing past the second parent.
+        second.genes.pop();
+        for seed in 0..16 {
+            let child = cookbook_crossover(&first, &second, &mut ChaCha8Rng::seed_from_u64(seed));
+            assert_eq!(child.genes.len(), 2);
+            assert_eq!(child.phi_components.len(), 2);
+            assert_eq!(child.psi_components.len(), 2);
+            assert_eq!(child.frozen_mask.len(), 2);
+            assert_eq!(child.conformations.len(), 2);
+            assert_eq!(child.site_grids.len(), 2);
+            assert_eq!(child.dirty.len(), 2);
+            assert_eq!(child.valid_mask.len(), 2);
+            assert_eq!(child.steric_scores.len(), 2);
+        }
+    }
+
+    #[test]
+    fn auto_budget_keeps_small_jobs_at_the_reliability_floor() {
+        let query = GlycanQuery {
+            source: GlycanSource::LocalBundle(PathBuf::from("budget.pdb")),
+            anomer: Anomer::Beta,
+            format: "PDB".into(),
+            level: "2".into(),
+        };
+        let ensemble = ensemble_from_pdb(GLYCAN, None, query, "budget").unwrap();
+        let site = SearchSite {
+            site: reglyco_core::GlycosylationSite::new("A", 1),
+            ensemble,
+        };
+        let protein = read_pdb_str(PROTEIN, &dry_options()).unwrap();
+        let budget = resolve_search_budget(
+            &protein,
+            std::slice::from_ref(&site),
+            false,
+            Some(SearchBudgetMode::Auto),
+            128,
+            100,
+        )
+        .unwrap();
+        assert_eq!(budget.population_size, 128);
+        assert_eq!(budget.generations, 100);
+        assert!(!budget.capped);
+    }
+
+    #[test]
+    fn auto_budget_caps_a_dense_sixteen_site_fixture_without_overflow() {
+        let query = GlycanQuery {
+            source: GlycanSource::LocalBundle(PathBuf::from("budget-dense.pdb")),
+            anomer: Anomer::Beta,
+            format: "PDB".into(),
+            level: "2".into(),
+        };
+        let ensemble = ensemble_from_pdb(GLYCAN, None, query, "budget-dense").unwrap();
+        let sites = (0..16)
+            .map(|_| SearchSite {
+                site: reglyco_core::GlycosylationSite::new("A", 1),
+                ensemble: ensemble.clone(),
+            })
+            .collect::<Vec<_>>();
+        let protein = read_pdb_str(PROTEIN, &dry_options()).unwrap();
+        let budget = resolve_search_budget(
+            &protein,
+            &sites,
+            false,
+            Some(SearchBudgetMode::Auto),
+            128,
+            100,
+        )
+        .unwrap();
+        assert_eq!(budget.site_count, 16);
+        assert_eq!(budget.graph_edges, 120);
+        assert_eq!(budget.population_size, 256);
+        assert_eq!(budget.generations, 500);
+        assert!(budget.capped);
+        assert!(budget.required_work > budget.total_budget);
+    }
+
+    #[test]
+    fn omitted_budget_mode_is_explicitly_manual_for_legacy_requests() {
+        let query = GlycanQuery {
+            source: GlycanSource::LocalBundle(PathBuf::from("budget-manual.pdb")),
+            anomer: Anomer::Beta,
+            format: "PDB".into(),
+            level: "2".into(),
+        };
+        let ensemble = ensemble_from_pdb(GLYCAN, None, query, "budget-manual").unwrap();
+        let site = SearchSite {
+            site: reglyco_core::GlycosylationSite::new("A", 1),
+            ensemble,
+        };
+        let protein = read_pdb_str(PROTEIN, &dry_options()).unwrap();
+        let budget = resolve_search_budget(&protein, &[site], false, None, 37, 19).unwrap();
+        assert_eq!(budget.requested_mode, SearchBudgetMode::Manual);
+        assert_eq!(budget.population_size, 37);
+        assert_eq!(budget.generations, 19);
+    }
 
     #[test]
     fn canonicalizes_supported_provider_formats_and_rejects_unknown_values() {
@@ -6108,6 +7783,27 @@ mod tests {
         }
         let fraction = first as f64 / 10_000.0;
         assert!((fraction - 0.8).abs() < 0.02, "observed {fraction}");
+    }
+
+    #[test]
+    fn steric_coverage_sampling_does_not_hide_rare_conformers() {
+        let model = GLYCAN.trim_end_matches("END\n");
+        let pdb = format!("MODEL        1\n{model}ENDMDL\nMODEL        2\n{model}ENDMDL\n");
+        let query = GlycanQuery {
+            source: GlycanSource::LocalBundle(PathBuf::from("coverage.pdb")),
+            anomer: Anomer::Beta,
+            format: "PDB".into(),
+            level: "2".into(),
+        };
+        let mut ensemble = ensemble_from_pdb(&pdb, None, query, "coverage").unwrap();
+        ensemble.conformers[0].cluster_weight = 99.0;
+        ensemble.conformers[1].cluster_weight = 1.0;
+        let mut rng = ChaCha8Rng::seed_from_u64(73);
+        let draws = (0..256)
+            .map(|_| coverage_conformer_index(&ensemble, &mut rng))
+            .collect::<Vec<_>>();
+        assert!(draws.contains(&0));
+        assert!(draws.contains(&1));
     }
 
     #[test]
@@ -6437,7 +8133,7 @@ mod tests {
         }];
         let structure = build_state(&protein, &sites, &state, &builder).unwrap();
         let reference = steric_site_scores(&structure, 1.7);
-        let prepared = PreparedAttachmentContext::new(&protein, &sites).unwrap();
+        let prepared = PreparedAttachmentContext::new(&protein, &sites, false).unwrap();
         let fast = prepared.evaluate(&state, 1.7).unwrap();
         let fast_coordinates = prepared.site_coordinates(&state).unwrap();
         let residues = structure.metadata().glycan_trees[0]
@@ -6489,6 +8185,526 @@ mod tests {
                 .zip(fast.site_scores)
                 .all(|(a, b)| (a - b).abs() < 1.0e-8)
         );
+    }
+
+    #[test]
+    #[ignore = "set REGLYCO_TETRAMER_WITNESS_DIR to run the frozen local witness audit"]
+    fn tetramer_witness_replays_through_prepared_context() {
+        let root = std::env::var("REGLYCO_TETRAMER_WITNESS_DIR")
+            .expect("set REGLYCO_TETRAMER_WITNESS_DIR");
+        let root = PathBuf::from(root);
+        let protein_text = fs::read_to_string(root.join("tetramer-protein-scaffold.pdb")).unwrap();
+        let protein = read_pdb_str(&protein_text, &dry_options()).unwrap();
+        let assignments = [
+            (
+                "A",
+                138,
+                "G92042VQ",
+                8usize,
+                244.70975503750356,
+                215.06040312066236,
+                'I',
+            ),
+            (
+                "C",
+                138,
+                "G92042VQ",
+                8usize,
+                263.3592065378453,
+                167.16176781713145,
+                'J',
+            ),
+            (
+                "E",
+                138,
+                "G92042VQ",
+                8usize,
+                258.2616864424269,
+                169.920751670931,
+                'K',
+            ),
+            (
+                "G",
+                138,
+                "G92042VQ",
+                2usize,
+                246.3636113096466,
+                180.15197907056614,
+                'L',
+            ),
+            (
+                "A",
+                350,
+                "G00028MO",
+                2usize,
+                57.41016756858368,
+                185.48277574168097,
+                'M',
+            ),
+            (
+                "C",
+                350,
+                "G00028MO",
+                0usize,
+                68.13629127402837,
+                144.77062339456134,
+                'N',
+            ),
+            (
+                "E",
+                350,
+                "G00028MO",
+                18usize,
+                68.8634929004141,
+                158.224916610495,
+                'O',
+            ),
+            (
+                "G",
+                350,
+                "G00028MO",
+                0usize,
+                61.06374740136145,
+                182.60351862813798,
+                'P',
+            ),
+            (
+                "A",
+                402,
+                "G48369JO",
+                10usize,
+                82.26559781319085,
+                172.67603457898605,
+                'Q',
+            ),
+            (
+                "C",
+                402,
+                "G48369JO",
+                4usize,
+                70.15669245057433,
+                177.63325495850322,
+                'R',
+            ),
+            (
+                "E",
+                402,
+                "G48369JO",
+                8usize,
+                78.87924332217361,
+                180.17664681709147,
+                'S',
+            ),
+            (
+                "G",
+                402,
+                "G48369JO",
+                8usize,
+                57.826652651493994,
+                192.31536696234548,
+                'T',
+            ),
+            (
+                "B",
+                930,
+                "G92042VQ",
+                14usize,
+                280.93647006317747,
+                232.63580291891284,
+                'U',
+            ),
+            (
+                "D",
+                930,
+                "G92042VQ",
+                4usize,
+                278.4765953396528,
+                180.80338202065082,
+                'V',
+            ),
+            (
+                "F",
+                930,
+                "G92042VQ",
+                15usize,
+                281.0076452754818,
+                178.35656905090673,
+                'W',
+            ),
+            (
+                "H",
+                930,
+                "G92042VQ",
+                12usize,
+                275.2139086878866,
+                179.21400348938639,
+                'X',
+            ),
+        ];
+        let mut ensembles = HashMap::new();
+        for glycan in ["G92042VQ", "G00028MO", "G48369JO"] {
+            let path = fs::read_dir(root.join("level2-cache"))
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pdb"))
+                .find_map(|entry| {
+                    let text = fs::read_to_string(entry.path()).ok()?;
+                    let models = text.matches("MODEL").count();
+                    let expected = match glycan {
+                        "G92042VQ" => 26,
+                        "G00028MO" => 21,
+                        _ => 25,
+                    };
+                    (models == expected).then_some(entry.path())
+                })
+                .unwrap();
+            let query = GlycanQuery {
+                source: GlycanSource::LocalBundle(path),
+                anomer: reglyco_core::Anomer::Beta,
+                format: "PDB".into(),
+                level: "2".into(),
+            };
+            ensembles.insert(glycan, LocalBundleProvider.load(&query).unwrap());
+        }
+        let sites = assignments
+            .iter()
+            .map(|(chain, number, glycan, ..)| SearchSite {
+                site: reglyco_core::GlycosylationSite::new(*chain, *number),
+                ensemble: ensembles.get(glycan).unwrap().clone(),
+            })
+            .collect::<Vec<_>>();
+        let prepared = PreparedAttachmentContext::new(&protein, &sites, false).unwrap();
+        let genes = assignments
+            .iter()
+            .map(|(_, _, _, conformer, phi, psi, _)| Gene {
+                conformer: *conformer,
+                phi: *phi,
+                psi: *psi,
+                rotamer: None,
+            })
+            .collect::<Vec<_>>();
+        let witness_text = fs::read_to_string(
+            "/home/opc/old-cookbook-diagnostic/output-level2-large-no-rot-v2/all-normalized.pdb",
+        )
+        .unwrap();
+        let witness = read_pdb_str(&witness_text, &dry_options()).unwrap();
+        let coordinates = prepared.site_coordinates(&genes).unwrap();
+        let mut complete = true;
+        for (index, (_, _, _, _, _, _, chain)) in assignments.iter().enumerate() {
+            let pose = prepared
+                .prepare_site_pose(index, &genes[index], 1.7)
+                .unwrap();
+            let score = prepared
+                .evaluate(
+                    &genes
+                        .iter()
+                        .enumerate()
+                        .map(|(site, gene)| {
+                            if site == index {
+                                gene.clone()
+                            } else {
+                                Gene {
+                                    conformer: 0,
+                                    phi: 0.0,
+                                    psi: 0.0,
+                                    rotamer: None,
+                                }
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    1.7,
+                )
+                .map(|value| value.score);
+            let witness_atoms = witness
+                .atoms()
+                .into_iter()
+                .filter(|atom| atom.residue.chain == chain.to_string())
+                .collect::<Vec<_>>();
+            let rmsd = if witness_atoms.len() == coordinates[index].len() {
+                let sum = witness_atoms
+                    .iter()
+                    .zip(&coordinates[index])
+                    .map(|(atom, position)| squared_distance(atom.position, *position))
+                    .sum::<f64>();
+                (sum / witness_atoms.len().max(1) as f64).sqrt()
+            } else {
+                f64::INFINITY
+            };
+            println!(
+                "site {}:{} witness_chain={} pose={} score={score:?} atoms={} rmsd={rmsd:.4}",
+                assignments[index].0,
+                assignments[index].1,
+                chain,
+                pose.is_some(),
+                witness_atoms.len()
+            );
+            // The witness was emitted by Cookbook with its own atom-order
+            // serialization.  The prepared replay is the admissibility gate;
+            // coordinate RMSD remains diagnostic because one historical
+            // chain used a different atom ordering/normalization path.
+            complete &= pose.is_some();
+        }
+        assert!(
+            complete,
+            "Cookbook witness is outside the prepared representation"
+        );
+    }
+
+    #[test]
+    #[ignore = "set REGLYCO_TETRAMER_WITNESS_DIR to run the frozen pool diagnostic"]
+    fn tetramer_coverage_pool_finds_joint_starts() {
+        let root = PathBuf::from(
+            std::env::var("REGLYCO_TETRAMER_WITNESS_DIR")
+                .expect("set REGLYCO_TETRAMER_WITNESS_DIR"),
+        );
+        let protein = read_pdb_str(
+            &fs::read_to_string(root.join("tetramer-protein-scaffold.pdb")).unwrap(),
+            &dry_options(),
+        )
+        .unwrap();
+        let expected = [("G92042VQ", 26), ("G00028MO", 21), ("G48369JO", 25)];
+        let mut ensembles = HashMap::new();
+        for (glycan, models) in expected {
+            let path = fs::read_dir(root.join("level2-cache"))
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pdb"))
+                .find(|entry| {
+                    fs::read_to_string(entry.path())
+                        .map(|text| text.matches("MODEL").count() == models)
+                        .unwrap_or(false)
+                })
+                .unwrap()
+                .path();
+            let query = GlycanQuery {
+                source: GlycanSource::LocalBundle(path),
+                anomer: reglyco_core::Anomer::Beta,
+                format: "PDB".into(),
+                level: "2".into(),
+            };
+            ensembles.insert(glycan, LocalBundleProvider.load(&query).unwrap());
+        }
+        let assignments = [
+            ("A", 138, "G92042VQ"),
+            ("C", 138, "G92042VQ"),
+            ("E", 138, "G92042VQ"),
+            ("G", 138, "G92042VQ"),
+            ("A", 350, "G00028MO"),
+            ("C", 350, "G00028MO"),
+            ("E", 350, "G00028MO"),
+            ("G", 350, "G00028MO"),
+            ("A", 402, "G48369JO"),
+            ("C", 402, "G48369JO"),
+            ("E", 402, "G48369JO"),
+            ("G", 402, "G48369JO"),
+            ("B", 930, "G92042VQ"),
+            ("D", 930, "G92042VQ"),
+            ("F", 930, "G92042VQ"),
+            ("H", 930, "G92042VQ"),
+        ];
+        let sites = assignments
+            .iter()
+            .map(|(chain, number, glycan)| SearchSite {
+                site: reglyco_core::GlycosylationSite::new(*chain, *number),
+                ensemble: ensembles.get(glycan).unwrap().clone(),
+            })
+            .collect::<Vec<_>>();
+        let auto_budget = resolve_search_budget(
+            &protein,
+            &sites,
+            false,
+            Some(SearchBudgetMode::Auto),
+            128,
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            (auto_budget.population_size, auto_budget.generations),
+            (256, 500),
+            "the frozen 16-site tetramer must receive the balanced Auto budget"
+        );
+        let prepared = PreparedAttachmentContext::new(&protein, &sites, false).unwrap();
+        let config = SearchConfig {
+            population_size: 256,
+            generations: 500,
+            seed: 20260919,
+            ..SearchConfig::default()
+        };
+        let pool_budget = std::env::var("REGLYCO_TETRAMER_POOL_BUDGET")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(256 * 501 / 2);
+        let result =
+            cookbook_compatible_pool_coverage(&protein, &sites, &config, &prepared, 4, pool_budget)
+                .unwrap();
+        assert!(!result.states.is_empty());
+        for (state, _, _) in &result.states {
+            let evaluation = prepared.evaluate(state, config.clash_distance).unwrap();
+            assert!(
+                evaluation.site_scores.iter().all(|score| *score <= 1.1),
+                "compatibility solver returned an invalid complete state: {:?}",
+                evaluation.site_scores
+            );
+        }
+        for (state, phi_components, psi_components) in &result.states {
+            let first_bad = state.iter().enumerate().find_map(|(index, gene)| {
+                let priors = resolved_priors(
+                    &protein,
+                    &sites[index],
+                    &sites[index].ensemble.conformers[gene.conformer].priors,
+                );
+                let valid = priors
+                    .phi
+                    .get(phi_components[index])
+                    .is_some_and(|component| vmm_component_within_95(gene.phi, component))
+                    && priors
+                        .psi
+                        .get(psi_components[index])
+                        .is_some_and(|component| vmm_component_within_95(gene.psi, component));
+                (!valid).then_some((
+                    index,
+                    gene.clone(),
+                    priors,
+                    phi_components[index],
+                    psi_components[index],
+                ))
+            });
+            assert!(
+                first_bad.is_none(),
+                "coverage state is outside its VMM component: {first_bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "set REGLYCO_TETRAMER_ENSEMBLE_DIR to validate a generated full-site ensemble"]
+    fn tetramer_ensemble_output_is_complete_and_sterically_valid() {
+        let root = PathBuf::from(
+            std::env::var("REGLYCO_TETRAMER_ENSEMBLE_DIR")
+                .expect("set REGLYCO_TETRAMER_ENSEMBLE_DIR"),
+        );
+        let contents = fs::read_to_string(root.join("ensemble.pdb")).unwrap();
+        let models = split_pdb_models(&contents);
+        assert_eq!(models.len(), 50, "full acceptance run must emit 50 frames");
+        for (index, model) in models.iter().enumerate() {
+            let structure = read_pdb_str(model, &dry_options()).unwrap();
+            assert_eq!(
+                structure.metadata().glycan_trees.len(),
+                16,
+                "frame {} lost one or more requested attachments",
+                index + 1
+            );
+            // Verify the exported coordinates with an independent spatial
+            // traversal, rather than trusting the sampler's cached scores.
+            // This keeps the regression useful without the quadratic generic
+            // diagnostic scorer, which is prohibitively slow on a 34k-atom
+            // tetramer repeated over 50 frames.
+            let atoms = structure.atoms();
+            let cell = |position: Vec3| {
+                (
+                    (position.x / 1.7).floor() as i32,
+                    (position.y / 1.7).floor() as i32,
+                    (position.z / 1.7).floor() as i32,
+                )
+            };
+            let make_grid = |coordinates: &[Vec3]| {
+                let mut grid = HashMap::<(i32, i32, i32), Vec<usize>>::new();
+                for (index, position) in coordinates.iter().copied().enumerate() {
+                    grid.entry(cell(position)).or_default().push(index);
+                }
+                grid
+            };
+            let pair = |first: &[Vec3],
+                        excluded_first: usize,
+                        second: &[Vec3],
+                        excluded_second: usize,
+                        grid: &HashMap<(i32, i32, i32), Vec<usize>>| {
+                let mut score = 1.0;
+                let threshold2 = 1.7 * 1.7;
+                for (first_index, first_position) in first.iter().enumerate() {
+                    if first_index < excluded_first {
+                        continue;
+                    }
+                    let center = cell(*first_position);
+                    for dx in -1..=1 {
+                        for dy in -1..=1 {
+                            for dz in -1..=1 {
+                                let Some(indices) =
+                                    grid.get(&(center.0 + dx, center.1 + dy, center.2 + dz))
+                                else {
+                                    continue;
+                                };
+                                for &second_index in indices {
+                                    if second_index < excluded_second {
+                                        continue;
+                                    }
+                                    let distance2 =
+                                        squared_distance(*first_position, second[second_index]);
+                                    if distance2 < threshold2 {
+                                        score += 200.0 * (-distance2).exp();
+                                        if score > 2.0 {
+                                            return score;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                score
+            };
+            let glycan_residues = structure
+                .metadata()
+                .glycan_trees
+                .iter()
+                .flat_map(|tree| tree.residue_ids.iter().cloned())
+                .collect::<HashSet<_>>();
+            let protein_positions = atoms
+                .iter()
+                .filter(|atom| !glycan_residues.contains(&atom.residue))
+                .map(|atom| atom.position)
+                .collect::<Vec<_>>();
+            let protein_grid = make_grid(&protein_positions);
+            let glycan_positions = structure
+                .metadata()
+                .glycan_trees
+                .iter()
+                .map(|tree| {
+                    let residues = tree.residue_ids.iter().cloned().collect::<HashSet<_>>();
+                    atoms
+                        .iter()
+                        .filter(|atom| residues.contains(&atom.residue))
+                        .map(|atom| atom.position)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let grids = glycan_positions
+                .iter()
+                .map(|coordinates| make_grid(coordinates))
+                .collect::<Vec<_>>();
+            let scores = glycan_positions
+                .iter()
+                .enumerate()
+                .map(|(site, coordinates)| {
+                    let mut score = pair(coordinates, 3, &protein_positions, 0, &protein_grid);
+                    for (other, other_coordinates) in glycan_positions.iter().enumerate() {
+                        if site == other {
+                            continue;
+                        }
+                        score =
+                            score.max(pair(coordinates, 3, other_coordinates, 3, &grids[other]));
+                    }
+                    score
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(scores.len(), 16);
+            assert!(
+                scores.iter().all(|score| *score <= 1.1),
+                "frame {} failed the independent complete-structure steric gate: {:?}",
+                index + 1,
+                scores
+            );
+        }
     }
 
     #[test]

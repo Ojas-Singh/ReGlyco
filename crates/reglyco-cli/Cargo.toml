@@ -24,6 +24,7 @@ reglyco-relax = { version = "0.1.0", path = "../reglyco-relax" }
 reglyco-report = { version = "0.1.0", path = "../reglyco-report" }
 reglyco-saxs = { version = "0.1.0", path = "../reglyco-saxs" }
 reglyco-validate = { version = "0.1.0", path = "../reglyco-validate" }
+reglyco-workflow = { version = "0.1.0", path = "../reglyco-workflow" }
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true

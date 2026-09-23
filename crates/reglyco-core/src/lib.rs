@@ -691,18 +691,13 @@ pub enum GlycanSource {
 /// the authoritative residue names supplied by the structure provider; it is
 /// deliberately kept separate from the force-field/template names used by
 /// GlySys so changing the display convention cannot change scoring chemistry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ResidueNameFormat {
     #[serde(rename = "PDB", alias = "pdb")]
+    #[default]
     Pdb,
     #[serde(rename = "GLYCAM", alias = "glycam")]
     Glycam,
-}
-
-impl Default for ResidueNameFormat {
-    fn default() -> Self {
-        Self::Pdb
-    }
 }
 
 impl ResidueNameFormat {
@@ -745,6 +740,46 @@ pub struct VonMisesComponent {
 pub struct LinkagePrior {
     pub phi: Vec<VonMisesComponent>,
     pub psi: Vec<VonMisesComponent>,
+}
+
+/// How an attachment search budget is selected at the request boundary.
+///
+/// `Auto` is resolved only after the glycan assets and the receptor-dependent
+/// conflict graph have been prepared. `Manual` preserves the concrete
+/// population/generation values supplied by historical requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBudgetMode {
+    #[default]
+    Auto,
+    Manual,
+}
+
+/// Search-space measurements and the deterministic budget selected from them.
+/// This is deliberately independent of a browser or command-line adapter so
+/// every client reports the same resolution for the same prepared inputs.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchBudgetResolution {
+    pub version: String,
+    pub requested_mode: SearchBudgetMode,
+    pub population_size: usize,
+    pub generations: usize,
+    pub total_budget: usize,
+    pub required_work: usize,
+    pub auto_cap_population: usize,
+    pub auto_cap_generations: usize,
+    pub capped: bool,
+    pub site_count: usize,
+    pub component_sizes: Vec<usize>,
+    pub graph_edges: usize,
+    pub maximum_degree: usize,
+    pub largest_component_size: usize,
+    pub site_pose_needs: Vec<usize>,
+    pub conformer_counts: Vec<usize>,
+    pub vmm_basin_counts: Vec<usize>,
+    pub rotamer_counts: Vec<usize>,
+    pub termination_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -854,17 +889,12 @@ pub enum SearchScoringMode {
 /// Versioned numerical targets for energy-weighted statistical ensembles.
 /// These are sampler identities, not backend labels: a GPU execution can
 /// still fall back to a separately labelled CPU segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SamplingTarget {
+    #[default]
     CpuReferenceV1,
     WebgpuF32V1,
-}
-
-impl Default for SamplingTarget {
-    fn default() -> Self {
-        Self::CpuReferenceV1
-    }
 }
 
 /// How a completed steric search chooses among candidates that pass the
@@ -1163,6 +1193,29 @@ pub struct VmmPolishDiagnostics {
     pub geometry_cpu_seconds: f64,
     #[serde(default)]
     pub geometry_transform_seconds: f64,
+    /// Joint feasibility coordinator diagnostics. These are additive and
+    /// default cleanly for reports produced before compatibility search was
+    /// introduced.
+    #[serde(default)]
+    pub compatibility_algorithm: String,
+    #[serde(default)]
+    pub compatibility_seeded_states: usize,
+    #[serde(default)]
+    pub compatibility_pose_attempts: usize,
+    #[serde(default)]
+    pub compatibility_pool_sizes: Vec<usize>,
+    #[serde(default)]
+    pub compatibility_pool_expansions: usize,
+    #[serde(default)]
+    pub compatibility_checks: usize,
+    #[serde(default)]
+    pub compatibility_backtracks: usize,
+    #[serde(default)]
+    pub compatibility_graph_edges: usize,
+    #[serde(default)]
+    pub compatibility_attempts_per_site: Vec<usize>,
+    #[serde(default)]
+    pub compatibility_proposal_budget: usize,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

@@ -484,8 +484,11 @@ reglyco build --protein protein.pdb \
 
 Repeat `--attach`, or paired `--site` and `--glycan`, for a multi-site build.
 Glycans may be GlyTouCan identifiers or local ensemble bundles. Build runs the
-steric GA over cluster, φ, ψ, and optional Dunbrack rotamers. It requires a
-clash-free complete result unless `--allow-clashes` is explicitly supplied.
+steric GA over cluster, φ, ψ, and optional Dunbrack rotamers. It writes the
+best complete constructible result found within the configured budget, even
+when some steric or VMM gates remain unresolved. Use `--require-clash-free`
+for strict automation; `--allow-clashes` remains a compatibility alias for
+the diagnostic default.
 The output directory contains `glycoprotein.pdb` and, by default, the Amber and
 GROMACS system bundle written by GlySys. Use `--no-system` to write only the
 constructed PDB.
@@ -534,8 +537,9 @@ reglyco validate --input glycoprotein.pdb --report
 
 `build`, `search`, and `refine` accept GlycoShape API/cache/offline settings,
 GA population and generation controls, and real backbone-dependent Dunbrack
-rotamers. Exhausted search fails by default; `--allow-clashes` emits the best
-complete result and marks it visibly in JSON and terminal output.
+rotamers. An exhausted Build emits the best complete result and marks it
+visibly in JSON and terminal output; `--require-clash-free` writes those
+artifacts before returning a nonzero status when the strict gates are not met.
 
 The workspace crates are:
 

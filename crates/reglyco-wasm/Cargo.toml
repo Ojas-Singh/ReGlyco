@@ -11,7 +11,7 @@ repository = "https://github.com/Ojas-Singh/ReGlyco"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-webgpu = ["full", "reglyco-workflow/webgpu", "dep:wasm-bindgen-futures", "dep:reglyco-ensemble"]
+webgpu = ["full", "reglyco-workflow/webgpu", "dep:wasm-bindgen-futures", "dep:futures-util", "dep:reglyco-ensemble"]
 default = ["public"]
 public = ["reglyco-workflow/public"]
 full = ["reglyco-workflow/full"]
@@ -19,6 +19,7 @@ threaded = ["dep:wasm-bindgen-rayon"]
 
 [dependencies]
 wasm-bindgen-futures = { version = "0.4", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
 reglyco-ensemble = { version = "0.1.0", path = "../reglyco-ensemble", optional = true }
 getrandom.workspace = true
 js-sys.workspace = true
