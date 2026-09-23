@@ -94,7 +94,7 @@ if [[ "${gpu_enabled}" == true ]]; then
 import hashlib,json,sys
 from pathlib import Path
 root=Path(sys.argv[1]);p=root/'manifest.json';m=json.loads(p.read_text())
-for variant,key in [('full-gpu-single','fullGpuSingle'),('full-gpu-threaded','fullGpuThreaded')]:
+for variant,key in [('full-gpu-single','fullGpuSingle')]:
     js=root/variant/'reglyco.js';wasm=root/variant/'reglyco_bg.wasm'
     if js.exists() and wasm.exists():
         m['artifacts'][key]={'js':str(js.relative_to(root)),'jsSha256':hashlib.sha256(js.read_bytes()).hexdigest(),'wasm':str(wasm.relative_to(root)),'wasmSha256':hashlib.sha256(wasm.read_bytes()).hexdigest()}
