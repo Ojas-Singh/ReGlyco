@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.97"
 license.workspace = true
 description = "Separately loaded browser PDF renderer for ReGlyco reports"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
