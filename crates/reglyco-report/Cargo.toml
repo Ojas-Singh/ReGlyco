@@ -1,6 +1,6 @@
 [package]
 name = "reglyco-report"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -14,7 +14,7 @@ crabwurcs-core.workspace = true
 crabwurcs-pdb.workspace = true
 crabwurcs-snfg.workspace = true
 contour.workspace = true
-crabsaxs = { package = "crabsaxs", version = "0.1.0", path = "../../../crabSAXS" }
+crabsaxs = { package = "crabsaxs", version = "0.1.1", path = "../../../crabSAXS" }
 petgraph.workspace = true
 glysys.workspace = true
 glysys-energy.workspace = true

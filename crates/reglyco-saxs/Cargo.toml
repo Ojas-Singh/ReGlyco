@@ -1,6 +1,6 @@
 [package]
 name = "reglyco-saxs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -8,7 +8,7 @@ description = "SAXS-refinement interfaces for ReGlyco"
 repository = "https://github.com/Ojas-Singh/ReGlyco"
 
 [dependencies]
-crabsaxs = { package = "crabsaxs", version = "0.1.0", path = "../../../crabSAXS" }
+crabsaxs = { package = "crabsaxs", version = "0.1.1", path = "../../../crabSAXS" }
 glysys.workspace = true
 nalgebra = "0.33"
 rayon.workspace = true

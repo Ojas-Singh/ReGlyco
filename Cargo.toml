@@ -1,6 +1,6 @@
 [package]
 name = "reglyco"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.97"
 authors = ["ReGlyco contributors"]
@@ -26,8 +26,8 @@ reglyco-density = { version = "0.1.0", path = "crates/reglyco-density" }
 reglyco-ensemble = { version = "0.1.0", path = "crates/reglyco-ensemble" }
 reglyco-refine = { version = "0.1.0", path = "crates/reglyco-refine" }
 reglyco-relax = { version = "0.1.0", path = "crates/reglyco-relax" }
-reglyco-report = { version = "0.1.0", path = "crates/reglyco-report" }
-reglyco-saxs = { version = "0.1.0", path = "crates/reglyco-saxs" }
+reglyco-report = { version = "0.1.1", path = "crates/reglyco-report" }
+reglyco-saxs = { version = "0.1.1", path = "crates/reglyco-saxs" }
 reglyco-validate = { version = "0.1.0", path = "crates/reglyco-validate" }
 reglyco-cli = { version = "0.2.0", path = "crates/reglyco-cli" }
 
