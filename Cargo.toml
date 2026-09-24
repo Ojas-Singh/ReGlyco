@@ -1,6 +1,6 @@
 [package]
 name = "reglyco"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.97"
 authors = ["ReGlyco contributors"]
@@ -29,7 +29,7 @@ reglyco-relax = { version = "0.1.0", path = "crates/reglyco-relax" }
 reglyco-report = { version = "0.1.1", path = "crates/reglyco-report" }
 reglyco-saxs = { version = "0.1.1", path = "crates/reglyco-saxs" }
 reglyco-validate = { version = "0.1.0", path = "crates/reglyco-validate" }
-reglyco-cli = { version = "0.2.0", path = "crates/reglyco-cli" }
+reglyco-cli = { version = "0.2.1", path = "crates/reglyco-cli" }
 
 [dev-dependencies]
 glysys.workspace = true

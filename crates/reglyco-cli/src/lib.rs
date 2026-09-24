@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use crabwurcs_core::{AnomericSymbol, parse_wurcs, write_wurcs_canonical};
 use crabwurcs_iupac::write_iupac_condensed_canonical;
 use crabwurcs_pdb::extract_glycans_with_provenance_from_str;
@@ -647,7 +647,13 @@ enum FailOnArg {
 }
 
 pub fn run() -> anyhow::Result<()> {
-    match Cli::parse().command {
+    run_with_version(env!("CARGO_PKG_VERSION"))
+}
+
+pub fn run_with_version(version: &'static str) -> anyhow::Result<()> {
+    let matches = Cli::command().version(version).get_matches();
+    let cli = Cli::from_arg_matches(&matches)?;
+    match cli.command {
         Command::Build(arguments) => run_build(arguments),
         Command::Ensemble(arguments) => run_ensemble(arguments),
         Command::Search(arguments) => run_search(arguments),
