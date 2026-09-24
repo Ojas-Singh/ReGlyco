@@ -123,7 +123,7 @@ root=Path(sys.argv[1]);p=root/'manifest.json';m=json.loads(p.read_text())
 for variant,key in [('full-gpu-single','fullGpuSingle'),('full-gpu-threaded','fullGpuThreaded')]:
     js=root/variant/'reglyco.js';wasm=root/variant/'reglyco_bg.wasm'
     if js.exists() and wasm.exists():
-        m['artifacts'][key]={'js':str(js.relative_to(root)),'jsSha256':hashlib.sha256(js.read_bytes()).hexdigest(),'wasm':str(wasm.relative_to(root)),'wasmSha256':hashlib.sha256(wasm.read_bytes()).hexdigest()}
+        m['artifacts'][key]={'js':js.relative_to(root).as_posix(),'jsSha256':hashlib.sha256(js.read_bytes()).hexdigest(),'wasm':wasm.relative_to(root).as_posix(),'wasmSha256':hashlib.sha256(wasm.read_bytes()).hexdigest()}
 p.write_text(json.dumps(m,indent=2)+'\n')
 PYGPU
 fi
