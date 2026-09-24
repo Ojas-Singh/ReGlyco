@@ -49,7 +49,10 @@ use reglyco_saxs::{
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
-pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const ENGINE_VERSION: &str = match option_env!("REGLYCO_RELEASE_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 fn deserialize_seed<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
 where

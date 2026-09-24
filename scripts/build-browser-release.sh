@@ -3,7 +3,23 @@ set -euo pipefail
 
 workspace_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 release_dir="${1:-${workspace_dir}/browser-release}"
-version="${REGLYCO_RELEASE_VERSION:-$(cargo metadata --no-deps --format-version 1 --manifest-path "${workspace_dir}/Cargo.toml" | sed -n 's/.*"name":"reglyco-wasm","version":"\([^"]*\)".*/\1/p')}"
+if [[ -n "${REGLYCO_RELEASE_VERSION:-}" ]]; then
+  version="${REGLYCO_RELEASE_VERSION}"
+else
+  version="$(git -C "${workspace_dir}" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')"
+  if [[ -z "${version}" ]]; then
+    version="$(cargo metadata --no-deps --format-version 1 --manifest-path "${workspace_dir}/Cargo.toml" | sed -n 's/.*"name":"reglyco-wasm","version":"\([^"]*\)".*/\1/p')"
+  fi
+fi
+export REGLYCO_RELEASE_VERSION="${version}"
+source_commit="$(git -C "${workspace_dir}" rev-parse HEAD)"
+if [[ -n "$(git -C "${workspace_dir}" status --porcelain)" ]]; then source_dirty=true; else source_dirty=false; fi
+if [[ "${source_dirty}" == true ]]; then
+  echo "Refusing to build a browser release from a dirty ReGlyco worktree." >&2
+  exit 1
+fi
+rustc_version="$(rustc --version)"
+wasm_bindgen_version="$(wasm-bindgen --version)"
 
 build_variant() {
   variant="$1"
@@ -80,6 +96,15 @@ printf '%s\n' \
   "  \"version\": \"${version}\"," \
   '  "schemaVersion": 1,' \
   '  "contracts": "reglyco-v1.d.ts",' \
+  '  "source": {' \
+  '    "repository": "https://github.com/Ojas-Singh/ReGlyco",' \
+  "    \"commit\": \"${source_commit}\"," \
+  "    \"dirty\": ${source_dirty}" \
+  '  },' \
+  '  "toolchain": {' \
+  "    \"rustc\": \"${rustc_version}\"," \
+  "    \"wasmBindgen\": \"${wasm_bindgen_version}\"" \
+  '  },' \
   '  "artifacts": {' \
   "    \"publicSingle\": { \"js\": \"public-single/reglyco.js\", \"jsSha256\": \"${public_js}\", \"wasm\": \"public-single/reglyco_bg.wasm\", \"wasmSha256\": \"${public_wasm}\" }," \
   "    \"publicThreaded\": { \"js\": \"public-threaded/reglyco.js\", \"jsSha256\": \"${public_threaded_js}\", \"wasm\": \"public-threaded/reglyco_bg.wasm\", \"wasmSha256\": \"${public_threaded_wasm}\" }," \
@@ -94,7 +119,7 @@ if [[ "${gpu_enabled}" == true ]]; then
 import hashlib,json,sys
 from pathlib import Path
 root=Path(sys.argv[1]);p=root/'manifest.json';m=json.loads(p.read_text())
-for variant,key in [('full-gpu-single','fullGpuSingle')]:
+for variant,key in [('full-gpu-single','fullGpuSingle'),('full-gpu-threaded','fullGpuThreaded')]:
     js=root/variant/'reglyco.js';wasm=root/variant/'reglyco_bg.wasm'
     if js.exists() and wasm.exists():
         m['artifacts'][key]={'js':str(js.relative_to(root)),'jsSha256':hashlib.sha256(js.read_bytes()).hexdigest(),'wasm':str(wasm.relative_to(root)),'wasmSha256':hashlib.sha256(wasm.read_bytes()).hexdigest()}
