@@ -20,6 +20,7 @@ if [[ "${source_dirty}" == true ]]; then
 fi
 rustc_version="$(rustc --version)"
 wasm_bindgen_version="$(wasm-bindgen --version)"
+rust_toolchain="${REGLYCO_RUSTUP_TOOLCHAIN:-$(rustup show active-toolchain | awk '{print $1}')}"
 
 build_variant() {
   variant="$1"
@@ -42,7 +43,7 @@ build_threaded_variant() {
   stage_dir="${release_dir}/${variant}"
   target_dir="${workspace_dir}/target/browser-release-cache/${variant/full-gpu/full}"
   mkdir -p "${stage_dir}"
-  CARGO_TARGET_DIR="${target_dir}" rustup run nightly-2026-07-15 cargo build -Z build-std=panic_abort,std \
+  CARGO_TARGET_DIR="${target_dir}" rustup run "${rust_toolchain}" cargo build -Z build-std=panic_abort,std \
     --config 'target.wasm32-unknown-unknown.rustflags=["-C","target-feature=+atomics,+bulk-memory,+mutable-globals","-C","link-arg=--shared-memory","-C","link-arg=--import-memory","-C","link-arg=--max-memory=4294967296","-C","link-arg=--export=__wasm_init_tls","-C","link-arg=--export=__tls_size","-C","link-arg=--export=__tls_align","-C","link-arg=--export=__tls_base","-C","link-arg=--export=__heap_base","-C","link-arg=--export=__data_end","-C","link-arg=--export=__stack_pointer","--cfg","getrandom_backend=\"custom\""]' \
     --manifest-path "${workspace_dir}/Cargo.toml" --release --target wasm32-unknown-unknown \
     -p reglyco-wasm --no-default-features --features "${features}"
