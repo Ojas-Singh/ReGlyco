@@ -21,13 +21,14 @@ fi
 rustc_version="$(rustc --version)"
 wasm_bindgen_version="$(wasm-bindgen --version)"
 rust_toolchain="${REGLYCO_RUSTUP_TOOLCHAIN:-$(rustup show active-toolchain | awk '{print $1}')}"
+build_cache_root="${REGLYCO_BUILD_CACHE_ROOT:-${workspace_dir}/target/browser-release-cache}"
 
 build_variant() {
   variant="$1"
   features="$2"
   rustflags="${3:-}"
   stage_dir="${release_dir}/${variant}"
-  target_dir="${workspace_dir}/target/browser-release-cache/${variant/full-gpu/full}"
+  target_dir="${build_cache_root}/${variant/full-gpu/full}"
   mkdir -p "${stage_dir}"
   if [[ -n "${rustflags}" ]]; then
     CARGO_TARGET_DIR="${target_dir}" RUSTFLAGS="${rustflags}" cargo build --manifest-path "${workspace_dir}/Cargo.toml" --release --target wasm32-unknown-unknown -p reglyco-wasm --no-default-features --features "${features}"
@@ -41,7 +42,7 @@ build_threaded_variant() {
   variant="$1"
   features="$2"
   stage_dir="${release_dir}/${variant}"
-  target_dir="${workspace_dir}/target/browser-release-cache/${variant/full-gpu/full}"
+  target_dir="${build_cache_root}/${variant/full-gpu/full}"
   mkdir -p "${stage_dir}"
   CARGO_TARGET_DIR="${target_dir}" rustup run "${rust_toolchain}" cargo build -Z build-std=panic_abort,std \
     --config 'target.wasm32-unknown-unknown.rustflags=["-C","target-feature=+atomics,+bulk-memory,+mutable-globals","-C","link-arg=--shared-memory","-C","link-arg=--import-memory","-C","link-arg=--max-memory=4294967296","-C","link-arg=--export=__wasm_init_tls","-C","link-arg=--export=__tls_size","-C","link-arg=--export=__tls_align","-C","link-arg=--export=__tls_base","-C","link-arg=--export=__heap_base","-C","link-arg=--export=__data_end","-C","link-arg=--export=__stack_pointer","--cfg","getrandom_backend=\"custom\""]' \
@@ -73,7 +74,7 @@ if [[ "${gpu_enabled}" == true ]]; then
   [[ "${only_variant}" == "all" || "${only_variant}" == "full-gpu-threaded" ]] && build_threaded_variant full-gpu-threaded 'full,webgpu,threaded'
 fi
 if [[ "${only_variant}" == "all" || "${only_variant}" == "pdf" ]]; then
-  pdf_target_dir="${workspace_dir}/target/browser-release-cache/pdf"
+  pdf_target_dir="${build_cache_root}/pdf"
   CARGO_TARGET_DIR="${pdf_target_dir}" cargo build --manifest-path "${workspace_dir}/Cargo.toml" --release --target wasm32-unknown-unknown -p reglyco-pdf-wasm
   mkdir -p "${release_dir}/pdf"
   wasm-bindgen "${pdf_target_dir}/wasm32-unknown-unknown/release/reglyco_pdf_wasm.wasm" --target web --out-dir "${release_dir}/pdf" --out-name reglyco_pdf
