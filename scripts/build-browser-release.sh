@@ -59,20 +59,12 @@ build_threaded_variant() {
 
 mkdir -p "${release_dir}"
 only_variant="${REGLYCO_ONLY_VARIANT:-all}"
-gpu_enabled=false
-if [[ "${REGLYCO_SITE_PROFILE:-}" == "development" && "${REGLYCO_WEBGPU:-}" == "true" ]]; then gpu_enabled=true; fi
-if [[ "${only_variant}" == full-gpu-* && "${gpu_enabled}" != true ]]; then
-  echo "GPU artifacts require REGLYCO_SITE_PROFILE=development and REGLYCO_WEBGPU=true" >&2
-  exit 1
-fi
 [[ "${only_variant}" == "all" || "${only_variant}" == "public-single" ]] && build_variant public-single public
 [[ "${only_variant}" == "all" || "${only_variant}" == "public-threaded" ]] && build_threaded_variant public-threaded 'public,threaded'
 [[ "${only_variant}" == "all" || "${only_variant}" == "full-single" ]] && build_variant full-single full
 [[ "${only_variant}" == "all" || "${only_variant}" == "full-threaded" ]] && build_threaded_variant full-threaded 'full,threaded'
-if [[ "${gpu_enabled}" == true ]]; then
-  [[ "${only_variant}" == "all" || "${only_variant}" == "full-gpu-single" ]] && build_variant full-gpu-single 'full,webgpu'
-  [[ "${only_variant}" == "all" || "${only_variant}" == "full-gpu-threaded" ]] && build_threaded_variant full-gpu-threaded 'full,webgpu,threaded'
-fi
+[[ "${only_variant}" == "all" || "${only_variant}" == "full-gpu-single" ]] && build_variant full-gpu-single 'full,webgpu'
+[[ "${only_variant}" == "all" || "${only_variant}" == "full-gpu-threaded" ]] && build_threaded_variant full-gpu-threaded 'full,webgpu,threaded'
 if [[ "${only_variant}" == "all" || "${only_variant}" == "pdf" ]]; then
   pdf_target_dir="${build_cache_root}/pdf"
   CARGO_TARGET_DIR="${pdf_target_dir}" cargo build --manifest-path "${workspace_dir}/Cargo.toml" --release --target wasm32-unknown-unknown -p reglyco-pdf-wasm
@@ -116,8 +108,7 @@ printf '%s\n' \
   '  }' \
   '}' > "${release_dir}/manifest.json"
 
-if [[ "${gpu_enabled}" == true ]]; then
-  python3 - "${release_dir}" <<'PYGPU'
+python3 - "${release_dir}" <<'PYGPU'
 import hashlib,json,sys
 from pathlib import Path
 root=Path(sys.argv[1]);p=root/'manifest.json';m=json.loads(p.read_text())
@@ -127,5 +118,4 @@ for variant,key in [('full-gpu-single','fullGpuSingle'),('full-gpu-threaded','fu
         m['artifacts'][key]={'js':js.relative_to(root).as_posix(),'jsSha256':hashlib.sha256(js.read_bytes()).hexdigest(),'wasm':wasm.relative_to(root).as_posix(),'wasmSha256':hashlib.sha256(wasm.read_bytes()).hexdigest()}
 p.write_text(json.dumps(m,indent=2)+'\n')
 PYGPU
-fi
 echo "Browser release ${version} written to ${release_dir}"
