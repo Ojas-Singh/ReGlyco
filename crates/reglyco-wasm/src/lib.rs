@@ -1,8 +1,8 @@
 use js_sys::Function;
 use reglyco_workflow::{
-    InputAssets, ProgressEvent, ReGlycoProfile, ReGlycoRunRequestV1, WorkflowControl,
-    analyze_torsions as workflow_analyze_torsions, capabilities as workflow_capabilities,
-    execute_with_control,
+    AssetData, InputAssets, ProgressEvent, ReGlycoProfile, ReGlycoRunRequestV1, WorkflowBundle,
+    WorkflowControl, analyze_torsions as workflow_analyze_torsions,
+    capabilities as workflow_capabilities, execute_with_control,
 };
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -45,6 +45,24 @@ pub unsafe extern "Rust" fn __getrandom_v03_custom(
         }
     }
     Ok(())
+}
+
+/// Text artifacts above this size cross into JavaScript as `Uint8Array`
+/// instead of strings. A large multi-model ensemble PDB can exceed V8's
+/// ~512 MiB string limit, and byte buffers can be transferred between
+/// workers without another copy.
+const LARGE_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+
+fn bundle_to_js(mut bundle: WorkflowBundle) -> Result<JsValue, JsValue> {
+    for artifact in &mut bundle.artifacts {
+        if let AssetData::Text(text) = &mut artifact.data {
+            if text.len() > LARGE_TEXT_ARTIFACT_BYTES {
+                // Moving the String into a Vec<u8> reuses its allocation.
+                artifact.data = AssetData::Bytes(std::mem::take(text).into_bytes());
+            }
+        }
+    }
+    serde_wasm_bindgen::to_value(&bundle).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 struct JsControl {
@@ -97,7 +115,7 @@ pub fn execute(request: JsValue, assets: JsValue, progress: Function) -> Result<
         ))
     })?
     .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
+    bundle_to_js(result)
 }
 
 #[wasm_bindgen]
@@ -108,13 +126,37 @@ pub fn analyze_torsions(
     seed_analysis: JsValue,
 ) -> Result<JsValue, JsValue> {
     install_panic_hook();
+    analyze_torsions_text(request, assets, &output_pdb, seed_analysis)
+}
+
+/// [`analyze_torsions`] for an output structure supplied as UTF-8 bytes, so
+/// a large ensemble never has to become a single JavaScript string.
+#[wasm_bindgen]
+pub fn analyze_torsions_bytes(
+    request: JsValue,
+    assets: JsValue,
+    output_pdb: &[u8],
+    seed_analysis: JsValue,
+) -> Result<JsValue, JsValue> {
+    install_panic_hook();
+    let output_pdb = std::str::from_utf8(output_pdb)
+        .map_err(|_| JsValue::from_str("the output structure must be UTF-8 PDB text"))?;
+    analyze_torsions_text(request, assets, output_pdb, seed_analysis)
+}
+
+fn analyze_torsions_text(
+    request: JsValue,
+    assets: JsValue,
+    output_pdb: &str,
+    seed_analysis: JsValue,
+) -> Result<JsValue, JsValue> {
     let request: ReGlycoRunRequestV1 = serde_wasm_bindgen::from_value(request)
         .map_err(|error| JsValue::from_str(&format!("invalid ReGlyco request: {error}")))?;
     let assets: InputAssets = serde_wasm_bindgen::from_value(assets)
         .map_err(|error| JsValue::from_str(&format!("invalid ReGlyco assets: {error}")))?;
     let seed_analysis: serde_json::Value = serde_wasm_bindgen::from_value(seed_analysis)
         .map_err(|error| JsValue::from_str(&format!("invalid torsion analysis seed: {error}")))?;
-    let result = workflow_analyze_torsions(&request, &assets, &output_pdb, seed_analysis)
+    let result = workflow_analyze_torsions(&request, &assets, output_pdb, seed_analysis)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     // `result` is an open-ended JSON object assembled by the workflow layer.
     // Passing `serde_json::Value` through serde-wasm-bindgen loses its map
@@ -214,9 +256,10 @@ pub async fn execute_async(
                 artifact.data = reglyco_workflow::AssetData::Text(report.clone());
             }
         }
-        serde_json::to_string(&bundle)
-            .map(|json| JsValue::from_str(&json))
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        // Serialize like the CPU export rather than through one JSON string:
+        // that string duplicated every artifact (including a multi-model
+        // ensemble PDB) inside the wasm heap and again as a JS string.
+        bundle_to_js(bundle)
     }))
     .await;
     match outcome {

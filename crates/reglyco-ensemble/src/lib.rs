@@ -5,6 +5,7 @@ pub mod gpu;
 use gpu::{gpu_evaluate_candidate, gpu_optimize, start_compute_stage_async};
 
 mod dunbrack;
+mod frames;
 mod geometry_gpu;
 mod prepared;
 mod sampling_energy;
@@ -17,12 +18,13 @@ use statistical::sample_statistical;
 #[cfg(feature = "webgpu")]
 use statistical::sample_statistical_async;
 
+pub use frames::{CompactFrames, FrameRecord, StructureStore};
 use prepared::PreparedSitePose;
 use prepared::SpatialGrid;
 pub use prepared::{PreparedAttachmentContext, PreparedEvaluation};
 pub use sasa::{
     COOKBOOK_HOTSPOT_SHIELDING_PERCENT, COOKBOOK_NDOTS, COOKBOOK_PROBE_RADIUS_ANGSTROM,
-    SasaAnalysis, SasaError, SasaResidue, calculate_sasa,
+    SasaAnalysis, SasaError, SasaResidue, calculate_sasa, calculate_sasa_streaming,
 };
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -5120,7 +5122,6 @@ fn cookbook_compatible_pool_sample_once(
                     }
                     let mut candidates = Vec::new();
                     'rotamers: for &rotamer in &rotamers {
-
                         // Balance the two discrete dimensions.  A simple
                         // component-major or offset-major nested loop can
                         // spend a small frontier on one dimension and miss a
@@ -5156,7 +5157,6 @@ fn cookbook_compatible_pool_sample_once(
                                     psi: wrap_degrees(
                                         psi_component.mean_degrees
                                             + psi_offset * psi_widths[psi_component_index],
-
                                     ),
                                     rotamer,
                                 },
@@ -5689,7 +5689,7 @@ pub async fn sample_attached_ensemble_with_cancel<C>(
 where
     C: FnMut() -> bool,
 {
-    sample_attached_ensemble_with_progress_cancel(
+    let (frames, diagnostics) = sample_attached_ensemble_with_progress_cancel(
         protein,
         sites,
         frames,
@@ -5698,7 +5698,8 @@ where
         cancelled,
         |_, _, _, _| {},
     )
-    .await
+    .await?;
+    Ok((frames.into_frames()?, diagnostics))
 }
 
 /// Sample an attached ensemble while reporting sampler-step progress.
@@ -5726,7 +5727,7 @@ pub async fn sample_attached_ensemble_with_progress_cancel<C, P>(
     builder: &glysys::SystemBuilder,
     mut cancelled: C,
     progress: P,
-) -> Result<(Vec<SampledFrame>, EnsembleSamplingDiagnostics)>
+) -> Result<(CompactFrames, EnsembleSamplingDiagnostics)>
 where
     C: FnMut() -> bool,
     P: FnMut(usize, usize, usize, usize),
@@ -5858,7 +5859,9 @@ where
         initial_state_cursor: AtomicUsize::new(0),
     };
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
-    let mut accepted = Vec::with_capacity(frames);
+    // Keep accepted frames compact: only the coordinates that differ from the
+    // first frame are retained, so large attached ensembles fit in wasm32.
+    let mut accepted = CompactFrames::with_capacity(frames);
     let mut attempts = 0usize;
     let mut native_proposals = 0usize;
     let mut native_accepts = 0usize;
@@ -6355,7 +6358,7 @@ where
             fallback_reason: None,
         }],
     };
-    refresh_frames(&mut accepted, protein, sites, config, builder)?;
+    refresh_compact_frames(&mut accepted, protein, sites, config, builder, |_, _| {})?;
     Ok((accepted, diagnostics))
 }
 
@@ -6395,6 +6398,66 @@ pub fn refresh_frames(
     config: &SearchConfig,
     builder: &glysys::SystemBuilder,
 ) -> Result<()> {
+    refresh_frames_with(
+        frames.len(),
+        protein,
+        sites,
+        config,
+        builder,
+        |index, refresh| {
+            let frame = &mut frames[index];
+            refresh(
+                &frame.structure,
+                &mut frame.sites,
+                &mut frame.log_native_probability,
+                &mut frame.selected_energy_kcal_per_mol,
+            )
+        },
+    )
+}
+
+/// [`refresh_frames`] for compact storage: frames are rebuilt one at a time,
+/// so refreshing a large ensemble never holds more than one full structure.
+/// `progress` receives `(completed, total)` after each frame.
+pub fn refresh_compact_frames(
+    frames: &mut CompactFrames,
+    protein: &Structure,
+    sites: &[SearchSite],
+    config: &SearchConfig,
+    builder: &glysys::SystemBuilder,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<()> {
+    let total = frames.len();
+    refresh_frames_with(total, protein, sites, config, builder, |index, refresh| {
+        let structure = frames.structure(index)?;
+        let record = frames.record_mut(index).ok_or_else(|| {
+            EnsembleError::Metadata(format!("ensemble frame {index} does not exist"))
+        })?;
+        refresh(
+            &structure,
+            &mut record.sites,
+            &mut record.log_native_probability,
+            &mut record.selected_energy_kcal_per_mol,
+        )?;
+        progress(index + 1, total);
+        Ok(())
+    })
+}
+
+type FrameRefresh<'a> =
+    dyn FnMut(&Structure, &mut [SearchSiteResult], &mut f64, &mut Option<f64>) -> Result<()> + 'a;
+
+fn refresh_frames_with<V>(
+    count: usize,
+    protein: &Structure,
+    sites: &[SearchSite],
+    config: &SearchConfig,
+    builder: &glysys::SystemBuilder,
+    mut visit: V,
+) -> Result<()>
+where
+    V: FnMut(usize, &mut FrameRefresh<'_>) -> Result<()>,
+{
     let system = if config.scoring_mode != SearchScoringMode::StericPrior {
         Some(prepare_frame_topology(protein, sites, builder)?)
     } else {
@@ -6432,17 +6495,43 @@ pub fn refresh_frames(
             group(glysys_energy::scoring::ComponentRole::Glycan),
         )
     });
-    for frame in frames {
-        if frame.structure.iter_atoms().any(|a| {
+    let mut refresh = |structure: &Structure,
+                       frame_sites: &mut [SearchSiteResult],
+                       log_native_probability: &mut f64,
+                       selected_energy_kcal_per_mol: &mut Option<f64>|
+     -> Result<()> {
+        if structure.iter_atoms().any(|a| {
             !a.position.x.is_finite() || !a.position.y.is_finite() || !a.position.z.is_finite()
         }) {
             return Err(EnsembleError::Metadata("nonfinite output geometry".into()));
         }
-        let scores = steric_site_scores(&frame.structure, config.clash_distance);
-        frame.log_native_probability = 0.;
-        for (index, (result, site)) in frame.sites.iter_mut().zip(sites).enumerate() {
-            let (phi, psi) =
-                reglyco_build::attachment_angles(&frame.structure, &site.site.residue)?;
+        let scores = steric_site_scores(structure, config.clash_distance);
+        // Collect every site's glycan coordinates in one pass over the atoms.
+        let site_trees = sites
+            .iter()
+            .map(|site| {
+                structure
+                    .metadata()
+                    .glycan_trees
+                    .iter()
+                    .find(|t| t.attachment_site.as_ref() == Some(&site.site.residue))
+            })
+            .collect::<Vec<_>>();
+        let mut residue_sites = HashMap::<&ResidueId, Vec<usize>>::new();
+        for (site_index, tree) in site_trees.iter().enumerate() {
+            for residue in tree.iter().flat_map(|tree| &tree.residue_ids) {
+                residue_sites.entry(residue).or_default().push(site_index);
+            }
+        }
+        let mut site_coordinates = vec![Vec::new(); site_trees.len()];
+        for atom in structure.iter_atoms() {
+            for &site_index in residue_sites.get(&atom.residue).into_iter().flatten() {
+                site_coordinates[site_index].push(atom.position);
+            }
+        }
+        *log_native_probability = 0.;
+        for (index, (result, site)) in frame_sites.iter_mut().zip(sites).enumerate() {
+            let (phi, psi) = reglyco_build::attachment_angles(structure, &site.site.residue)?;
             let conformer = &site.ensemble.conformers[result.conformer_index];
             let prior = resolved_priors(protein, site, &conformer.priors);
             result.phi_degrees = phi;
@@ -6457,7 +6546,7 @@ pub fn refresh_frames(
             .ln()
                 + vmm_penalty(phi, &prior.phi)
                 + vmm_penalty(psi, &prior.psi);
-            frame.log_native_probability -= result.prior_score;
+            *log_native_probability -= result.prior_score;
             result.phi_within_vmm95 = result
                 .phi_component
                 .and_then(|i| prior.phi.get(i))
@@ -6469,23 +6558,14 @@ pub fn refresh_frames(
             result.steric_score = *scores.get(index).ok_or_else(|| {
                 EnsembleError::Metadata("output attachment mapping mismatch".into())
             })?;
-            let residues = frame
-                .structure
-                .metadata()
-                .glycan_trees
-                .iter()
-                .find(|t| t.attachment_site.as_ref() == Some(&site.site.residue))
-                .ok_or_else(|| EnsembleError::Metadata("missing output glycan tree".into()))?;
-            result.coordinates = frame
-                .structure
-                .iter_atoms()
-                .filter(|a| residues.residue_ids.contains(&a.residue))
-                .map(|a| a.position)
-                .collect();
+            if site_trees[index].is_none() {
+                return Err(EnsembleError::Metadata("missing output glycan tree".into()));
+            }
+            result.coordinates = std::mem::take(&mut site_coordinates[index]);
         }
 
         if let Some(evaluator) = &evaluator {
-            let coordinates = mapping.as_ref().unwrap().coordinates(&frame.structure)?;
+            let coordinates = mapping.as_ref().unwrap().coordinates(structure)?;
             let value = if config.scoring_mode == SearchScoringMode::FullEnergy {
                 evaluator.energy(&coordinates)?.total()
             } else {
@@ -6497,8 +6577,12 @@ pub fn refresh_frames(
             if !value.is_finite() {
                 return Err(EnsembleError::Metadata("nonfinite output energy".into()));
             }
-            frame.selected_energy_kcal_per_mol = Some(value);
+            *selected_energy_kcal_per_mol = Some(value);
         }
+        Ok(())
+    };
+    for index in 0..count {
+        visit(index, &mut refresh)?;
     }
     Ok(())
 }
@@ -6774,20 +6858,32 @@ pub fn steric_score(structure: &Structure, clash_distance: f64) -> f64 {
 
 /// Compute the Cookbook-compatible steric score for each attached glycan.
 pub fn steric_site_scores(structure: &Structure, clash_distance: f64) -> Vec<f64> {
-    let atoms = structure.atoms();
-    let all_glycan_residues = structure
-        .metadata()
-        .glycan_trees
-        .iter()
-        .flat_map(|tree| tree.residue_ids.iter().cloned())
-        .collect::<HashSet<_>>();
-    structure
-        .metadata()
-        .glycan_trees
+    let trees = &structure.metadata().glycan_trees;
+    let mut residue_trees = HashMap::<&ResidueId, Vec<usize>>::new();
+    for (tree_index, tree) in trees.iter().enumerate() {
+        for residue in &tree.residue_ids {
+            residue_trees.entry(residue).or_default().push(tree_index);
+        }
+    }
+    // One residue lookup per atom; membership of every tree follows from it.
+    let mut positions = Vec::new();
+    let mut is_glycan = Vec::new();
+    let mut tree_members = vec![Vec::new(); trees.len()];
+    for atom in structure.iter_atoms() {
+        let atom_trees = residue_trees
+            .get(&atom.residue)
+            .map_or(&[][..], Vec::as_slice);
+        positions.push(atom.position);
+        is_glycan.push(!atom_trees.is_empty());
+        for (tree_index, members) in tree_members.iter_mut().enumerate() {
+            members.push(atom_trees.contains(&tree_index));
+        }
+    }
+    let grid = ContactGrid::new(&positions, clash_distance);
+    trees
         .iter()
         .enumerate()
-        .map(|(site_index, tree)| {
-            let residues = tree.residue_ids.iter().cloned().collect::<HashSet<_>>();
+        .map(|(site_index, _)| {
             let attachment = structure.metadata().glycosylation_sites.get(site_index);
             let link_position = attachment
                 .and_then(|site| structure.find_atom(&site.protein_residue, &site.protein_atom))
@@ -6796,38 +6892,107 @@ pub fn steric_site_scores(structure: &Structure, clash_distance: f64) -> Vec<f64
             // The Cookbook scorer ignores the three attachment-proximal
             // atoms (C1 and its immediate neighbors), preventing the fixed
             // bond geometry from dominating the steric objective.
-            let glycan_atoms = atoms
-                .iter()
-                .filter(|atom| residues.contains(&atom.residue))
+            let glycan_atoms = (0..positions.len())
+                .filter(|&index| tree_members[site_index][index])
                 .skip(3)
                 .collect::<Vec<_>>();
-            let protein_atoms = atoms
-                .iter()
-                .filter(|atom| !all_glycan_residues.contains(&atom.residue))
-                .filter(|atom| {
-                    link_position.is_none_or(|link| distance(link, atom.position) <= 40.0)
-                })
-                .collect::<Vec<_>>();
-            let mut score = pair_steric_score(&glycan_atoms, &protein_atoms, clash_distance);
-            for other in structure
-                .metadata()
-                .glycan_trees
-                .iter()
-                .enumerate()
-                .filter(|(other_index, _)| *other_index != site_index)
-                .map(|(_, other)| {
-                    let other_residues = other.residue_ids.iter().cloned().collect::<HashSet<_>>();
-                    atoms
-                        .iter()
-                        .filter(|atom| other_residues.contains(&atom.residue))
-                        .collect::<Vec<_>>()
-                })
-            {
-                score = score.max(pair_steric_score(&glycan_atoms, &other, clash_distance));
+            let mut score = grid.pair_steric_score(&glycan_atoms, clash_distance, |index| {
+                !is_glycan[index]
+                    && link_position.is_none_or(|link| distance(link, positions[index]) <= 40.0)
+            });
+            for (other_index, members) in tree_members.iter().enumerate() {
+                if other_index != site_index {
+                    score = score.max(grid.pair_steric_score(
+                        &glycan_atoms,
+                        clash_distance,
+                        |index| members[index],
+                    ));
+                }
             }
             score
         })
         .collect()
+}
+
+/// Uniform grid over atom positions for contact queries within one fixed
+/// distance.
+struct ContactGrid<'a> {
+    positions: &'a [Vec3],
+    cell_size: f64,
+    cells: HashMap<(i64, i64, i64), Vec<usize>>,
+}
+
+impl<'a> ContactGrid<'a> {
+    fn new(positions: &'a [Vec3], cutoff: f64) -> Self {
+        let cell_size = if cutoff.is_finite() && cutoff > 0.0 {
+            cutoff
+        } else {
+            1.0
+        };
+        let mut cells = HashMap::<(i64, i64, i64), Vec<usize>>::new();
+        for (index, position) in positions.iter().enumerate() {
+            cells
+                .entry(Self::cell(*position, cell_size))
+                .or_default()
+                .push(index);
+        }
+        Self {
+            positions,
+            cell_size,
+            cells,
+        }
+    }
+
+    fn cell(position: Vec3, cell_size: f64) -> (i64, i64, i64) {
+        (
+            (position.x / cell_size).floor() as i64,
+            (position.y / cell_size).floor() as i64,
+            (position.z / cell_size).floor() as i64,
+        )
+    }
+
+    /// Exactly [`pair_steric_score`] between `first` and every atom accepted
+    /// by `second`: contacts are visited in the same (first, then atom index)
+    /// order, so the accumulated score and its early exit are unchanged.
+    fn pair_steric_score(
+        &self,
+        first: &[usize],
+        threshold: f64,
+        second: impl Fn(usize) -> bool,
+    ) -> f64 {
+        let mut score = 1.0;
+        let mut contacts = Vec::new();
+        for &atom in first {
+            let center = self.positions[atom];
+            let (x, y, z) = Self::cell(center, self.cell_size);
+            contacts.clear();
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        let Some(cell) = self.cells.get(&(x + dx, y + dy, z + dz)) else {
+                            continue;
+                        };
+                        for &other in cell {
+                            if second(other) {
+                                let distance = distance(center, self.positions[other]);
+                                if distance < threshold {
+                                    contacts.push((other, distance));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            contacts.sort_unstable_by_key(|(other, _)| *other);
+            for &(_, distance) in &contacts {
+                score += 200.0 * (-distance * distance).exp();
+                if score > 2.0 {
+                    return score;
+                }
+            }
+        }
+        score
+    }
 }
 
 /// Return compact residue-level partners for the hard steric contacts in a
@@ -8191,6 +8356,237 @@ mod tests {
                 .iter()
                 .all(|frame| { frame.sites.iter().all(|site| { site.steric_score <= 1.1 }) })
         );
+    }
+
+    #[test]
+    fn compact_sampler_frames_match_materialized_frames() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ensemble.pdb");
+        fs::write(&path, GLYCAN).unwrap();
+        let query = GlycanQuery {
+            source: GlycanSource::LocalBundle(path),
+            anomer: Anomer::Beta,
+            format: "PDB".into(),
+            level: "3".into(),
+        };
+        let ensemble = LocalBundleProvider.load(&query).unwrap();
+        let sites = vec![SearchSite {
+            site: reglyco_core::GlycosylationSite::new("A", 1),
+            ensemble,
+        }];
+        let protein = read_pdb_str(PROTEIN, &dry_options()).unwrap();
+        let builder = glysys::SystemBuilder::new(dry_options()).unwrap();
+        let config = SearchConfig {
+            seed: 23,
+            mh_chains: 2,
+            mh_burn_in_sweeps: 0,
+            mh_thinning_accepted: 1,
+            ..SearchConfig::default()
+        };
+        let (materialized, _) =
+            sample_attached_ensemble(&protein, &sites, 4, &config, &builder).unwrap();
+        let (compact, _) = sample_attached_ensemble_with_progress_cancel(
+            &protein,
+            &sites,
+            4,
+            &config,
+            &builder,
+            || false,
+            |_, _, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(compact.len(), materialized.len());
+        for (index, frame) in materialized.iter().enumerate() {
+            let record = &compact.iter().as_slice()[index];
+            assert_eq!(
+                compact.structure(index).unwrap().to_pdb_string(),
+                frame.structure.to_pdb_string()
+            );
+            assert_eq!(record.source, frame.source);
+            assert_eq!(record.proposal_index, frame.proposal_index);
+            assert_eq!(
+                record.log_native_probability.to_bits(),
+                frame.log_native_probability.to_bits()
+            );
+        }
+        let pdb = compact.structures().multi_model_pdb().unwrap();
+        assert_eq!(pdb.matches("\nENDMDL\n").count(), 4);
+    }
+
+    #[test]
+    fn pruned_sasa_matches_exhaustive_lattice_bit_for_bit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ensemble.pdb");
+        fs::write(&path, GLYCAN).unwrap();
+        let query = GlycanQuery {
+            source: GlycanSource::LocalBundle(path),
+            anomer: Anomer::Beta,
+            format: "PDB".into(),
+            level: "3".into(),
+        };
+        let ensemble = LocalBundleProvider.load(&query).unwrap();
+        let sites = vec![SearchSite {
+            site: reglyco_core::GlycosylationSite::new("A", 1),
+            ensemble,
+        }];
+        let protein = read_pdb_str(PROTEIN, &dry_options()).unwrap();
+        let builder = glysys::SystemBuilder::new(dry_options()).unwrap();
+        let config = SearchConfig {
+            seed: 11,
+            mh_chains: 2,
+            mh_burn_in_sweeps: 0,
+            mh_thinning_accepted: 1,
+            ..SearchConfig::default()
+        };
+        let (frames, _) = sample_attached_ensemble(&protein, &sites, 3, &config, &builder).unwrap();
+        let mut structures = frames
+            .into_iter()
+            .map(|frame| frame.structure)
+            .collect::<Vec<_>>();
+        // A moved protein atom must invalidate the reused bare-protein areas.
+        let mut moved = structures[0].clone();
+        let atom = moved
+            .iter_atoms()
+            .filter(|atom| atom.residue_name == "SER")
+            .last()
+            .map(|atom| (atom.id, atom.position))
+            .unwrap();
+        moved
+            .set_atom_position(
+                atom.0,
+                Vec3 {
+                    x: atom.1.x + 0.75,
+                    ..atom.1
+                },
+            )
+            .unwrap();
+        structures.push(moved);
+        let pruned =
+            crate::sasa::sasa_over_frames::<_, _, SasaError>(structures.iter().map(Ok), false)
+                .unwrap();
+        let exhaustive =
+            crate::sasa::sasa_over_frames::<_, _, SasaError>(structures.iter().map(Ok), true)
+                .unwrap();
+        assert_eq!(pruned.frame_count, 4);
+        assert_eq!(pruned.residues.len(), exhaustive.residues.len());
+        for (left, right) in pruned.residues.iter().zip(&exhaustive.residues) {
+            assert_eq!(left.residue, right.residue);
+            assert_eq!(
+                left.shielding_percent.to_bits(),
+                right.shielding_percent.to_bits()
+            );
+            assert_eq!(left.real_sasa_nm2.to_bits(), right.real_sasa_nm2.to_bits());
+            assert_eq!(left.hotspot, right.hotspot);
+        }
+        assert!(
+            pruned
+                .residues
+                .iter()
+                .any(|residue| residue.shielding_percent > 0.0)
+        );
+    }
+
+    /// The original all-pairs scorer, kept to verify the grid version.
+    fn reference_steric_site_scores(structure: &Structure, clash_distance: f64) -> Vec<f64> {
+        let atoms = structure.atoms();
+        let all_glycan_residues = structure
+            .metadata()
+            .glycan_trees
+            .iter()
+            .flat_map(|tree| tree.residue_ids.iter().cloned())
+            .collect::<HashSet<_>>();
+        structure
+            .metadata()
+            .glycan_trees
+            .iter()
+            .enumerate()
+            .map(|(site_index, tree)| {
+                let residues = tree.residue_ids.iter().cloned().collect::<HashSet<_>>();
+                let attachment = structure.metadata().glycosylation_sites.get(site_index);
+                let link_position = attachment
+                    .and_then(|site| structure.find_atom(&site.protein_residue, &site.protein_atom))
+                    .and_then(|atom| structure.atom(atom))
+                    .map(|atom| atom.position);
+                // The Cookbook scorer ignores the three attachment-proximal
+                // atoms (C1 and its immediate neighbors), preventing the fixed
+                // bond geometry from dominating the steric objective.
+                let glycan_atoms = atoms
+                    .iter()
+                    .filter(|atom| residues.contains(&atom.residue))
+                    .skip(3)
+                    .collect::<Vec<_>>();
+                let protein_atoms = atoms
+                    .iter()
+                    .filter(|atom| !all_glycan_residues.contains(&atom.residue))
+                    .filter(|atom| {
+                        link_position.is_none_or(|link| distance(link, atom.position) <= 40.0)
+                    })
+                    .collect::<Vec<_>>();
+                let mut score = pair_steric_score(&glycan_atoms, &protein_atoms, clash_distance);
+                for other in structure
+                    .metadata()
+                    .glycan_trees
+                    .iter()
+                    .enumerate()
+                    .filter(|(other_index, _)| *other_index != site_index)
+                    .map(|(_, other)| {
+                        let other_residues =
+                            other.residue_ids.iter().cloned().collect::<HashSet<_>>();
+                        atoms
+                            .iter()
+                            .filter(|atom| other_residues.contains(&atom.residue))
+                            .collect::<Vec<_>>()
+                    })
+                {
+                    score = score.max(pair_steric_score(&glycan_atoms, &other, clash_distance));
+                }
+                score
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grid_steric_scores_match_all_pairs_reference_bit_for_bit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ensemble.pdb");
+        fs::write(&path, GLYCAN).unwrap();
+        let query = GlycanQuery {
+            source: GlycanSource::LocalBundle(path),
+            anomer: Anomer::Beta,
+            format: "PDB".into(),
+            level: "3".into(),
+        };
+        let ensemble = LocalBundleProvider.load(&query).unwrap();
+        let sites = vec![SearchSite {
+            site: reglyco_core::GlycosylationSite::new("A", 1),
+            ensemble,
+        }];
+        let protein = read_pdb_str(PROTEIN, &dry_options()).unwrap();
+        let builder = glysys::SystemBuilder::new(dry_options()).unwrap();
+        let config = SearchConfig {
+            seed: 5,
+            mh_chains: 2,
+            mh_burn_in_sweeps: 0,
+            mh_thinning_accepted: 1,
+            ..SearchConfig::default()
+        };
+        let (frames, _) = sample_attached_ensemble(&protein, &sites, 4, &config, &builder).unwrap();
+        for frame in &frames {
+            // Include thresholds that produce clashes, so the early exit and
+            // accumulated contacts are both exercised.
+            for threshold in [1.7, 3.0, 4.5, 8.0] {
+                let grid = steric_site_scores(&frame.structure, threshold);
+                let reference = reference_steric_site_scores(&frame.structure, threshold);
+                assert_eq!(
+                    grid.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                    reference
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "threshold {threshold}"
+                );
+            }
+        }
     }
 
     #[test]
