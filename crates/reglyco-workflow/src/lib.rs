@@ -2396,8 +2396,20 @@ pub fn analyze_torsions(
         append_attachment_analysis(&mut analysis, &stage);
     }
     let mut observations = Vec::new();
+    let options = build_options(request);
+    let mut template: Option<ModelTemplate> = None;
     for (index, model) in pdb_models(output_pdb).enumerate() {
-        let structure = read_pdb_str(&model, &build_options(request))?;
+        let structure = match template
+            .as_ref()
+            .and_then(|template| template.reuse(&model))
+        {
+            Some(structure) => structure,
+            None => {
+                let parsed = read_pdb_str(&model, &options)?;
+                template = Some(ModelTemplate::new(parsed.clone(), &model));
+                parsed
+            }
+        };
         observations.extend(glycosidic_torsion_observations(
             &structure,
             stage,
@@ -2421,6 +2433,85 @@ pub fn analyze_torsions(
     append_glycan_cluster_distributions(&mut analysis, request);
     append_cluster_distributions(&mut analysis);
     Ok(analysis)
+}
+
+/// A parsed model reused for later models of the same ensemble. ReGlyco
+/// ensembles share one topology, and a full parse (including glycan
+/// recognition) of every large model dominated torsion analysis. A later model
+/// reuses the parse only when every non-coordinate column and record matches;
+/// its coordinates are then read exactly as the PDB reader reads them.
+struct ModelTemplate {
+    structure: Structure,
+    signature: String,
+    atoms: std::collections::HashSet<u32>,
+}
+
+impl ModelTemplate {
+    fn new(structure: Structure, model: &str) -> Self {
+        let atoms = structure.iter_atoms().map(|atom| atom.id.0).collect();
+        Self {
+            structure,
+            signature: pdb_model_signature(model),
+            atoms,
+        }
+    }
+
+    fn reuse(&self, model: &str) -> Option<Structure> {
+        if pdb_model_signature(model) != self.signature {
+            return None;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut updates = Vec::with_capacity(self.atoms.len());
+        for line in model.lines() {
+            if !(line.starts_with("ATOM  ") || line.starts_with("HETATM")) {
+                continue;
+            }
+            let serial = line.get(6..11)?.trim().parse::<u32>().ok()?;
+            if !seen.insert(serial) {
+                // Alternate locations are resolved by the full reader.
+                return None;
+            }
+            if !self.atoms.contains(&serial) {
+                // Records the reader discards (for example protein hydrogens).
+                continue;
+            }
+            let coordinate =
+                |start: usize, end: usize| line.get(start..end)?.trim().parse::<f64>().ok();
+            updates.push((
+                glysys::AtomId(serial),
+                glysys::Vec3 {
+                    x: coordinate(30, 38)?,
+                    y: coordinate(38, 46)?,
+                    z: coordinate(46, 54)?,
+                },
+            ));
+        }
+        if updates.len() != self.atoms.len() {
+            return None;
+        }
+        let mut structure = self.structure.clone();
+        structure.set_atom_positions(updates).ok()?;
+        Some(structure)
+    }
+}
+
+/// Model text with the coordinate columns of atom records removed.
+fn pdb_model_signature(model: &str) -> String {
+    let mut signature = String::with_capacity(model.len());
+    for line in model.lines() {
+        match (line.starts_with("ATOM  ") || line.starts_with("HETATM"))
+            .then(|| line.get(..30).zip(line.get(54..)))
+            .flatten()
+        {
+            Some((head, tail)) => {
+                signature.push_str(head);
+                signature.push_str(tail);
+            }
+            None => signature.push_str(line),
+        }
+        signature.push('\n');
+    }
+    signature
 }
 
 #[cfg(test)]
@@ -3478,7 +3569,7 @@ fn finish_workflow(
     // output has been displayed; no reporting bug may suppress a valid
     // Cookbook search result.
     let validation = ValidationSummary {
-        valid: !protein.atoms().is_empty(),
+        valid: protein.iter_atoms().next().is_some(),
         findings: Vec::new(),
         warnings: Vec::new(),
         errors: Vec::new(),
@@ -5747,6 +5838,36 @@ pub fn energy_analysis_csv(analysis: &Value) -> String {
     output
 }
 
+/// Constant-time coordinate lookups for one structure. `Structure::atom`
+/// rebuilds every atom record on each call, which made measuring each
+/// linkage of a large multi-model ensemble effectively quadratic.
+struct AtomLookup<'a> {
+    structure: &'a Structure,
+    positions: HashMap<glysys::AtomId, glysys::Vec3>,
+}
+
+impl<'a> AtomLookup<'a> {
+    fn new(structure: &'a Structure) -> Self {
+        Self {
+            structure,
+            positions: structure
+                .iter_atoms()
+                .map(|atom| (atom.id, atom.position))
+                .collect(),
+        }
+    }
+
+    fn position_of(&self, id: glysys::AtomId) -> Option<glysys::Vec3> {
+        self.positions.get(&id).copied()
+    }
+
+    fn position(&self, residue: &ResidueId, name: &str) -> Option<glysys::Vec3> {
+        self.structure
+            .find_atom(residue, name)
+            .and_then(|id| self.position_of(id))
+    }
+}
+
 fn glycosidic_torsion_observations(
     structure: &Structure,
     stage: &str,
@@ -5800,12 +5921,17 @@ fn glycosidic_torsion_observations(
             }
         }
     }
+    let atoms_by_id = atoms
+        .iter()
+        .map(|atom| (atom.id, atom))
+        .collect::<HashMap<_, _>>();
+    let lookup = AtomLookup::new(structure);
     let mut observations = Vec::new();
     for (first, second) in bond_pairs {
-        let Some(first) = structure.atom(first) else {
+        let Some(&first) = atoms_by_id.get(&first) else {
             continue;
         };
-        let Some(second) = structure.atom(second) else {
+        let Some(&second) = atoms_by_id.get(&second) else {
             continue;
         };
         if first.residue == second.residue
@@ -5887,22 +6013,15 @@ fn glycosidic_torsion_observations(
                 .or_else(|| structure.find_atom(&donor.residue, "O6"))
                 .or_else(|| structure.find_atom(&donor.residue, "O4"))
         };
-        let donor_ring = donor_ring_atom
-            .and_then(|id| structure.atom(id))
-            .map(|atom| atom.position);
-        let acceptor_carbon = structure
-            .find_atom(&acceptor.residue, &format!("C{acceptor_position}"))
-            .and_then(|id| structure.atom(id))
-            .map(|atom| atom.position);
+        let donor_ring = donor_ring_atom.and_then(|id| lookup.position_of(id));
+        let acceptor_carbon = lookup.position(&acceptor.residue, &format!("C{acceptor_position}"));
         let previous = acceptor_position
             .checked_sub(1)
-            .and_then(|position| structure.find_atom(&acceptor.residue, &format!("C{position}")))
-            .and_then(|id| structure.atom(id))
-            .map(|atom| atom.position);
+            .and_then(|position| lookup.position(&acceptor.residue, &format!("C{position}")));
         let phi = torsion_reference
             .and_then(|reference| {
                 reference_defined_torsion(
-                    structure,
+                    &lookup,
                     reference,
                     "phi",
                     &donor.residue,
@@ -5917,7 +6036,7 @@ fn glycosidic_torsion_observations(
         let psi = torsion_reference
             .and_then(|reference| {
                 reference_defined_torsion(
-                    structure,
+                    &lookup,
                     reference,
                     "psi",
                     &donor.residue,
@@ -5935,7 +6054,7 @@ fn glycosidic_torsion_observations(
         let omega = torsion_reference
             .and_then(|reference| {
                 reference_defined_torsion(
-                    structure,
+                    &lookup,
                     reference,
                     "omega",
                     &donor.residue,
@@ -5949,18 +6068,9 @@ fn glycosidic_torsion_observations(
                         // C4-C5-C6-O6.  The former O5-C5-C6-O6 fallback
                         // measured a different torsion and could not be
                         // compared with the source population.
-                        let first = structure
-                            .find_atom(&acceptor.residue, "C4")
-                            .and_then(|id| structure.atom(id))
-                            .map(|atom| atom.position)?;
-                        let c5 = structure
-                            .find_atom(&acceptor.residue, "C5")
-                            .and_then(|id| structure.atom(id))
-                            .map(|atom| atom.position)?;
-                        let c6 = structure
-                            .find_atom(&acceptor.residue, "C6")
-                            .and_then(|id| structure.atom(id))
-                            .map(|atom| atom.position)?;
+                        let first = lookup.position(&acceptor.residue, "C4")?;
+                        let c5 = lookup.position(&acceptor.residue, "C5")?;
+                        let c6 = lookup.position(&acceptor.residue, "C6")?;
                         Some(glycoshape_dihedral_degrees(
                             first,
                             c5,
@@ -6176,7 +6286,7 @@ fn torsion_reference_for_observation<'a>(
 }
 
 fn reference_defined_torsion(
-    structure: &Structure,
+    lookup: &AtomLookup<'_>,
     reference: &Value,
     axis: &str,
     donor: &ResidueId,
@@ -6205,10 +6315,7 @@ fn reference_defined_torsion(
                 .get("atom_name")
                 .or_else(|| atom.get("atomName"))
                 .and_then(Value::as_str)?;
-            structure
-                .find_atom(residue, atom_name)
-                .and_then(|id| structure.atom(id))
-                .map(|atom| atom.position)
+            lookup.position(residue, atom_name)
         })
         .collect::<Option<Vec<_>>>()?;
     Some(glycoshape_dihedral_degrees(
@@ -6958,6 +7065,41 @@ END
     }
 
     #[test]
+    fn ensemble_models_reuse_the_first_parse_exactly() {
+        let options = BuildOptions {
+            add_water: false,
+            add_ions: false,
+            ..BuildOptions::default()
+        };
+        let first = read_pdb_str(PROTEIN, &options).unwrap().to_pdb_string();
+        let shifted = first
+            .lines()
+            .map(|line| {
+                if line.starts_with("ATOM  ") || line.starts_with("HETATM") {
+                    let x = line[30..38].trim().parse::<f64>().unwrap() + 0.5;
+                    format!("{}{:>8.3}{}", &line[..30], x, &line[38..])
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let template = ModelTemplate::new(read_pdb_str(&first, &options).unwrap(), &first);
+        let reused = template.reuse(&shifted).expect("same topology is reused");
+        let parsed = read_pdb_str(&shifted, &options).unwrap();
+        assert_eq!(reused.to_pdb_string(), parsed.to_pdb_string());
+        assert_eq!(reused.metadata(), parsed.metadata());
+        // Any non-coordinate difference falls back to the full reader.
+        assert!(
+            template
+                .reuse(&shifted.replacen(" CA ", " CX ", 1))
+                .is_none()
+        );
+        let duplicated = format!("{}\n{}", shifted.lines().next().unwrap(), shifted);
+        assert!(template.reuse(&duplicated).is_none());
+    }
+
+    #[test]
     fn ensemble_output_budget_reports_the_supported_frame_count() {
         let options = BuildOptions {
             add_water: false,
@@ -7408,8 +7550,14 @@ END
                 ]
             }
         });
-        let measured =
-            reference_defined_torsion(&structure, &reference, "omega", &donor, &acceptor).unwrap();
+        let measured = reference_defined_torsion(
+            &AtomLookup::new(&structure),
+            &reference,
+            "omega",
+            &donor,
+            &acceptor,
+        )
+        .unwrap();
         let positions = ["C4", "C5", "C6", "O6"].map(|name| {
             structure
                 .atom(structure.find_atom(&acceptor, name).unwrap())

@@ -6887,8 +6887,7 @@ pub fn steric_site_scores(structure: &Structure, clash_distance: f64) -> Vec<f64
             let attachment = structure.metadata().glycosylation_sites.get(site_index);
             let link_position = attachment
                 .and_then(|site| structure.find_atom(&site.protein_residue, &site.protein_atom))
-                .and_then(|atom| structure.atom(atom))
-                .map(|atom| atom.position);
+                .and_then(|atom| structure.atom_position(atom));
             // The Cookbook scorer ignores the three attachment-proximal
             // atoms (C1 and its immediate neighbors), preventing the fixed
             // bond geometry from dominating the steric objective.
