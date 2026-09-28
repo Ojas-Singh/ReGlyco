@@ -7062,6 +7062,8 @@ pub fn clash_partner_labels(structure: &Structure, clash_distance: f64) -> Vec<V
         .collect()
 }
 
+/// All-pairs reference for [`ContactGrid::pair_steric_score`].
+#[cfg(test)]
 fn pair_steric_score(
     first: &[&glysys::StructureAtom],
     second: &[&glysys::StructureAtom],
