@@ -2210,24 +2210,6 @@ fn convert_finding(finding: NativeFinding) -> ValidationFinding {
     }
 }
 
-fn multi_model_pdb(structures: &[Structure]) -> String {
-    let mut output = String::new();
-    for (index, structure) in structures.iter().enumerate() {
-        output.push_str(&format!("MODEL     {:>4}\n", index + 1));
-        for line in structure
-            .to_pdb_string()
-            .lines()
-            .filter(|line| !line.starts_with("END"))
-        {
-            output.push_str(line);
-            output.push('\n');
-        }
-        output.push_str("ENDMDL\n");
-    }
-    output.push_str("END\n");
-    output
-}
-
 /// The browser engine returns the multi-model ensemble PDB as one buffer in
 /// the 4 GiB wasm32 heap. Refuse requests whose output alone could not fit
 /// next to the working set, before any sampling time is spent.
@@ -2554,11 +2536,14 @@ pub async fn execute_with_control(
                 None,
                 None,
             )?;
-            let models = parse_pdb_models(input, &options)?;
+            // Input and relaxed frames stay in compact storage; a large
+            // ensemble would otherwise exceed the wasm32 heap.
+            let models = parse_pdb_model_store(input, &options)?;
             if models.len() > 1 {
-                let mut relaxed_frames = Vec::with_capacity(models.len());
+                let mut relaxed_frames =
+                    reglyco_ensemble::StructureStore::with_capacity(models.len());
                 let mut diagnostics = Vec::with_capacity(models.len());
-                for (index, model) in models.iter().enumerate() {
+                for index in 0..models.len() {
                     emit(
                         control,
                         "relax",
@@ -2567,7 +2552,7 @@ pub async fn execute_with_control(
                         Some(models.len()),
                     )?;
                     let model =
-                        prepare_proline_sites(model.clone(), &request.assignments, &options)?;
+                        prepare_proline_sites(models.get(index)?, &request.assignments, &options)?;
                     let system = builder.prepare_structure(&model)?;
                     let relaxation =
                         relax_with_progress(&model, &system, &relax_options(request), |event| {
@@ -2576,15 +2561,12 @@ pub async fn execute_with_control(
                     diagnostics.push(relaxation.diagnostics);
                     relaxed_frames.push(relaxation.structure);
                 }
-                protein = relaxed_frames
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| WorkflowError::Invalid("ensemble contains no frames".into()))?;
+                protein = relaxed_frames.get(0)?;
                 extra_artifacts.push(text_artifact(
                     "ensemble.pdb",
                     "chemical/x-pdb",
                     ArtifactRole::Structure,
-                    multi_model_pdb(&relaxed_frames),
+                    relaxed_frames.multi_model_pdb()?,
                 ));
                 analysis = json!({ "frames": relaxed_frames.len(), "diagnostics": diagnostics });
             } else {
@@ -6832,19 +6814,43 @@ fn execute_refine(
     )
 }
 
+#[cfg(feature = "full")]
 fn parse_pdb_models(contents: &str, options: &BuildOptions) -> Result<Vec<Structure>> {
-    let mut blocks = Vec::new();
+    let mut models = Vec::new();
+    visit_pdb_models(contents, options, |model| models.push(model))?;
+    Ok(models)
+}
+
+/// Parse every model into compact storage, so a large multi-model input is
+/// never held as that many full structures.
+fn parse_pdb_model_store(
+    contents: &str,
+    options: &BuildOptions,
+) -> Result<reglyco_ensemble::StructureStore> {
+    let mut models = reglyco_ensemble::StructureStore::with_capacity(0);
+    visit_pdb_models(contents, options, |model| models.push(model))?;
+    Ok(models)
+}
+
+fn visit_pdb_models(
+    contents: &str,
+    options: &BuildOptions,
+    mut visit: impl FnMut(Structure),
+) -> Result<()> {
+    let mut count = 0usize;
     let mut current = String::new();
     let has_models = contents.lines().any(|line| line.starts_with("MODEL"));
     if !has_models {
-        return Ok(vec![read_pdb_str(contents, options)?]);
+        visit(read_pdb_str(contents, options)?);
+        return Ok(());
     }
     for line in contents.lines() {
         if line.starts_with("MODEL") {
             current.clear();
         } else if line.starts_with("ENDMDL") {
             if !current.trim().is_empty() {
-                blocks.push(read_pdb_str(&current, options)?);
+                visit(read_pdb_str(&current, options)?);
+                count += 1;
             }
             current.clear();
         } else if !current.is_empty()
@@ -6856,12 +6862,12 @@ fn parse_pdb_models(contents: &str, options: &BuildOptions) -> Result<Vec<Struct
             current.push('\n');
         }
     }
-    if blocks.is_empty() {
+    if count == 0 {
         return Err(WorkflowError::Invalid(
             "multi-model PDB contains no complete MODEL/ENDMDL blocks".into(),
         ));
     }
-    Ok(blocks)
+    Ok(())
 }
 
 #[cfg(feature = "full")]
