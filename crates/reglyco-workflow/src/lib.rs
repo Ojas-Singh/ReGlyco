@@ -24,10 +24,9 @@ use reglyco_core::{
 };
 use reglyco_ensemble::{
     EnsembleError, SearchPhase, SearchProgress, StrictSearchDiagnostics, build_from_outcome,
-    calculate_sasa, ensemble_from_pdb, linkage_priors_for_glycan, resolve_search_budget,
+    ensemble_from_pdb, linkage_priors_for_glycan, resolve_search_budget,
     sample_attached_ensemble_with_progress_cancel, search_with_progress_cancelled,
     steric_site_scores,
-
 };
 use reglyco_relax::{MovableSelection, RelaxOptions, RelaxProgress, relax_with_progress};
 use reglyco_validate::{Severity, StericPolicy, ValidationFinding as NativeFinding, validate};
@@ -362,7 +361,17 @@ pub struct ReGlycoRunRequestV1 {
 #[serde(untagged)]
 pub enum AssetData {
     Text(String),
-    Bytes(Vec<u8>),
+    /// Serialized as a byte string: JSON still writes a number array, while
+    /// serde-wasm-bindgen produces one `Uint8Array` instead of a JS array
+    /// with one element per byte.
+    Bytes(#[serde(serialize_with = "serialize_asset_bytes")] Vec<u8>),
+}
+
+fn serialize_asset_bytes<S: serde::Serializer>(
+    bytes: &[u8],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_bytes(bytes)
 }
 
 impl AssetData {
@@ -696,7 +705,6 @@ fn scan_trial_compatible(
             .iter()
             .all(|score| *score <= 1.1),
     )
-
 }
 
 fn attachment_search_config(request: &ReGlycoRunRequestV1) -> SearchConfig {
@@ -1051,6 +1059,105 @@ fn is_protein_residue_name(name: &str) -> bool {
             | "OLT"
             | "OLP"
     )
+}
+
+fn is_solvent_residue_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_uppercase().as_str(),
+        "HOH" | "WAT" | "DOD" | "H2O" | "SOL"
+    )
+}
+
+/// PDB chemical-component codes of common glycan monosaccharides.
+const CARBOHYDRATE_COMPONENTS: &[&str] = &[
+    "NAG", "NDG", "MAN", "BMA", "GLC", "BGC", "GAL", "GLA", "FUC", "FUL", "XYS", "XYP", "SIA",
+    "SLB", "NGC", "NGA", "A2G", "GCS", "GCU", "BDP", "IDR", "KDN", "RAM", "RHA", "ARA", "ARB",
+    "AFL", "RIB", "ROH",
+];
+
+/// Known carbohydrate component, or a GLYCAM residue name such as `4YB`,
+/// `0MA`, or `VMB` (linkage code, sugar letter, anomer).
+fn is_carbohydrate_residue_name(name: &str) -> bool {
+    let name = name.trim().to_ascii_uppercase();
+    if CARBOHYDRATE_COMPONENTS.contains(&name.as_str()) {
+        return true;
+    }
+    let bytes = name.as_bytes();
+    bytes.len() == 3
+        && (bytes[0].is_ascii_digit() || (b'P'..=b'Z').contains(&bytes[0]))
+        && bytes[1].is_ascii_uppercase()
+        && matches!(bytes[2], b'A' | b'B')
+}
+
+/// Residues of glycans already present in `structure`: parser glycan trees,
+/// glycosylation-site glycan residues, and carbohydrate-named residues, plus
+/// any other non-protein, non-solvent residue covalently bonded to them.
+fn deposited_glycan_residues(structure: &Structure) -> BTreeSet<ResidueId> {
+    let names = structure
+        .residues()
+        .into_iter()
+        .map(|residue| (residue.id, residue.name))
+        .collect::<BTreeMap<_, _>>();
+    let removable = |id: &ResidueId| {
+        names
+            .get(id)
+            .is_some_and(|name| !is_protein_residue_name(name) && !is_solvent_residue_name(name))
+    };
+    let metadata = structure.metadata();
+    let mut pending = metadata
+        .glycan_trees
+        .iter()
+        .flat_map(|tree| tree.residue_ids.iter().cloned())
+        .chain(
+            metadata
+                .glycosylation_sites
+                .iter()
+                .map(|site| site.glycan_residue.clone()),
+        )
+        .chain(
+            names
+                .iter()
+                .filter(|(_, name)| is_carbohydrate_residue_name(name))
+                .map(|(id, _)| id.clone()),
+        )
+        .filter(|id| removable(id))
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return BTreeSet::new();
+    }
+    let atom_residues = structure
+        .iter_atoms()
+        .map(|atom| (atom.id, atom.residue))
+        .collect::<BTreeMap<_, _>>();
+    let mut neighbours = BTreeMap::<ResidueId, Vec<ResidueId>>::new();
+    for (first, second) in structure.bonds() {
+        let (Some(first), Some(second)) = (atom_residues.get(&first), atom_residues.get(&second))
+        else {
+            continue;
+        };
+        if first != second {
+            neighbours
+                .entry(first.clone())
+                .or_default()
+                .push(second.clone());
+            neighbours
+                .entry(second.clone())
+                .or_default()
+                .push(first.clone());
+        }
+    }
+    let mut glycans = BTreeSet::new();
+    while let Some(residue) = pending.pop() {
+        if !glycans.insert(residue.clone()) {
+            continue;
+        }
+        for neighbour in neighbours.get(&residue).into_iter().flatten() {
+            if removable(neighbour) && !glycans.contains(neighbour) {
+                pending.push(neighbour.clone());
+            }
+        }
+    }
+    glycans
 }
 
 fn requested_replacement_metadata(request: &ReGlycoRunRequestV1) -> Value {
@@ -2103,22 +2210,42 @@ fn convert_finding(finding: NativeFinding) -> ValidationFinding {
     }
 }
 
-fn multi_model_pdb(structures: &[Structure]) -> String {
-    let mut output = String::new();
-    for (index, structure) in structures.iter().enumerate() {
-        output.push_str(&format!("MODEL     {:>4}\n", index + 1));
-        for line in structure
-            .to_pdb_string()
-            .lines()
-            .filter(|line| !line.starts_with("END"))
-        {
-            output.push_str(line);
-            output.push('\n');
-        }
-        output.push_str("ENDMDL\n");
+/// The browser engine returns the multi-model ensemble PDB as one buffer in
+/// the 4 GiB wasm32 heap. Refuse requests whose output alone could not fit
+/// next to the working set, before any sampling time is spent.
+const BROWSER_ENSEMBLE_PDB_LIMIT_BYTES: usize = 1536 * 1024 * 1024;
+
+fn check_ensemble_output_budget(
+    protein: &Structure,
+    sites: &[SearchSite],
+    frames: usize,
+    limit_bytes: usize,
+) -> Result<()> {
+    let glycan_atoms: usize = sites
+        .iter()
+        .map(|site| {
+            site.ensemble
+                .conformers
+                .first()
+                .map_or(0, |conformer| conformer.structure.iter_atoms().count())
+        })
+        .sum();
+    let atoms = protein.iter_atoms().count() + glycan_atoms;
+    // Fixed-width ATOM/HETATM records are 81 bytes including the newline.
+    let frame_bytes = atoms.saturating_mul(81).max(1);
+    let estimated = frame_bytes.saturating_mul(frames);
+    if estimated <= limit_bytes {
+        return Ok(());
     }
-    output.push_str("END\n");
-    output
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    Err(WorkflowError::Invalid(format!(
+        "{frames} frames of this {atoms}-atom glycoprotein would produce a ~{:.1} GiB ensemble \
+         PDB, above the browser engine's {:.1} GiB output limit. Request at most {} frames, \
+         or run the native ReGlyco CLI for larger ensembles.",
+        estimated as f64 / GIB,
+        limit_bytes as f64 / GIB,
+        limit_bytes / frame_bytes,
+    )))
 }
 
 fn text_artifact(
@@ -2227,7 +2354,9 @@ pub fn analyze_torsions(
         append_torsion_analysis(&mut analysis, &input, "input/parent");
     }
 
-    let models = split_pdb_models(output_pdb);
+    // Models are produced one at a time: collecting every model of a large
+    // ensemble duplicated the whole multi-model PDB inside the wasm heap.
+    let ensemble = pdb_models(output_pdb).nth(1).is_some();
     let stage = final_structure_stage(request, &analysis);
     let has_attachment_references = analysis
         .get("attachmentReferences")
@@ -2239,8 +2368,8 @@ pub fn analyze_torsions(
         // omit private GlycoShape reference grids. Rebuild the small VMM
         // description from newly fetched, in-memory source assets; this does
         // not run search or alter the accepted coordinates.
-        if let Some(model) = models.first() {
-            if let Ok(structure) = read_pdb_str(model, &build_options(request)) {
+        if let Some(model) = pdb_models(output_pdb).next() {
+            if let Ok(structure) = read_pdb_str(&model, &build_options(request)) {
                 if let Ok(sites) = search_sites(request, assets, &structure) {
                     append_attachment_reference_data_from_observations(&mut analysis, &sites);
                 }
@@ -2266,10 +2395,21 @@ pub fn analyze_torsions(
     if !has_attachment_observations {
         append_attachment_analysis(&mut analysis, &stage);
     }
-    let ensemble = models.len() > 1;
     let mut observations = Vec::new();
-    for (index, model) in models.iter().enumerate() {
-        let structure = read_pdb_str(model, &build_options(request))?;
+    let options = build_options(request);
+    let mut template: Option<ModelTemplate> = None;
+    for (index, model) in pdb_models(output_pdb).enumerate() {
+        let structure = match template
+            .as_ref()
+            .and_then(|template| template.reuse(&model))
+        {
+            Some(structure) => structure,
+            None => {
+                let parsed = read_pdb_str(&model, &options)?;
+                template = Some(ModelTemplate::new(parsed.clone(), &model));
+                parsed
+            }
+        };
         observations.extend(glycosidic_torsion_observations(
             &structure,
             stage,
@@ -2295,37 +2435,127 @@ pub fn analyze_torsions(
     Ok(analysis)
 }
 
-fn split_pdb_models(pdb: &str) -> Vec<String> {
-    if !pdb.lines().any(|line| line.starts_with("MODEL")) {
-        return vec![pdb.to_string()];
-    }
-    let mut models = Vec::new();
-    let mut current = String::new();
-    let mut inside = false;
-    for line in pdb.lines() {
-        if line.starts_with("MODEL") {
-            current.clear();
-            inside = true;
-            continue;
+/// A parsed model reused for later models of the same ensemble. ReGlyco
+/// ensembles share one topology, and a full parse (including glycan
+/// recognition) of every large model dominated torsion analysis. A later model
+/// reuses the parse only when every non-coordinate column and record matches;
+/// its coordinates are then read exactly as the PDB reader reads them.
+struct ModelTemplate {
+    structure: Structure,
+    signature: String,
+    atoms: std::collections::HashSet<u32>,
+}
+
+impl ModelTemplate {
+    fn new(structure: Structure, model: &str) -> Self {
+        let atoms = structure.iter_atoms().map(|atom| atom.id.0).collect();
+        Self {
+            structure,
+            signature: pdb_model_signature(model),
+            atoms,
         }
-        if line.starts_with("ENDMDL") {
-            if inside && !current.trim().is_empty() {
-                current.push_str("END\n");
-                models.push(current.clone());
+    }
+
+    fn reuse(&self, model: &str) -> Option<Structure> {
+        if pdb_model_signature(model) != self.signature {
+            return None;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut updates = Vec::with_capacity(self.atoms.len());
+        for line in model.lines() {
+            if !(line.starts_with("ATOM  ") || line.starts_with("HETATM")) {
+                continue;
             }
-            inside = false;
-            continue;
+            let serial = line.get(6..11)?.trim().parse::<u32>().ok()?;
+            if !seen.insert(serial) {
+                // Alternate locations are resolved by the full reader.
+                return None;
+            }
+            if !self.atoms.contains(&serial) {
+                // Records the reader discards (for example protein hydrogens).
+                continue;
+            }
+            let coordinate =
+                |start: usize, end: usize| line.get(start..end)?.trim().parse::<f64>().ok();
+            updates.push((
+                glysys::AtomId(serial),
+                glysys::Vec3 {
+                    x: coordinate(30, 38)?,
+                    y: coordinate(38, 46)?,
+                    z: coordinate(46, 54)?,
+                },
+            ));
         }
-        if inside {
-            current.push_str(line);
-            current.push('\n');
+        if updates.len() != self.atoms.len() {
+            return None;
         }
+        let mut structure = self.structure.clone();
+        structure.set_atom_positions(updates).ok()?;
+        Some(structure)
     }
-    if inside && !current.trim().is_empty() {
-        current.push_str("END\n");
-        models.push(current);
+}
+
+/// Model text with the coordinate columns of atom records removed.
+fn pdb_model_signature(model: &str) -> String {
+    let mut signature = String::with_capacity(model.len());
+    for line in model.lines() {
+        match (line.starts_with("ATOM  ") || line.starts_with("HETATM"))
+            .then(|| line.get(..30).zip(line.get(54..)))
+            .flatten()
+        {
+            Some((head, tail)) => {
+                signature.push_str(head);
+                signature.push_str(tail);
+            }
+            None => signature.push_str(line),
+        }
+        signature.push('\n');
     }
-    models
+    signature
+}
+
+#[cfg(test)]
+fn split_pdb_models(pdb: &str) -> Vec<String> {
+    pdb_models(pdb).collect()
+}
+
+/// Yield each MODEL of a PDB as standalone text (terminated by `END`), one at
+/// a time. A PDB without MODEL records is yielded once as-is.
+fn pdb_models(pdb: &str) -> impl Iterator<Item = String> + '_ {
+    let multi_model = pdb.lines().any(|line| line.starts_with("MODEL"));
+    let mut single = (!multi_model).then(|| pdb.to_string());
+    let mut lines = pdb.lines();
+    std::iter::from_fn(move || {
+        if !multi_model {
+            return single.take();
+        }
+        let mut current = String::new();
+        let mut inside = false;
+        for line in lines.by_ref() {
+            if line.starts_with("MODEL") {
+                current.clear();
+                inside = true;
+                continue;
+            }
+            if line.starts_with("ENDMDL") {
+                if inside && !current.trim().is_empty() {
+                    current.push_str("END\n");
+                    return Some(current);
+                }
+                inside = false;
+                continue;
+            }
+            if inside {
+                current.push_str(line);
+                current.push('\n');
+            }
+        }
+        if inside && !current.trim().is_empty() {
+            current.push_str("END\n");
+            return Some(current);
+        }
+        None
+    })
 }
 
 #[maybe_async_cfg::maybe(
@@ -2397,11 +2627,14 @@ pub async fn execute_with_control(
                 None,
                 None,
             )?;
-            let models = parse_pdb_models(input, &options)?;
+            // Input and relaxed frames stay in compact storage; a large
+            // ensemble would otherwise exceed the wasm32 heap.
+            let models = parse_pdb_model_store(input, &options)?;
             if models.len() > 1 {
-                let mut relaxed_frames = Vec::with_capacity(models.len());
+                let mut relaxed_frames =
+                    reglyco_ensemble::StructureStore::with_capacity(models.len());
                 let mut diagnostics = Vec::with_capacity(models.len());
-                for (index, model) in models.iter().enumerate() {
+                for index in 0..models.len() {
                     emit(
                         control,
                         "relax",
@@ -2410,7 +2643,7 @@ pub async fn execute_with_control(
                         Some(models.len()),
                     )?;
                     let model =
-                        prepare_proline_sites(model.clone(), &request.assignments, &options)?;
+                        prepare_proline_sites(models.get(index)?, &request.assignments, &options)?;
                     let system = builder.prepare_structure(&model)?;
                     let relaxation =
                         relax_with_progress(&model, &system, &relax_options(request), |event| {
@@ -2419,15 +2652,12 @@ pub async fn execute_with_control(
                     diagnostics.push(relaxation.diagnostics);
                     relaxed_frames.push(relaxation.structure);
                 }
-                protein = relaxed_frames
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| WorkflowError::Invalid("ensemble contains no frames".into()))?;
+                protein = relaxed_frames.get(0)?;
                 extra_artifacts.push(text_artifact(
                     "ensemble.pdb",
                     "chemical/x-pdb",
                     ArtifactRole::Structure,
-                    multi_model_pdb(&relaxed_frames),
+                    relaxed_frames.multi_model_pdb()?,
                 ));
                 analysis = json!({ "frames": relaxed_frames.len(), "diagnostics": diagnostics });
             } else {
@@ -2663,6 +2893,14 @@ pub async fn execute_with_control(
         }
         WorkflowId::Ensemble => {
             let sites = search_sites(request, assets, &protein)?;
+            if cfg!(target_arch = "wasm32") {
+                check_ensemble_output_budget(
+                    &protein,
+                    &sites,
+                    request.options.ensemble_frames,
+                    BROWSER_ENSEMBLE_PDB_LIMIT_BYTES,
+                )?;
+            }
             let search_budget = resolved_attachment_budget(request, &protein, &sites)?;
             emit(
                 control,
@@ -2740,31 +2978,36 @@ pub async fn execute_with_control(
                 Err(EnsembleError::Cancelled) => return Err(WorkflowError::Cancelled),
                 Err(error) => return Err(error.into()),
             };
-            let original = frames
-                .iter()
-                .map(|frame| frame.structure.clone())
-                .collect::<Vec<_>>();
-            let mut final_frames = original.clone();
+            // Frames stay in compact storage (one shared template plus
+            // per-frame coordinates) and are rebuilt one at a time below.
+            // Cloning every full frame structure here exhausted the 4 GiB
+            // wasm32 heap for large glycoproteins (for example a 16-site
+            // tetramer with 200 frames) after sampling had finished.
             if request.options.post_relax {
                 let frame_template =
                     reglyco_ensemble::prepare_frame_topology(&protein, &sites, &builder)?;
                 let coordinate_map = glysys_energy::geometry::CoordinateMap::new(&frame_template);
-                let mut relaxed = Vec::with_capacity(original.len());
-                for (index, frame) in original.iter().enumerate() {
+                let mut relaxed = reglyco_ensemble::StructureStore::with_capacity(frames.len());
+                for index in 0..frames.len() {
                     emit(
                         control,
                         "relax",
                         "Relaxing ensemble frames…",
                         Some(index + 1),
-                        Some(original.len()),
+                        Some(frames.len()),
                     )?;
+                    let frame = frames.structure(index)?;
                     let mut frame_system = frame_template.clone();
                     let coordinates = coordinate_map
-                        .coordinates(frame)
+                        .coordinates(&frame)
                         .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
                     frame_system.set_coordinates(&coordinates)?;
-                    match relax_with_progress(frame, &frame_system, &relax_options(request), |_| {})
-                    {
+                    match relax_with_progress(
+                        &frame,
+                        &frame_system,
+                        &relax_options(request),
+                        |_| {},
+                    ) {
                         Ok(mut result) => {
                             result
                                 .structure
@@ -2778,8 +3021,9 @@ pub async fn execute_with_control(
                         }
                     }
                 }
-                if relaxed.len() == original.len() {
-                    final_frames = relaxed;
+                let pre_relax = frames.structures().multi_model_pdb()?;
+                if relaxed.len() == frames.len() {
+                    frames.replace_structures(relaxed)?;
                 } else {
                     status = WorkflowStatus::Partial;
                     if !relaxed.is_empty() {
@@ -2787,7 +3031,7 @@ pub async fn execute_with_control(
                             "partial-relaxed-ensemble.pdb",
                             "chemical/x-pdb",
                             ArtifactRole::Structure,
-                            multi_model_pdb(&relaxed),
+                            relaxed.multi_model_pdb()?,
                         ));
                     }
                 }
@@ -2795,25 +3039,74 @@ pub async fn execute_with_control(
                     "pre-relax-ensemble.pdb",
                     "chemical/x-pdb",
                     ArtifactRole::Structure,
-                    multi_model_pdb(&original),
+                    pre_relax,
                 ));
             }
-            for (frame, final_structure) in frames.iter_mut().zip(&final_frames) {
-                frame.structure = final_structure.clone();
+            // Post-sampling stages report progress so a long finalization of a
+            // large ensemble is visible rather than an apparently idle page.
+            let frame_count = frames.len();
+            let report_every = (frame_count / 20).max(1);
+            reglyco_ensemble::refresh_compact_frames(
+                &mut frames,
+                &protein,
+                &sites,
+                &config,
+                &builder,
+                |done, total| {
+                    if done == total || done.is_multiple_of(report_every) {
+                        let _ = emit(
+                            control,
+                            "finalize",
+                            "Scoring accepted frames…",
+                            Some(done),
+                            Some(total),
+                        );
+                    }
+                },
+            )?;
+            if frames.is_empty() {
+                return Err(WorkflowError::Invalid("ensemble returned no frames".into()));
             }
-            reglyco_ensemble::refresh_frames(&mut frames, &protein, &sites, &config, &builder)?;
-            protein = final_frames
-                .first()
-                .cloned()
-                .ok_or_else(|| WorkflowError::Invalid("ensemble returned no frames".into()))?;
+            protein = frames.structure(0)?;
+            emit(
+                control,
+                "ensemble_pdb",
+                format!("Writing the {frame_count}-frame ensemble PDB…"),
+                None,
+                None,
+            )?;
             extra_artifacts.push(text_artifact(
                 "ensemble.pdb",
                 "chemical/x-pdb",
                 ArtifactRole::Structure,
-                multi_model_pdb(&final_frames),
+                frames.structures().multi_model_pdb()?,
             ));
             if request.options.calculate_sasa {
-                let sasa = calculate_sasa(final_frames.iter())?;
+                emit(
+                    control,
+                    "sasa",
+                    "Calculating SASA shielding across frames…",
+                    Some(0),
+                    Some(frame_count),
+                )?;
+                let sasa = reglyco_ensemble::calculate_sasa_streaming(
+                    frames
+                        .structures()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, frame)| {
+                            if index > 0 && index.is_multiple_of(report_every) {
+                                let _ = emit(
+                                    control,
+                                    "sasa",
+                                    "Calculating SASA shielding across frames…",
+                                    Some(index),
+                                    Some(frame_count),
+                                );
+                            }
+                            frame.map_err(WorkflowError::from)
+                        }),
+                )?;
                 extra_artifacts.push(text_artifact(
                     "sasa.pdb",
                     "chemical/x-pdb",
@@ -2860,11 +3153,11 @@ pub async fn execute_with_control(
                     [segment] => segment.backend.as_str(),
                     _ => "Mixed",
                 };
-                if let (Some(first), Some(first_frame)) = (final_frames.first(), frames.first()) {
+                if let Some(first_frame) = frames.first() {
                     match reglyco_ensemble::analyze_energy_structure(
                         &sites,
                         &first_frame.sites,
-                        first,
+                        &protein,
                         &builder,
                         config.scoring_mode,
                         config.use_obc2,
@@ -2965,13 +3258,32 @@ pub async fn execute_with_control(
             }
         }
         WorkflowId::NScan => {
-            emit(
-                control,
-                "scan",
-                "Finding unoccupied N-X-S/T sequons…",
-                None,
-                None,
-            )?;
+            emit(control, "scan", "Finding N-X-S/T sequons…", None, None)?;
+            // Scan the protein as if it were deglycosylated: deposited glycans
+            // neither mark a sequon as occupied nor block neighbouring sites.
+            // The reported output structure remains the unmodified input.
+            let ignored_glycan_residues = deposited_glycan_residues(&protein);
+            // Sequons that were unoccupied in the input; the others carried a
+            // deposited glycan and are reported so clients mark them as
+            // replacements when building on them.
+            let unoccupied_in_input = scan_n_linked_sequons(&protein)
+                .into_iter()
+                .map(|sequon| sequon.asparagine)
+                .collect::<BTreeSet<_>>();
+            let protein =
+                if ignored_glycan_residues.is_empty() {
+                    protein.clone()
+                } else {
+                    let mut stripped = protein.clone();
+                    stripped.remove_residues(&ignored_glycan_residues);
+                    warnings.push(format!(
+                    "Ignored {} deposited glycan residue{} while scanning; occupied sequons were \
+                     tested as if unoccupied, and building on them replaces the deposited glycan.",
+                    ignored_glycan_residues.len(),
+                    if ignored_glycan_residues.len() == 1 { "" } else { "s" },
+                ));
+                    stripped
+                };
             let sequons = scan_n_linked_sequons(&protein);
             if let Some(asset) = assets.get("scan-glycan.pdb") {
                 let query = GlycanQuery {
@@ -3079,7 +3391,6 @@ pub async fn execute_with_control(
                             joint_seconds += joint_started.elapsed().as_secs_f64();
                             match joint {
                                 Ok(joint) if joint.clash_status == ClashStatus::ClashFree => {
-
                                     compatible = trial_sites;
                                     compatible_results = joint.sites;
                                 }
@@ -3123,12 +3434,17 @@ pub async fn execute_with_control(
                                 ("context".into(), json!(sequon.context)),
                                 ("accessible".into(), json!(accessible)),
                                 ("jointlyCompatible".into(), json!(jointly_compatible)),
+                                (
+                                    "occupied".into(),
+                                    json!(!unoccupied_in_input.contains(&sequon.asparagine)),
+                                ),
                             ]),
                         }
                     })
                     .collect();
                 analysis = json!({
                     "sequons": sequons,
+                    "ignoredGlycanResidueCount": ignored_glycan_residues.len(),
                     "structuralAccessibilityComputed": true,
                     "independentAccessibleCount": independent.iter().filter(|entry| entry.0).count(),
                     "jointlyCompatibleCount": compatible.len(),
@@ -3156,6 +3472,10 @@ pub async fn execute_with_control(
                         details: BTreeMap::from([
                             ("motif".into(), json!(sequon.motif)),
                             ("context".into(), json!(sequon.context)),
+                            (
+                                "occupied".into(),
+                                json!(!unoccupied_in_input.contains(&sequon.asparagine)),
+                            ),
                         ]),
                     })
                     .collect();
@@ -3249,7 +3569,7 @@ fn finish_workflow(
     // output has been displayed; no reporting bug may suppress a valid
     // Cookbook search result.
     let validation = ValidationSummary {
-        valid: !protein.atoms().is_empty(),
+        valid: protein.iter_atoms().next().is_some(),
         findings: Vec::new(),
         warnings: Vec::new(),
         errors: Vec::new(),
@@ -5518,6 +5838,36 @@ pub fn energy_analysis_csv(analysis: &Value) -> String {
     output
 }
 
+/// Constant-time coordinate lookups for one structure. `Structure::atom`
+/// rebuilds every atom record on each call, which made measuring each
+/// linkage of a large multi-model ensemble effectively quadratic.
+struct AtomLookup<'a> {
+    structure: &'a Structure,
+    positions: HashMap<glysys::AtomId, glysys::Vec3>,
+}
+
+impl<'a> AtomLookup<'a> {
+    fn new(structure: &'a Structure) -> Self {
+        Self {
+            structure,
+            positions: structure
+                .iter_atoms()
+                .map(|atom| (atom.id, atom.position))
+                .collect(),
+        }
+    }
+
+    fn position_of(&self, id: glysys::AtomId) -> Option<glysys::Vec3> {
+        self.positions.get(&id).copied()
+    }
+
+    fn position(&self, residue: &ResidueId, name: &str) -> Option<glysys::Vec3> {
+        self.structure
+            .find_atom(residue, name)
+            .and_then(|id| self.position_of(id))
+    }
+}
+
 fn glycosidic_torsion_observations(
     structure: &Structure,
     stage: &str,
@@ -5571,12 +5921,17 @@ fn glycosidic_torsion_observations(
             }
         }
     }
+    let atoms_by_id = atoms
+        .iter()
+        .map(|atom| (atom.id, atom))
+        .collect::<HashMap<_, _>>();
+    let lookup = AtomLookup::new(structure);
     let mut observations = Vec::new();
     for (first, second) in bond_pairs {
-        let Some(first) = structure.atom(first) else {
+        let Some(&first) = atoms_by_id.get(&first) else {
             continue;
         };
-        let Some(second) = structure.atom(second) else {
+        let Some(&second) = atoms_by_id.get(&second) else {
             continue;
         };
         if first.residue == second.residue
@@ -5658,22 +6013,15 @@ fn glycosidic_torsion_observations(
                 .or_else(|| structure.find_atom(&donor.residue, "O6"))
                 .or_else(|| structure.find_atom(&donor.residue, "O4"))
         };
-        let donor_ring = donor_ring_atom
-            .and_then(|id| structure.atom(id))
-            .map(|atom| atom.position);
-        let acceptor_carbon = structure
-            .find_atom(&acceptor.residue, &format!("C{acceptor_position}"))
-            .and_then(|id| structure.atom(id))
-            .map(|atom| atom.position);
+        let donor_ring = donor_ring_atom.and_then(|id| lookup.position_of(id));
+        let acceptor_carbon = lookup.position(&acceptor.residue, &format!("C{acceptor_position}"));
         let previous = acceptor_position
             .checked_sub(1)
-            .and_then(|position| structure.find_atom(&acceptor.residue, &format!("C{position}")))
-            .and_then(|id| structure.atom(id))
-            .map(|atom| atom.position);
+            .and_then(|position| lookup.position(&acceptor.residue, &format!("C{position}")));
         let phi = torsion_reference
             .and_then(|reference| {
                 reference_defined_torsion(
-                    structure,
+                    &lookup,
                     reference,
                     "phi",
                     &donor.residue,
@@ -5688,7 +6036,7 @@ fn glycosidic_torsion_observations(
         let psi = torsion_reference
             .and_then(|reference| {
                 reference_defined_torsion(
-                    structure,
+                    &lookup,
                     reference,
                     "psi",
                     &donor.residue,
@@ -5706,7 +6054,7 @@ fn glycosidic_torsion_observations(
         let omega = torsion_reference
             .and_then(|reference| {
                 reference_defined_torsion(
-                    structure,
+                    &lookup,
                     reference,
                     "omega",
                     &donor.residue,
@@ -5720,18 +6068,9 @@ fn glycosidic_torsion_observations(
                         // C4-C5-C6-O6.  The former O5-C5-C6-O6 fallback
                         // measured a different torsion and could not be
                         // compared with the source population.
-                        let first = structure
-                            .find_atom(&acceptor.residue, "C4")
-                            .and_then(|id| structure.atom(id))
-                            .map(|atom| atom.position)?;
-                        let c5 = structure
-                            .find_atom(&acceptor.residue, "C5")
-                            .and_then(|id| structure.atom(id))
-                            .map(|atom| atom.position)?;
-                        let c6 = structure
-                            .find_atom(&acceptor.residue, "C6")
-                            .and_then(|id| structure.atom(id))
-                            .map(|atom| atom.position)?;
+                        let first = lookup.position(&acceptor.residue, "C4")?;
+                        let c5 = lookup.position(&acceptor.residue, "C5")?;
+                        let c6 = lookup.position(&acceptor.residue, "C6")?;
                         Some(glycoshape_dihedral_degrees(
                             first,
                             c5,
@@ -5947,7 +6286,7 @@ fn torsion_reference_for_observation<'a>(
 }
 
 fn reference_defined_torsion(
-    structure: &Structure,
+    lookup: &AtomLookup<'_>,
     reference: &Value,
     axis: &str,
     donor: &ResidueId,
@@ -5976,10 +6315,7 @@ fn reference_defined_torsion(
                 .get("atom_name")
                 .or_else(|| atom.get("atomName"))
                 .and_then(Value::as_str)?;
-            structure
-                .find_atom(residue, atom_name)
-                .and_then(|id| structure.atom(id))
-                .map(|atom| atom.position)
+            lookup.position(residue, atom_name)
         })
         .collect::<Option<Vec<_>>>()?;
     Some(glycoshape_dihedral_degrees(
@@ -6585,19 +6921,43 @@ fn execute_refine(
     )
 }
 
+#[cfg(feature = "full")]
 fn parse_pdb_models(contents: &str, options: &BuildOptions) -> Result<Vec<Structure>> {
-    let mut blocks = Vec::new();
+    let mut models = Vec::new();
+    visit_pdb_models(contents, options, |model| models.push(model))?;
+    Ok(models)
+}
+
+/// Parse every model into compact storage, so a large multi-model input is
+/// never held as that many full structures.
+fn parse_pdb_model_store(
+    contents: &str,
+    options: &BuildOptions,
+) -> Result<reglyco_ensemble::StructureStore> {
+    let mut models = reglyco_ensemble::StructureStore::with_capacity(0);
+    visit_pdb_models(contents, options, |model| models.push(model))?;
+    Ok(models)
+}
+
+fn visit_pdb_models(
+    contents: &str,
+    options: &BuildOptions,
+    mut visit: impl FnMut(Structure),
+) -> Result<()> {
+    let mut count = 0usize;
     let mut current = String::new();
     let has_models = contents.lines().any(|line| line.starts_with("MODEL"));
     if !has_models {
-        return Ok(vec![read_pdb_str(contents, options)?]);
+        visit(read_pdb_str(contents, options)?);
+        return Ok(());
     }
     for line in contents.lines() {
         if line.starts_with("MODEL") {
             current.clear();
         } else if line.starts_with("ENDMDL") {
             if !current.trim().is_empty() {
-                blocks.push(read_pdb_str(&current, options)?);
+                visit(read_pdb_str(&current, options)?);
+                count += 1;
             }
             current.clear();
         } else if !current.is_empty()
@@ -6609,12 +6969,12 @@ fn parse_pdb_models(contents: &str, options: &BuildOptions) -> Result<Vec<Struct
             current.push('\n');
         }
     }
-    if blocks.is_empty() {
+    if count == 0 {
         return Err(WorkflowError::Invalid(
             "multi-model PDB contains no complete MODEL/ENDMDL blocks".into(),
         ));
     }
-    Ok(blocks)
+    Ok(())
 }
 
 #[cfg(feature = "full")]
@@ -6704,6 +7064,57 @@ END
         }
     }
 
+    #[test]
+    fn ensemble_models_reuse_the_first_parse_exactly() {
+        let options = BuildOptions {
+            add_water: false,
+            add_ions: false,
+            ..BuildOptions::default()
+        };
+        let first = read_pdb_str(PROTEIN, &options).unwrap().to_pdb_string();
+        let shifted = first
+            .lines()
+            .map(|line| {
+                if line.starts_with("ATOM  ") || line.starts_with("HETATM") {
+                    let x = line[30..38].trim().parse::<f64>().unwrap() + 0.5;
+                    format!("{}{:>8.3}{}", &line[..30], x, &line[38..])
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let template = ModelTemplate::new(read_pdb_str(&first, &options).unwrap(), &first);
+        let reused = template.reuse(&shifted).expect("same topology is reused");
+        let parsed = read_pdb_str(&shifted, &options).unwrap();
+        assert_eq!(reused.to_pdb_string(), parsed.to_pdb_string());
+        assert_eq!(reused.metadata(), parsed.metadata());
+        // Any non-coordinate difference falls back to the full reader.
+        assert!(
+            template
+                .reuse(&shifted.replacen(" CA ", " CX ", 1))
+                .is_none()
+        );
+        let duplicated = format!("{}\n{}", shifted.lines().next().unwrap(), shifted);
+        assert!(template.reuse(&duplicated).is_none());
+    }
+
+    #[test]
+    fn ensemble_output_budget_reports_the_supported_frame_count() {
+        let options = BuildOptions {
+            add_water: false,
+            add_ions: false,
+            ..BuildOptions::default()
+        };
+        let protein = read_pdb_str(PROTEIN, &options).unwrap();
+        let atoms = protein.iter_atoms().count();
+        let frame_bytes = atoms * 81;
+        check_ensemble_output_budget(&protein, &[], 10, frame_bytes * 10).unwrap();
+        let error = check_ensemble_output_budget(&protein, &[], 11, frame_bytes * 10)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Request at most 10 frames"), "{error}");
+    }
     #[test]
     fn options_default_to_pdb_and_record_format_and_seed_metadata() {
         let mut request = replacement_request(WorkflowId::SiteBuild, pro_assignment("PRO"));
@@ -7139,8 +7550,14 @@ END
                 ]
             }
         });
-        let measured =
-            reference_defined_torsion(&structure, &reference, "omega", &donor, &acceptor).unwrap();
+        let measured = reference_defined_torsion(
+            &AtomLookup::new(&structure),
+            &reference,
+            "omega",
+            &donor,
+            &acceptor,
+        )
+        .unwrap();
         let positions = ["C4", "C5", "C6", "O6"].map(|name| {
             structure
                 .atom(structure.find_atom(&acceptor, name).unwrap())

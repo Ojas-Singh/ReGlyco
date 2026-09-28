@@ -5,6 +5,7 @@
 //! so attached ensemble jobs do not need GROMACS, trajectories, or temporary
 //! files.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 
 use glysys::{AtomId, ResidueId, Structure, StructureAtom, Vec3};
@@ -130,14 +131,43 @@ enum PdbValue {
 /// Calculate the Cookbook SASA, absolute SASA, and hotspot values from sampled
 /// attached structures.  The structures must retain the same atom IDs across
 /// frames, as Re-Glyco sampled frames do.
-pub fn calculate_sasa<'a, I>(frames: I) -> Result<SasaAnalysis>
+pub fn calculate_sasa<I, S>(frames: I) -> Result<SasaAnalysis>
 where
-    I: IntoIterator<Item = &'a Structure>,
+    I: IntoIterator<Item = S>,
+    S: Borrow<Structure>,
 {
-    let frames = frames.into_iter().collect::<Vec<_>>();
-    let Some(template) = frames.first() else {
-        return Err(SasaError::EmptyFrames);
+    calculate_sasa_streaming(frames.into_iter().map(Ok))
+}
+
+/// [`calculate_sasa`] over frames produced one at a time (for example rebuilt
+/// from compact ensemble storage).  Only one frame is held at once, so the
+/// peak memory does not grow with the number of frames.
+pub fn calculate_sasa_streaming<I, S, E>(frames: I) -> std::result::Result<SasaAnalysis, E>
+where
+    I: IntoIterator<Item = std::result::Result<S, E>>,
+    S: Borrow<Structure>,
+    E: From<SasaError>,
+{
+    sasa_over_frames(frames, false)
+}
+
+/// `exhaustive` recomputes every lattice area in every frame. It exists to
+/// verify that the default path (bare-area reuse and contact pruning) is
+/// exact.
+pub(crate) fn sasa_over_frames<I, S, E>(
+    frames: I,
+    exhaustive: bool,
+) -> std::result::Result<SasaAnalysis, E>
+where
+    I: IntoIterator<Item = std::result::Result<S, E>>,
+    S: Borrow<Structure>,
+    E: From<SasaError>,
+{
+    let mut frames = frames.into_iter();
+    let Some(first) = frames.next().transpose()? else {
+        return Err(SasaError::EmptyFrames.into());
     };
+    let template = first.borrow();
 
     let template_atoms = template.atoms();
     let protein_atoms = template_atoms
@@ -152,7 +182,7 @@ where
         .map(|residue| residue.id)
         .collect::<Vec<_>>();
     if protein_atoms.is_empty() || protein_residues.is_empty() {
-        return Err(SasaError::MismatchedAtoms);
+        return Err(SasaError::MismatchedAtoms.into());
     }
 
     let residue_indices = protein_residues
@@ -163,8 +193,14 @@ where
     let protein_atom_ids = protein_atoms.iter().map(|atom| atom.id).collect::<Vec<_>>();
     let mut bare_sasa_sum = vec![0.0; protein_residues.len()];
     let mut glyco_sasa_sum = vec![0.0; protein_residues.len()];
+    let mut frame_count = 0usize;
+    // Bare-protein areas of the last computed frame. Sampled frames normally
+    // keep the protein fixed, so these are reused whenever the protein
+    // coordinates are bit-identical instead of being recomputed per frame.
+    let mut cached_bare: Option<(Vec<Vec3>, Vec<f64>)> = None;
 
-    for frame in &frames {
+    let mut accumulate = |frame: &Structure| -> Result<()> {
+        frame_count += 1;
         let frame_atoms = frame.atoms();
         let frame_by_id = frame_atoms
             .iter()
@@ -195,11 +231,19 @@ where
             .iter()
             .map(|atom| vdw_radius(&atom.element))
             .collect::<Vec<_>>();
-        let bare_areas = double_cubic_lattice_sasa(
-            &bare_positions,
-            &bare_radii,
-            &(0..bare_atoms.len()).collect::<Vec<_>>(),
-        );
+        let reusable = !exhaustive
+            && cached_bare
+                .as_ref()
+                .is_some_and(|(positions, _)| same_positions(positions, &bare_positions));
+        if !reusable {
+            let areas = double_cubic_lattice_sasa(
+                &bare_positions,
+                &bare_radii,
+                &(0..bare_atoms.len()).collect::<Vec<_>>(),
+            );
+            cached_bare = Some((bare_positions, areas));
+        }
+        let bare_areas = &cached_bare.as_ref().expect("bare SASA was computed").1;
 
         let glyco_positions = frame_atoms
             .iter()
@@ -223,7 +267,21 @@ where
                     .ok_or(SasaError::MissingAtom(*atom_id))
             })
             .collect::<Result<Vec<_>>>()?;
-        let glyco_areas = double_cubic_lattice_sasa(&glyco_positions, &glyco_radii, &glyco_indices);
+        // A protein atom's area can only change when a non-protein atom lies
+        // within the solvent-radius contact distance used by the lattice
+        // test; every other atom keeps exactly its bare-protein area.
+        let affected = if exhaustive {
+            vec![true; glyco_indices.len()]
+        } else {
+            atoms_contacting_others(&glyco_positions, &glyco_radii, &glyco_indices)
+        };
+        let affected_indices = glyco_indices
+            .iter()
+            .zip(&affected)
+            .filter_map(|(index, affected)| affected.then_some(*index))
+            .collect::<Vec<_>>();
+        let glyco_areas =
+            double_cubic_lattice_sasa(&glyco_positions, &glyco_radii, &affected_indices);
 
         let mut bare_by_residue = vec![0.0; protein_residues.len()];
         let mut glyco_by_residue = vec![0.0; protein_residues.len()];
@@ -233,7 +291,11 @@ where
                 .copied()
                 .ok_or_else(|| SasaError::MissingResidue(atom.residue.clone()))?;
             bare_by_residue[residue_index] += bare_areas[index];
-            glyco_by_residue[residue_index] += glyco_areas[glyco_indices[index]];
+            glyco_by_residue[residue_index] += if affected[index] {
+                glyco_areas[glyco_indices[index]]
+            } else {
+                bare_areas[index]
+            };
         }
 
         for index in 0..protein_residues.len() {
@@ -242,9 +304,14 @@ where
             bare_sasa_sum[index] += bare;
             glyco_sasa_sum[index] += glyco;
         }
+        Ok(())
+    };
+    accumulate(template)?;
+    drop(first);
+    for frame in frames {
+        accumulate(frame?.borrow())?;
     }
 
-    let frame_count = frames.len();
     let frame_count_f64 = frame_count as f64;
     let residues = protein_residues
         .into_iter()
@@ -278,6 +345,71 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GridCell(i64, i64, i64);
+
+fn same_positions(first: &[Vec3], second: &[Vec3]) -> bool {
+    first.len() == second.len()
+        && first.iter().zip(second).all(|(a, b)| {
+            a.x.to_bits() == b.x.to_bits()
+                && a.y.to_bits() == b.y.to_bits()
+                && a.z.to_bits() == b.z.to_bits()
+        })
+}
+
+/// For each index in `targets`, whether any atom outside `targets` lies within
+/// the contact distance that [`double_cubic_lattice_sasa`] uses to test
+/// burial. The distance expression matches the lattice test exactly, so an
+/// atom reported as unaffected has the same neighbour set with and without
+/// the other atoms.
+fn atoms_contacting_others(positions: &[Vec3], radii: &[f64], targets: &[usize]) -> Vec<bool> {
+    let mut is_target = vec![false; positions.len()];
+    for &index in targets {
+        is_target[index] = true;
+    }
+    let solvent_radii = radii
+        .iter()
+        .map(|radius| radius + COOKBOOK_PROBE_RADIUS_ANGSTROM)
+        .collect::<Vec<_>>();
+    let max_radius = solvent_radii.iter().copied().fold(0.0, f64::max);
+    let cell_size = (2.0 * max_radius).max(1.0e-6);
+    let mut others = HashMap::<GridCell, Vec<usize>>::new();
+    for (index, position) in positions.iter().enumerate() {
+        if !is_target[index] {
+            others
+                .entry(grid_cell(*position, cell_size))
+                .or_default()
+                .push(index);
+        }
+    }
+    targets
+        .iter()
+        .map(|&index| {
+            let atom_radius = solvent_radii[index];
+            let center = positions[index];
+            let cell = grid_cell(center, cell_size);
+            (-1..=1).any(|dx| {
+                (-1..=1).any(|dy| {
+                    (-1..=1).any(|dz| {
+                        others
+                            .get(&GridCell(cell.0 + dx, cell.1 + dy, cell.2 + dz))
+                            .into_iter()
+                            .flatten()
+                            .any(|&other| {
+                                let neighbor_radius = solvent_radii[other];
+                                let displacement = Vec3 {
+                                    x: positions[other].x - center.x,
+                                    y: positions[other].y - center.y,
+                                    z: positions[other].z - center.z,
+                                };
+                                dot(displacement, displacement)
+                                    <= (atom_radius + neighbor_radius)
+                                        * (atom_radius + neighbor_radius)
+                            })
+                    })
+                })
+            })
+        })
+        .collect()
+}
 
 /// GROMACS's double-cubic-lattice rolling-probe surface area for the
 /// requested atom indices. Coordinates and radii are in Ångström; returned

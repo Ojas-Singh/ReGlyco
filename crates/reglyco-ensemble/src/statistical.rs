@@ -372,7 +372,7 @@ pub(super) async fn sample_statistical<C>(
     builder: &glysys::SystemBuilder,
     mut cancelled: C,
     mut progress: impl FnMut(usize, usize, usize, usize),
-) -> Result<(Vec<SampledFrame>, EnsembleSamplingDiagnostics)>
+) -> Result<(CompactFrames, EnsembleSamplingDiagnostics)>
 where
     C: FnMut() -> bool,
 {
@@ -520,7 +520,8 @@ where
         initial_states: std::sync::Arc::new(Vec::new()),
         initial_state_cursor: std::sync::atomic::AtomicUsize::new(0),
     };
-    let mut result = Vec::with_capacity(frames);
+    // Accepted frames share one topology; store only their coordinates.
+    let mut result = CompactFrames::with_capacity(frames);
     let mut proposals = 0;
     let mut accepts = 0;
     let mut gpu_proposals = 0;

@@ -127,3 +127,38 @@ fn browser_shaped_scan_completes_with_budget_and_timing_report() {
     assert_eq!(analysis["scanBudget"]["generations"], 25);
     assert!(analysis["timings"]["totalSeconds"].as_f64().is_some());
 }
+
+#[test]
+fn scan_ignores_deposited_glycans_and_flags_occupied_sequons() {
+    // PROTEIN with a NAG bonded to ASN A1 ND2: the sequon is occupied in the
+    // input but must still be scanned as if the protein were deglycosylated.
+    let occupied = PROTEIN.replace(
+        "TER\nEND\n",
+        "\
+TER
+HETATM   11  C1  NAG B   1       4.550  -2.620  -3.020  1.00  0.00           C
+HETATM   12  O5  NAG B   1       5.900  -2.300  -3.300  1.00  0.00           O
+CONECT    8   11
+END
+",
+    );
+    let bundle = execute(&scan_request(), &scan_assets(&occupied)).expect("scan executes");
+    let analysis = &bundle.report.analysis;
+    assert_eq!(analysis["ignoredGlycanResidueCount"], 1, "{analysis}");
+    assert_eq!(bundle.report.sites.len(), 1, "{analysis}");
+    let site = &bundle.report.sites[0];
+    assert_eq!(site.details["occupied"], true);
+    assert_eq!(site.status, "compatible", "{analysis}");
+    assert!(
+        bundle
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Ignored 1 deposited glycan residue")),
+        "{:?}",
+        bundle.warnings
+    );
+
+    let free = execute(&scan_request(), &scan_assets(PROTEIN)).expect("scan executes");
+    assert_eq!(free.report.sites[0].details["occupied"], false);
+    assert_eq!(free.report.analysis["ignoredGlycanResidueCount"], 0);
+}
