@@ -17,6 +17,15 @@ Downloaded proteins are cached under `.reglyco-cache/proteins`; use
 `--protein-cache PATH` to move the cache or `--protein-offline` to forbid
 network access.
 
+## GlycoShape data access
+
+Glycan ensembles named by GlyTouCan ID are fetched from the GlycoShape API at
+`https://glycoshape.org` (`--api-base`). Command-line clients receive Level 1,
+the public dataset, which is the default `--level`. Levels 2 and 3 are not
+served to command-line clients, and requesting them fails with an explanatory
+error. Local ensemble bundles (`--glycan PATH` or `--attach SITE=PATH`) are used
+as supplied. glycoshape.io is retired and should not be used as `--api-base`.
+
 ## Licensing
 
 This project is dual licensed.
@@ -177,7 +186,7 @@ cargo run --release -- refine \
   --assembly 1 \
   --replace-glycan A:79=G63337SS \
   --anomer beta \
-  --level 3 \
+  --level 1 \
   --objective density \
   --density-map auto \
   --density-map-source pdbe \
@@ -191,7 +200,7 @@ cargo run --release -- refine \
 
 This is the one-shot scientific example: it downloads the 5KZC biological
 assembly and the PDBe EDS density map, replaces the deposited glycan at `A:79` with
-the 512-conformer GlycoShape `G63337SS` Man9 ensemble, fits correlated complete
+the public Level 1 GlycoShape `G63337SS` Man9 ensemble, fits correlated complete
 arms, and writes `fitted.pdb`, `candidates.pdb`, `candidates.json`,
 `density.json`, `validation.json`, `search.json`, `report.json`, `report.pdf`,
 `report.typ`, `glycoshape-density-best.pdb`, `glycoshape-nearest-fit.pdb`,
@@ -236,7 +245,7 @@ basins, and compares the surviving basins on one fixed nominal ROI:
 RAYON_NUM_THREADS=4 cargo run --release -- refine \
   --pdb-id 5KZC --assembly 1 \
   --replace-glycan A:79=G63337SS \
-  --anomer beta --level 3 \
+  --anomer beta --level 1 \
   --objective density \
   --density-map auto --density-map-source pdbe \
   --density-difference-map none \
@@ -297,7 +306,10 @@ finalist with the shared nominal kernel and fixed ROI.  Per-residue blur is
 tested only after a connected pose exists and is accepted only with a held-out
 likelihood and BIC gain.
 
-The canonical no-override cached Adaptive benchmark is recorded in
+The benchmarks below were recorded with a locally cached 512-conformer Level 3
+`G63337SS` ensemble; Level 3 is not distributed publicly, so public runs use
+Level 1 or a local bundle. The canonical no-override cached Adaptive benchmark is
+recorded in
 `example-output/5kzc-parallel-default-final`.  The accepted optimization only
 parallelizes independent proposal/refinement work and defers native-arm
 alternatives until final reporting.  It keeps the
@@ -336,7 +348,8 @@ exact command, wall-clock resource usage, and `density.json` for 5KZC and both
 For a PDB-ID density run with no explicit attachment, ReGlyco defaults to
 biological assembly 1 and discovers every carbohydrate component with an
 explicit protein LINK through crabWURCS 0.3.1. Each site is resolved against
-GlycoShape at level 3, checked for exact canonical topology, fitted with its
+GlycoShape at the requested `--level` (Level 1 by default), checked for exact
+canonical topology, fitted with its
 own Adaptive scorer/ROI/conformer state, and merged only after fitting. This
 preflight is atomic: an unsupported attachment or missing exact ensemble stops
 before the input is stripped. Use `--asymmetric-unit` for the old asymmetric

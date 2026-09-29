@@ -266,7 +266,8 @@ struct EnsembleArgs {
 
 #[derive(Debug, Clone, Args)]
 struct ProviderArgs {
-    #[arg(long, default_value = "https://glycoshape.io")]
+    /// GlycoShape API to fetch glycan ensembles from.
+    #[arg(long, default_value = "https://glycoshape.org")]
     api_base: String,
     #[arg(long, default_value = ".reglyco-cache")]
     cache: PathBuf,
@@ -274,7 +275,9 @@ struct ProviderArgs {
     offline: bool,
     #[arg(long, default_value = "beta")]
     anomer: String,
-    #[arg(long, default_value = "3")]
+    /// GlycoShape dataset level. glycoshape.org serves Level 1 to
+    /// command-line clients; Levels 2 and 3 are not available from it.
+    #[arg(long, default_value = "1")]
     level: String,
 }
 
@@ -4459,7 +4462,8 @@ mod tests {
         let Command::Refine(arguments) = cli.command else {
             panic!("expected refine command");
         };
-        assert_eq!(arguments.common.provider.level, "3");
+        assert_eq!(arguments.common.provider.level, "1");
+        assert_eq!(arguments.common.provider.api_base, "https://glycoshape.org");
         assert!(!arguments.common.protein.asymmetric_unit);
         let cli = Cli::try_parse_from([
             "reglyco",

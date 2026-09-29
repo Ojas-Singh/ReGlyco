@@ -531,7 +531,18 @@ impl EnsembleProvider for GlycoShapeProvider {
             .client
             .get(&url)
             .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| EnsembleError::Remote(error.to_string()))?;
+        if matches!(response.status().as_u16(), 401 | 403) {
+            return Err(EnsembleError::Remote(format!(
+                "{identifier} Level {} is not available from {} to command-line clients \
+                 (HTTP {}). Only Level 1 is public; use `--level 1` or a local ensemble bundle.",
+                query.level,
+                self.api_base_url.trim_end_matches('/'),
+                response.status().as_u16()
+            )));
+        }
+        let response = response
+            .error_for_status()
             .map_err(|error| EnsembleError::Remote(error.to_string()))?;
         let pdb = response
             .text()
