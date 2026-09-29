@@ -6,7 +6,9 @@ is useful for checking coordinate transforms, replacement, deterministic
 search, and report provenance rather than for claiming an unbiased fit.
 
 Fetch biological assembly 1, replace the legacy glycan at A:79, and fit the
-complete Man9 ensemble:
+complete Man9 ensemble. This record used the 512-conformer Level 3 ensemble,
+which glycoshape.org does not serve; reproduce it with a local Level 3 bundle or
+run the public Level 1 ensemble with `--level 1`:
 
 ```text
 reglyco refine \
