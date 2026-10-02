@@ -20760,6 +20760,10 @@ struct BranchRotation {
     child_residue: ResidueId,
     parent_residue: ResidueId,
     label: String,
+    /// The four atoms of the measured dihedral, resolved from the bond graph
+    /// when the rotation is built (so sialic acids use C2/O6, furanoses O4).
+    /// `None` keeps the historical name-based lookup.
+    dihedral: Option<[AtomId; 4]>,
 }
 
 #[derive(Debug, Clone)]
@@ -21800,6 +21804,7 @@ fn branch_rotations(structure: &Structure, targets: &[DensityTarget]) -> Vec<Bra
                 left_atom.residue.clone()
             },
             label: format!("{left_name}-{right_name}"),
+            dihedral: None,
         });
     }
     branches
@@ -21837,6 +21842,15 @@ fn frozen_branch_indices(branches: &[BranchRotation], score: &DensityScore) -> B
 /// C1(child)-O(parent)-C-acceptor(parent)-previous-carbon(parent), and omega
 /// is O5(parent)-C5(parent)-C6(parent)-O6(parent).
 fn branch_torsion_degrees(structure: &Structure, branch: &BranchRotation) -> Option<f64> {
+    if let Some(quad) = branch.dihedral {
+        let position = |atom: AtomId| structure.atom(atom).map(|value| value.position);
+        return Some(dihedral_degrees_refine(
+            position(quad[0])?,
+            position(quad[1])?,
+            position(quad[2])?,
+            position(quad[3])?,
+        ));
+    }
     let find = |residue: &ResidueId, name: &str| -> Option<Vec3> {
         structure
             .find_atom(residue, name)
@@ -21897,6 +21911,15 @@ fn branch_torsion_degrees_positions(
     positions: &BTreeMap<AtomId, Vec3>,
     branch: &BranchRotation,
 ) -> Option<f64> {
+    if let Some(quad) = branch.dihedral {
+        let position = |atom: AtomId| positions.get(&atom).copied();
+        return Some(dihedral_degrees_refine(
+            position(quad[0])?,
+            position(quad[1])?,
+            position(quad[2])?,
+            position(quad[3])?,
+        ));
+    }
     let find = |residue: &ResidueId, name: &str| -> Option<Vec3> {
         let atom = structure.find_atom(residue, name)?;
         positions.get(&atom).copied()
@@ -30827,17 +30850,72 @@ fn explicit_branch_rotations(
             continue;
         }
         let moving = moving.into_iter().collect::<Vec<_>>();
-        let child_c1 = structure
-            .atoms()
-            .into_iter()
-            .find(|atom| {
-                atom.residue == child_residue
-                    && atom.name.trim().eq_ignore_ascii_case("C1")
-                    && moving.contains(&atom.id)
+        // The child side of the inter-residue bond is the anomeric carbon
+        // itself (C1 for aldoses, C2 for sialic/ulosonic acids). Looking it up
+        // by the name "C1" picked the carboxyl carbon of Neu5Ac and rotated
+        // about a line that is not a bond.
+        let neighbours = |atom: AtomId| {
+            structure
+                .bonds()
+                .into_iter()
+                .filter_map(move |(first, second)| {
+                    if first == atom {
+                        Some(second)
+                    } else if second == atom {
+                        Some(first)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let anomeric = if atom_by_id[&child_atom].name.trim().starts_with('C') {
+            child_atom
+        } else {
+            structure
+                .atoms()
+                .into_iter()
+                .find(|atom| {
+                    atom.residue == child_residue
+                        && atom.name.trim().eq_ignore_ascii_case("C1")
+                        && moving.contains(&atom.id)
+                })
+                .map(|atom| atom.id)
+                .unwrap_or(child_atom)
+        };
+        let ring_oxygen = neighbours(anomeric).into_iter().find(|atom| {
+            atom_by_id.get(atom).is_some_and(|value| {
+                value.residue == child_residue && value.name.trim().starts_with('O')
             })
-            .map(|atom| atom.id)
-            .unwrap_or(child_atom);
-        let linkage_axis = (child_c1, parent_atom);
+        });
+        let acceptor_carbon = neighbours(parent_atom).into_iter().find(|atom| {
+            atom_by_id.get(atom).is_some_and(|value| {
+                value.residue == parent_residue && value.name.trim().starts_with('C')
+            })
+        });
+        let previous_carbon = acceptor_carbon.and_then(|acceptor| {
+            let number = atom_by_id[&acceptor]
+                .name
+                .trim()
+                .trim_start_matches('C')
+                .parse::<u32>()
+                .ok()?;
+            let wanted = if number == 6 {
+                5
+            } else {
+                number.checked_sub(1)?
+            };
+            neighbours(acceptor).into_iter().find(|atom| {
+                atom_by_id.get(atom).is_some_and(|value| {
+                    value.residue == parent_residue
+                        && value
+                            .name
+                            .trim()
+                            .eq_ignore_ascii_case(&format!("C{wanted}"))
+                })
+            })
+        });
+        let linkage_axis = (anomeric, parent_atom);
         if seen.insert((linkage_axis.0, linkage_axis.1, "phi".into())) {
             branches.push(BranchRotation {
                 axis: linkage_axis,
@@ -30846,9 +30924,18 @@ fn explicit_branch_rotations(
                 child_residue: child_residue.clone(),
                 parent_residue: parent_residue.clone(),
                 label: format!(
-                    "{}:C1-{}:{} [phi]",
-                    child_residue, parent_residue, atom_by_id[&parent_atom].name
+                    "{}:{}-{}:{} [phi]",
+                    child_residue,
+                    atom_by_id[&anomeric].name.trim(),
+                    parent_residue,
+                    atom_by_id[&parent_atom].name
                 ),
+                dihedral: match (ring_oxygen, acceptor_carbon) {
+                    (Some(ring_o), Some(acceptor)) => {
+                        Some([ring_o, anomeric, parent_atom, acceptor])
+                    }
+                    _ => None,
+                },
             });
         }
         // The parent atom attached to the child anomeric carbon is normally
@@ -30885,6 +30972,8 @@ fn explicit_branch_rotations(
                         parent_residue,
                         atom_by_id[&parent_atom].name
                     ),
+                    dihedral: previous_carbon
+                        .map(|previous| [anomeric, parent_atom, parent_acceptor, previous]),
                 });
             }
             // O6 is the canonical exocyclic 1→6 acceptor.  Rotate C6 and
@@ -30952,6 +31041,7 @@ fn explicit_branch_rotations(
                                     "{}:C5-{}:C6 [omega]",
                                     parent_residue, parent_residue
                                 ),
+                                dihedral: None,
                             });
                         }
                     }
@@ -31416,6 +31506,7 @@ mod tests {
                 child_residue: residue(child),
                 parent_residue: residue(parent),
                 label: format!("{parent}->{child}"),
+                dihedral: None,
             }
         }
 
@@ -31519,6 +31610,7 @@ mod tests {
                 child_residue: residue(child),
                 parent_residue: residue(parent),
                 label: format!("{parent}->{child}"),
+                dihedral: None,
             }
         }
         let branches = vec![
@@ -31684,6 +31776,7 @@ TER\nEND\n",
             child_residue: arm.root_residue.clone(),
             parent_residue: arm.parent_residue.clone(),
             label: "O3-C1 [phi]".into(),
+            dihedral: None,
         };
         let registered = transplant_arm_positions(&structure, &source, &target, &arm, &branch)
             .expect("parent-frame registration must succeed");
@@ -31833,6 +31926,7 @@ TER\nEND\n",
                 child_residue: residue(child),
                 parent_residue: residue(parent),
                 label: format!("{parent}->{child}"),
+                dihedral: None,
             }
         }
         let branches = vec![
@@ -31932,6 +32026,7 @@ TER\nEND\n",
                 child_residue: residue(child),
                 parent_residue: residue(parent),
                 label: format!("{parent}->{child}"),
+                dihedral: None,
             }
         }
         // Alpha-1,6 style arm: root 4, children 5 and 7, grandchild 6.
@@ -33514,6 +33609,155 @@ TER\nEND\n",
             (wrapped - near2).abs() < 1.0e-6,
             "periodic distance should treat an equivalent wrapped state as native: wrapped={wrapped} near2={near2}"
         );
+    }
+
+    #[test]
+    fn branch_rotations_keep_geometry_for_sialic_acid_linkages() {
+        // Neu5Ac is linked through its anomeric C2, not C1 (the carboxyl
+        // carbon). Every explicit branch rotation must turn about a real bond:
+        // a 37 degree rotation changes the measured torsion by exactly 37
+        // degrees and leaves every bond length and bond angle untouched.
+        let options = BuildOptions {
+            add_water: false,
+            add_ions: false,
+            ..BuildOptions::default()
+        };
+        let protein = read_pdb_str(
+            include_str!("../../../tests/fixtures/protein.pdb"),
+            &options,
+        )
+        .unwrap();
+        let glycan = read_pdb_str(
+            include_str!("../../../tests/fixtures/glycan-sialyl.pdb"),
+            &options,
+        )
+        .unwrap();
+        let site = reglyco_core::GlycosylationSite::new("A", 1);
+        let ensemble = GlycanEnsemble {
+            query: GlycanQuery {
+                source: GlycanSource::LocalBundle("fixture".into()),
+                anomer: Anomer::Beta,
+                format: "PDB".into(),
+                level: "2".into(),
+            },
+            conformers: vec![EnsembleConformer {
+                id: "fixture".into(),
+                structure: glycan,
+                cluster_index: 0,
+                cluster_weight: 1.0,
+                main_cluster: Some(0),
+                anomer: Anomer::Beta,
+                linkage_anchor: Some(("C1".into(), "O5".into())),
+                priors: Default::default(),
+            }],
+            provenance: "fixture".into(),
+            population_source: reglyco_core::ConformerPopulationSource::AssetMetadata,
+        };
+        let sites = vec![SearchSite {
+            site: site.clone(),
+            ensemble,
+        }];
+        let builder = SystemBuilder::new(options).unwrap();
+        let built = build_from_outcome(
+            &protein,
+            &sites,
+            &reglyco_ensemble::search(
+                &protein,
+                &sites,
+                &SearchConfig {
+                    seed: 3,
+                    population_size: 8,
+                    generations: 1,
+                    require_clash_free: false,
+                    ..SearchConfig::default()
+                },
+                &builder,
+            )
+            .unwrap(),
+            &builder,
+            false,
+        )
+        .unwrap();
+        let structure = built.structure;
+        let targets = resolve_targets(
+            &structure,
+            &[DensityTarget {
+                site: site.residue.clone(),
+                glycan_residues: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let branches = explicit_branch_rotations(&structure, &targets);
+        let sialic_phi = branches
+            .iter()
+            .find(|branch| {
+                branch.label.contains("[phi]")
+                    && structure
+                        .atom(branch.axis.0)
+                        .is_some_and(|atom| atom.residue_name.trim() == "0SA")
+            })
+            .expect("a phi rotation for the Neu5Ac linkage");
+        assert_eq!(
+            structure.atom(sialic_phi.axis.0).unwrap().name.trim(),
+            "C2",
+            "Neu5Ac phi must rotate about its anomeric C2"
+        );
+        let baseline = structure
+            .atoms()
+            .into_iter()
+            .map(|atom| (atom.id, atom.position))
+            .collect::<BTreeMap<_, _>>();
+        let bonds = structure.bonds();
+        let distance = |positions: &BTreeMap<AtomId, Vec3>, a: AtomId, b: AtomId| {
+            let (p, q) = (positions[&a], positions[&b]);
+            ((p.x - q.x).powi(2) + (p.y - q.y).powi(2) + (p.z - q.z).powi(2)).sqrt()
+        };
+        for branch in &branches {
+            let original = branch_torsion_degrees_positions(&structure, &baseline, branch)
+                .expect("torsion available");
+            let mut positions = baseline.clone();
+            rotate_positions(&mut positions, branch, 37.0_f64.to_radians()).unwrap();
+            let actual = branch_torsion_degrees_positions(&structure, &positions, branch)
+                .expect("torsion available");
+            let delta = wrap_degrees(actual - wrap_degrees(original + 37.0)).abs();
+            assert!(
+                delta < 1.0e-6,
+                "{}: torsion moved {actual} from {original}",
+                branch.label
+            );
+            for (a, b) in &bonds {
+                if !(positions.contains_key(a) && positions.contains_key(b)) {
+                    continue;
+                }
+                let change = (distance(&positions, *a, *b) - distance(&baseline, *a, *b)).abs();
+                assert!(
+                    change < 1.0e-6,
+                    "{}: bond length changed by {change}",
+                    branch.label
+                );
+            }
+            // 1-3 distances fix every bond angle
+            for (a, b) in &bonds {
+                for (c, d) in &bonds {
+                    let (x, y) = if b == c {
+                        (*a, *d)
+                    } else if a == c && b != d {
+                        (*b, *d)
+                    } else {
+                        continue;
+                    };
+                    if x == y || !(positions.contains_key(&x) && positions.contains_key(&y)) {
+                        continue;
+                    }
+                    let change = (distance(&positions, x, y) - distance(&baseline, x, y)).abs();
+                    assert!(
+                        change < 1.0e-6,
+                        "{}: bond angle changed (1-3 distance {change})",
+                        branch.label
+                    );
+                }
+            }
+        }
     }
 
     #[test]
