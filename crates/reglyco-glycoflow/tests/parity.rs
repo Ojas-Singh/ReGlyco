@@ -651,6 +651,82 @@ fn parity(name: &str) {
     check("attach search psi", psi, f(&a["psi"]), 1e-5, 1.0);
     check("attach search phi", phi, f(&a["phi"]), 1e-5, 1.0);
     check("attach search objective", e, f(&a["e"]), 2e-3, 1e-2);
+    // --- restrained Cartesian refinement at a perturbed pose
+    if let Some(cfx) = fx.get("cartesian") {
+        use reglyco_glycoflow::cartesian::{
+            RestraintOptions, Restraints, cartesian_refine, coordinate_objective,
+        };
+        let pts = |v: &Value| -> Vec<[f64; 3]> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    let p = vec_f(p);
+                    [p[0], p[1], p[2]]
+                })
+                .collect()
+        };
+        let xc = pts(&cfx["x"]);
+        let t = cfx["template"].as_u64().unwrap() as usize;
+        let options = RestraintOptions::default();
+        let r = Restraints::new(&problem, t, &options);
+        let mut g = vec![[0.0; 3]; xc.len()];
+        let (terms, psi) = coordinate_objective(&problem, &xc, Some(&mut g));
+        let er = r.energy(&xc, Some(&mut g));
+        // totals are sums of terms of either sign: tolerance relative to their magnitude
+        let magnitude = |t: &reglyco_glycoflow::Terms| {
+            t.loglik.abs()
+                + 10.0 * (t.e_env.abs() + t.e_self.abs())
+                + t.e_att.abs()
+                + t.e_prior.abs()
+        };
+        check(
+            "cartesian objective",
+            terms.total,
+            f(&cfx["total"]),
+            1e-3,
+            magnitude(&terms),
+        );
+        check(
+            "cartesian prior",
+            terms.e_prior,
+            f(&cfx["e_prior"]),
+            1e-4,
+            1e-2,
+        );
+        check(
+            "cartesian restraints",
+            er,
+            f(&cfx["e_restraint"]),
+            1e-4,
+            1e-2,
+        );
+        check("cartesian psi_N", psi, f(&cfx["psi"]), 1e-5, 1.0);
+        let gp: Vec<f64> = pts(&cfx["grad"]).into_iter().flatten().collect();
+        let gr: Vec<f64> = g.into_iter().flatten().collect();
+        check_vec("cartesian dE/dx", &gr, &gp);
+        let steps = cfx["steps"].as_u64().unwrap() as usize;
+        let fit = cartesian_refine(&problem, &xc, t, steps, f(&cfx["lr"]), &options);
+        check(
+            "cartesian refined total",
+            fit.total,
+            f(&cfx["refined_total"]),
+            1e-3,
+            magnitude(&fit.terms) + fit.e_restraint,
+        );
+        let xr = pts(&cfx["refined_x"]);
+        let shift = fit
+            .x
+            .iter()
+            .zip(&xr)
+            .map(|(a, b)| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>())
+            .fold(0.0f64, f64::max)
+            .sqrt();
+        println!("  cartesian refined max |x_rust - x_python| {shift:.2e} A");
+        if shift > 1e-2 {
+            fail(format!("cartesian refined coordinates differ by {shift} A"));
+        }
+    }
     // --- in-place RMSD of the deposited-fit pose
     let dep = site.deposited.as_ref().unwrap();
     let rec = reglyco_glycoflow::evaluation::recovery(&problem, dep, &x0, &[]);

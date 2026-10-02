@@ -17,6 +17,7 @@ use reglyco_density::site_likelihood::{
     SiteEnvironmentAtom, SiteLikelihood, SiteLikelihoodOptions,
 };
 
+use crate::cartesian::{CartesianFit, RestraintOptions, cartesian_refine_all};
 use crate::counter::CounterSnapshot;
 use crate::error::{Result, invalid};
 use crate::model::GlycoflowModel;
@@ -65,6 +66,13 @@ pub struct FitConfig {
     /// limits, so a tolerance of 0.08^2 guarantees no single pair violates them.
     pub contact_tolerance: f64,
     pub max_escalations: usize,
+    /// Restrained Cartesian refinement of every retained basin (0: torsion space only), at
+    /// `cartesian_clash_weight` with the same contact escalation; basins are then ranked on
+    /// objective + restraint energy (`cartesian.rs`).
+    pub cartesian_steps: usize,
+    pub cartesian_lr: f64,
+    pub cartesian_clash_weight: f64,
+    pub restraints: RestraintOptions,
 }
 
 impl Default for FitConfig {
@@ -92,6 +100,10 @@ impl Default for FitConfig {
             steric_lr: 0.005,
             contact_tolerance: 0.0064,
             max_escalations: 2,
+            cartesian_steps: 300,
+            cartesian_lr: 0.005,
+            cartesian_clash_weight: 100.0,
+            restraints: RestraintOptions::default(),
         }
     }
 }
@@ -288,6 +300,9 @@ pub struct Basin {
     pub terms: Terms,
     /// objective before refinement
     pub unrefined: f64,
+    /// restraint energy of the Cartesian stage (0 without it); basins are ranked on
+    /// terms.total + e_restraint
+    pub e_restraint: f64,
 }
 
 pub struct FitOutcome {
@@ -391,24 +406,83 @@ pub fn fit_site(
             w *= 10.0;
         }
     }
+    // restrained Cartesian refinement of every basin, with the same contact escalation
+    let mut cartesian: Option<Vec<CartesianFit>> = None;
+    if config.cartesian_steps > 0 {
+        let t0 = Instant::now();
+        let templates: Vec<usize> = poses.iter().map(|p| p.template).collect();
+        let mut xs: Vec<Vec<V3>> = {
+            let problem: &SiteProblem = problem;
+            poses.par_iter().map(|p| problem.place(p)).collect()
+        };
+        let mut w = config.cartesian_clash_weight;
+        for _ in 0..=config.max_escalations {
+            problem.w_env = w;
+            problem.w_self = w;
+            final_contact_weight = w;
+            let fits = cartesian_refine_all(
+                problem,
+                &xs,
+                &templates,
+                config.cartesian_steps,
+                config.cartesian_lr,
+                &config.restraints,
+            );
+            let best = (0..fits.len())
+                .min_by(|&a, &b| fits[a].total.total_cmp(&fits[b].total))
+                .unwrap_or(0);
+            let clear =
+                fits[best].terms.e_env + fits[best].terms.e_self <= config.contact_tolerance;
+            xs = fits.iter().map(|f| f.x.clone()).collect();
+            cartesian = Some(fits);
+            if clear {
+                break;
+            }
+            w *= 10.0;
+        }
+        problem.counter.add_stage("cartesian", t0);
+    }
     let problem: &SiteProblem = problem;
     let c = &problem.counter;
     let t0 = Instant::now();
-    let evaluated: Vec<_> = poses
-        .par_iter()
-        .map(|p| problem.evaluate(p, false))
-        .collect();
-    let basins: Vec<Basin> = poses
-        .into_iter()
-        .zip(evaluated)
-        .zip(&unrefined)
-        .map(|((pose, ev), &unrefined)| Basin {
-            pose,
-            x: ev.x,
-            terms: ev.terms,
-            unrefined,
-        })
-        .collect();
+    let basins: Vec<Basin> = match cartesian {
+        Some(fits) => {
+            energies = fits.iter().map(|f| f.total).collect();
+            poses
+                .into_iter()
+                .zip(fits)
+                .zip(&unrefined)
+                .map(|((mut pose, fit), &unrefined)| {
+                    pose.psi = fit.psi;
+                    Basin {
+                        pose,
+                        x: fit.x,
+                        terms: fit.terms,
+                        unrefined,
+                        e_restraint: fit.e_restraint,
+                    }
+                })
+                .collect()
+        }
+        None => {
+            let evaluated: Vec<_> = poses
+                .par_iter()
+                .map(|p| problem.evaluate(p, false))
+                .collect();
+            poses
+                .into_iter()
+                .zip(evaluated)
+                .zip(&unrefined)
+                .map(|((pose, ev), &unrefined)| Basin {
+                    pose,
+                    x: ev.x,
+                    terms: ev.terms,
+                    unrefined,
+                    e_restraint: 0.0,
+                })
+                .collect()
+        }
+    };
     let mut order: Vec<usize> = (0..energies.len()).collect();
     order.sort_by(|&a, &b| energies[a].total_cmp(&energies[b]));
     let best = order[0];

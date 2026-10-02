@@ -15,6 +15,7 @@
 //!   completion (pinned-torsion inpainting); [`pipeline`]: `fit_site`;
 //! * [`output`], [`evaluation`], [`workflow`]: structures, reports, validation.
 
+pub mod cartesian;
 pub mod counter;
 pub mod error;
 pub mod evaluation;

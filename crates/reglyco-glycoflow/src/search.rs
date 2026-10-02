@@ -233,7 +233,7 @@ pub fn sample_free(
 }
 
 /// Adam (PyTorch defaults: betas 0.9 / 0.999, eps 1e-8).
-struct Adam {
+pub(crate) struct Adam {
     lr: f64,
     m: Vec<f64>,
     v: Vec<f64>,
@@ -241,7 +241,7 @@ struct Adam {
 }
 
 impl Adam {
-    fn new(n: usize, lr: f64) -> Self {
+    pub(crate) fn new(n: usize, lr: f64) -> Self {
         Self {
             lr,
             m: vec![0.0; n],
@@ -249,7 +249,7 @@ impl Adam {
             t: 0,
         }
     }
-    fn step(&mut self, params: &mut [f64], grad: &[f64]) {
+    pub(crate) fn step(&mut self, params: &mut [f64], grad: &[f64]) {
         let (b1, b2, eps) = (0.9f64, 0.999f64, 1e-8f64);
         self.t += 1;
         let bc1 = 1.0 - b1.powi(self.t);

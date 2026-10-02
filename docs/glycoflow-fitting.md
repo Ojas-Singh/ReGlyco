@@ -26,7 +26,9 @@ The model directory is produced by `scripts/export_rust_fixtures.py` in GlycoFlo
 
 What it does: observation-guided GlycoFlow generation (384 samples, 8 Heun steps), refinement of 24 distinct
 basins on one candidate-independent site likelihood (`reglyco-density::site_likelihood`) plus
-contact, amide and GlycoFlow-prior terms; a final contact-validity stage; a calibrated support
+contact, amide and GlycoFlow-prior terms; a final contact-validity stage; restrained Cartesian
+refinement of every basin (atoms move freely with the template's bonds, 1-3 distances and chiral
+volumes as restraints; basins are ranked afterwards, with the same contact escalation); a calibrated support
 test that marks residues without density, which are then regenerated from the GlycoFlow prior and
 labelled as prior-driven.
 

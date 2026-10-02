@@ -41,7 +41,9 @@ Pipeline (`pipeline.rs`, = `pipeline.fit_site` + `search.method_b`): 384 observa
 GlycoFlow samples (Heun 8 steps; from t >= 0.3 the velocity gets `-g/rms(g)`, g = dE/dtau at the
 predicted endpoint, through `glycoflow_core::sampler::Guidance`; attachment angles grid-searched
 every 4 steps; batches of 256) -> attachment grid search -> 24 distinct basins (1.5 A) -> Adam refinement (150
-steps) -> polish of the best 4 (300 steps) -> subtree support test (gain > 3 + 0.5 per torsion) -> prior completion of
+steps) -> polish of the best 4 (300 steps) -> restrained Cartesian refinement of every basin
+(`cartesian.rs`: bonds 0.02 A, 1-3 distances 0.04 A, chiral volumes 0.2 A^3; 300 Adam steps; ranking on
+objective + restraints, contact weight escalated x10 while the best pose violates the floors) -> subtree support test (gain > 3 + 0.5 per torsion) -> prior completion of
 unsupported subtrees (pinned-torsion GlycoFlow inpainting with clash guidance, labelled as
 prior-driven) -> density-ambiguous alternatives within 5 objective units.
 
