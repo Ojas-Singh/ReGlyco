@@ -1376,14 +1376,31 @@ fn ideal_bond_length_for_atoms(left: &glysys::StructureAtom, right: &glysys::Str
     // resonance-delocalised C5N--O5N carbonyl.  GLYCAM coordinates place it
     // near 1.22 Å; treating it as an ordinary 1.43 Å C--O single bond makes
     // otherwise valid level-2/3 conformers fail source validation.
-    if (names.iter().any(|name| name == "C2N") && names.iter().any(|name| name == "O2N"))
-        || (names.iter().any(|name| name == "C5N") && names.iter().any(|name| name == "O5N"))
+    // The same N-acetyl groups carry PDB chemical-component names: C7=O7 in
+    // NAG/NDG/NGA/A2G and C10=O10 in SIA/SLB. Without these pairs every
+    // correctly built N-acetyl carbonyl in a PDB-named glycan (deposited
+    // models included) was reported as a 0.2 Å bond-length error.
+    let pair =
+        |a: &str, b: &str| names.iter().any(|name| name == a) && names.iter().any(|name| name == b);
+    let carbohydrate = |atom: &glysys::StructureAtom| {
+        matches!(
+            atom.residue_name.trim().to_ascii_uppercase().as_str(),
+            "NAG" | "NDG" | "NGA" | "A2G" | "SIA" | "SLB" | "NGC" | "NGE"
+        )
+    };
+    let ccd_acetyl = carbohydrate(left) && carbohydrate(right);
+    if pair("C2N", "O2N")
+        || pair("C5N", "O5N")
+        || (ccd_acetyl && (pair("C7", "O7") || pair("C10", "O10")))
     {
         1.21
-    // The amide N5--C5N bond is shorter than the generic C--N fallback too.
-    // Some GLYCAM exports omit the corresponding restraint and otherwise
+    // The amide N--C(acetyl) bond is shorter than the generic C--N fallback
+    // too. Some GLYCAM exports omit the corresponding restraint and otherwise
     // trigger a false source-asset bond-length error.
-    } else if names.iter().any(|name| name == "N5") && names.iter().any(|name| name == "C5N") {
+    } else if pair("N5", "C5N")
+        || pair("N2", "C2N")
+        || (ccd_acetyl && (pair("N2", "C7") || pair("N5", "C10")))
+    {
         1.33
     } else {
         ideal_bond_length(&left.element, &right.element)
@@ -1629,6 +1646,48 @@ fn dihedral_degrees(first: Vec3, second: Vec3, third: Vec3, fourth: Vec3) -> f64
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn n_acetyl_carbonyl_and_amide_use_their_own_lengths_for_pdb_names() {
+        let atom = |name: &str, residue: &str, element: &str| glysys::StructureAtom {
+            id: glysys::AtomId(1),
+            name: name.into(),
+            residue: ResidueId {
+                chain: "B".into(),
+                number: 1,
+                insertion_code: None,
+            },
+            residue_name: residue.into(),
+            element: element.into(),
+            occupancy: 1.0,
+            b_factor: 0.0,
+            position: Vec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+        };
+        for (residue, carbonyl, oxygen, nitrogen) in
+            [("NAG", "C7", "O7", "N2"), ("SIA", "C10", "O10", "N5")]
+        {
+            let c = atom(carbonyl, residue, "C");
+            assert_eq!(
+                ideal_bond_length_for_atoms(&c, &atom(oxygen, residue, "O")),
+                1.21
+            );
+            assert_eq!(
+                ideal_bond_length_for_atoms(&atom(nitrogen, residue, "N"), &c),
+                1.33
+            );
+        }
+        assert_eq!(
+            ideal_bond_length_for_atoms(&atom("C2N", "0YB", "C"), &atom("N2", "0YB", "N")),
+            1.33
+        );
+        // a C7/O7 pair in a non-carbohydrate component keeps the generic length
+        let ligand = ideal_bond_length_for_atoms(&atom("C7", "LIG", "C"), &atom("O7", "LIG", "O"));
+        assert!(ligand > 1.3);
+    }
+
     use super::*;
     use glysys::{BuildOptions, read_pdb_str};
 
