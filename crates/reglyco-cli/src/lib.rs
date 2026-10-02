@@ -39,6 +39,7 @@ use reglyco_report::{
 };
 use sha2::{Digest, Sha256};
 
+mod glycoflow;
 mod saxs;
 
 #[derive(Debug, Parser)]
@@ -512,10 +513,13 @@ struct RefineArgs {
     /// Remove the exact glycan tree at a site before fitting a replacement.
     /// Repeat as `SITE` or `SITE=SOURCE`; when `SOURCE` is present it also
     /// supplies the replacement ensemble, so --attach is optional.
+    /// With `--density-search glycoflow`, SOURCE may be a GLYCAM sequence.
     #[arg(long = "replace-glycan")]
     replace_glycans: Vec<String>,
     #[arg(long)]
     overwrite: bool,
+    #[command(flatten)]
+    glycoflow: glycoflow::GlycoflowArgs,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -562,6 +566,9 @@ enum DensitySearchArg {
     Adaptive,
     Swarm,
     Staged,
+    /// GlycoFlow observation-guided generation of the glycan of known sequence
+    /// (crate reglyco-glycoflow; needs --glycoflow-model or $GLYCOFLOW_MODEL).
+    Glycoflow,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1323,6 +1330,12 @@ fn run_relax(arguments: RelaxArgs) -> anyhow::Result<()> {
 
 fn run_refine(arguments: RefineArgs) -> anyhow::Result<()> {
     let started = Instant::now();
+    if matches!(arguments.density_search, DensitySearchArg::Glycoflow) {
+        if !matches!(arguments.objective, ObjectiveArg::Density) {
+            anyhow::bail!("--density-search glycoflow requires --objective density");
+        }
+        return glycoflow::run_refine_glycoflow(arguments, started);
+    }
     let quiet = arguments.common.quiet;
     if !quiet {
         eprintln!("refine: loading protein, replacement ensemble, and search configuration...");
@@ -1667,6 +1680,7 @@ fn run_refine(arguments: RefineArgs) -> anyhow::Result<()> {
                 DensitySearchArg::Adaptive => DensitySearchStrategy::Adaptive,
                 DensitySearchArg::Swarm => DensitySearchStrategy::Swarm,
                 DensitySearchArg::Staged => DensitySearchStrategy::Staged,
+                DensitySearchArg::Glycoflow => unreachable!("handled by run_refine_glycoflow"),
             };
             config.effort = match arguments.density_effort {
                 DensityEffortArg::Fast => DensityEffort::Fast,

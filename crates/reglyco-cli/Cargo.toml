@@ -7,6 +7,10 @@ license.workspace = true
 description = "Command-line interface implementation for ReGlyco"
 repository = "https://github.com/Ojas-Singh/ReGlyco"
 
+[features]
+# GlycoFlow network on CUDA (`--glycoflow-device cuda`); build with CUDA_COMPUTE_CAP set
+glycoflow-cuda = ["reglyco-glycoflow/cuda"]
+
 [dependencies]
 anyhow.workspace = true
 crabsaxs = { package = "crabsaxs", version = "0.1.0", path = "../../../crabSAXS" }
@@ -19,6 +23,7 @@ reglyco-build = { version = "0.1.0", path = "../reglyco-build" }
 reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
 reglyco-density = { version = "0.1.0", path = "../reglyco-density" }
 reglyco-ensemble = { version = "0.1.0", path = "../reglyco-ensemble" }
+reglyco-glycoflow = { version = "0.1.0", path = "../reglyco-glycoflow" }
 reglyco-refine = { version = "0.1.0", path = "../reglyco-refine" }
 reglyco-relax = { version = "0.1.0", path = "../reglyco-relax" }
 reglyco-report = { version = "0.1.0", path = "../reglyco-report" }
