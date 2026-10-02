@@ -57,6 +57,13 @@ pub struct FitConfig {
     pub final_clash_weight: Option<f64>,
     pub steric_steps: usize,
     pub steric_lr: f64,
+    /// Contact-validity escalation: while the selected pose's raw contact energy
+    /// (E_env + E_self, squared floor violations) exceeds `contact_tolerance`, multiply the final
+    /// contact weight by 10, re-score every basin, refine the best few and re-select (at most
+    /// `max_escalations` times). The floors sit >= 0.08 A above the validator's van der Waals
+    /// limits, so a tolerance of 0.08^2 guarantees no single pair violates them.
+    pub contact_tolerance: f64,
+    pub max_escalations: usize,
 }
 
 impl Default for FitConfig {
@@ -82,6 +89,8 @@ impl Default for FitConfig {
             final_clash_weight: Some(100.0),
             steric_steps: 150,
             steric_lr: 0.005,
+            contact_tolerance: 0.0064,
+            max_escalations: 2,
         }
     }
 }
@@ -292,6 +301,8 @@ pub struct FitOutcome {
     pub alternatives: Vec<usize>,
     pub counters: CounterSnapshot,
     pub wall_seconds: f64,
+    /// contact weight of the final objective (after any escalation)
+    pub final_contact_weight: f64,
 }
 
 /// Fit one site (`pipeline.fit_site`). The problem's prior (if any) must already be set. The
@@ -334,26 +345,45 @@ pub fn fit_site(
         c.add_stage("polish", t0);
         (poses, energies, r.unrefined)
     };
-    // final objective: re-score every basin, refine the best few under it
-    if let Some(w) = config.final_clash_weight {
-        problem.w_env = w;
-        problem.w_self = w;
-        let problem: &SiteProblem = problem;
-        let t0 = Instant::now();
-        energies = poses
-            .par_iter()
-            .map(|pose| problem.evaluate(pose, false).terms.total)
-            .collect();
-        problem.counter.add_objective(poses.len());
-        polish_top(
-            problem,
-            &mut poses,
-            &mut energies,
-            config.polish_top,
-            config.steric_steps,
-            config.steric_lr,
-        );
-        problem.counter.add_stage("steric polish", t0);
+    // final objective: re-score every basin, refine the best few under it; escalate the contact
+    // weight while the selected pose still violates the contact floors
+    let mut final_contact_weight = problem.w_env;
+    if let Some(w0) = config.final_clash_weight {
+        let mut w = w0;
+        for round in 0..=config.max_escalations {
+            problem.w_env = w;
+            problem.w_self = w;
+            final_contact_weight = w;
+            let problem: &SiteProblem = problem;
+            let t0 = Instant::now();
+            energies = poses
+                .par_iter()
+                .map(|pose| problem.evaluate(pose, false).terms.total)
+                .collect();
+            problem.counter.add_objective(poses.len());
+            polish_top(
+                problem,
+                &mut poses,
+                &mut energies,
+                config.polish_top,
+                config.steric_steps,
+                config.steric_lr,
+            );
+            let stage = if round == 0 {
+                "steric polish"
+            } else {
+                "steric escalation"
+            };
+            problem.counter.add_stage(stage, t0);
+            let best = (0..energies.len())
+                .min_by(|&a, &b| energies[a].total_cmp(&energies[b]))
+                .unwrap_or(0);
+            let t = problem.evaluate(&poses[best], false).terms;
+            if t.e_env + t.e_self <= config.contact_tolerance {
+                break;
+            }
+            w *= 10.0;
+        }
     }
     let problem: &SiteProblem = problem;
     let c = &problem.counter;
@@ -413,6 +443,7 @@ pub fn fit_site(
         alternatives,
         counters: c.snapshot(),
         wall_seconds: started.elapsed().as_secs_f64(),
+        final_contact_weight,
     })
 }
 

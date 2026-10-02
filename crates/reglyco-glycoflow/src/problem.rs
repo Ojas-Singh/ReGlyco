@@ -18,7 +18,7 @@
 //! `dE/dpsi_N` and `dE/dphi_N` as rigid rotations of the glycan about CG->ND2 and ND2->C1.
 
 use glycoflow_core::geometry::{set_torsions, torsion_gradient};
-use glycoflow_core::guidance::{C_POLAR_FLOOR, CC_FLOOR, POLAR_FLOOR, clash_energy_grad};
+use glycoflow_core::guidance::{C_POLAR_FLOOR, CC_FLOOR, clash_energy_grad};
 use glycoflow_core::rng::SplitMix64;
 use glycoflow_core::{Glycan, ResidueLibrary, Vocab};
 
