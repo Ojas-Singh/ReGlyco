@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 pub mod fast_score;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod rcsb;
+pub mod site_likelihood;
 
 pub type Result<T> = std::result::Result<T, DensityError>;
 
