@@ -42,11 +42,16 @@ pub struct SiteLikelihoodOptions {
     pub spacing_angstrom: f64,
     /// Radius of the fixed scoring ball around the site.
     pub radius_angstrom: f64,
-    /// Map resolution; sets the independent-sample volume `(d/2)^3` used to
-    /// express the gain as a log-likelihood.
+    /// Map resolution. Sets the largest lag of the residual autocorrelation
+    /// (`max(3 A, resolution)`) behind the independent-sample volume.
     pub resolution_angstrom: f64,
     /// Wrap map lookups through the unit cell (full-cell crystallographic maps).
     pub periodic: bool,
+    /// Volume of one independent sample of the map noise (A^3), converting
+    /// squared-error gains into log-likelihood units. `None` (the default
+    /// rule) measures it from the residual map, see
+    /// [`noise_correlation_volume`]; `Some(v)` overrides the measurement.
+    pub independent_volume: Option<f64>,
 }
 
 /// A Cartesian box of values: `data[(ix * ny + iy) * nz + iz]` at
@@ -332,6 +337,7 @@ impl SiteLikelihood {
         let obs_blur = gaussian_blur(&observed, sigma);
         let dv = h * h * h;
         let r2max = options.radius_angstrom * options.radius_angstrom;
+        let mut inside = vec![false; observed.data.len()];
         let mut s = SiteRegionSums {
             volume: 0.0,
             obs: 0.0,
@@ -352,6 +358,7 @@ impl SiteLikelihood {
                         continue;
                     }
                     let idx = observed.index(i, j, k);
+                    inside[idx] = true;
                     let o = observed.data[idx] as f64;
                     let q = prot.data[idx] as f64;
                     s.volume += dv;
@@ -378,6 +385,39 @@ impl SiteLikelihood {
             g0_inverse[1][0] * s.obs + g0_inverse[1][1] * s.obs_prot,
         ];
         let sse0 = s.obs_obs - (theta[0] * s.obs + theta[1] * s.obs_prot);
+        let independent_volume = match options.independent_volume {
+            Some(volume) => volume,
+            None => {
+                // residual on the protein shell (the signal the protein model
+                // explains), lags up to the resolution: local correlated
+                // noise / model error without long-range structure
+                let prot_max = prot.data.iter().copied().fold(f32::MIN, f32::max);
+                let shell = prot
+                    .data
+                    .iter()
+                    .zip(&inside)
+                    .map(|(p, inside)| *inside && *p > 0.05 * prot_max)
+                    .collect::<Vec<_>>();
+                let residual = observed
+                    .data
+                    .iter()
+                    .zip(&prot.data)
+                    .map(|(o, p)| *o as f64 - theta[0] - theta[1] * *p as f64)
+                    .collect::<Vec<_>>();
+                noise_correlation_volume(
+                    &residual,
+                    &shell,
+                    observed.dims,
+                    h,
+                    options.resolution_angstrom.max(3.0),
+                )
+            }
+        };
+        if !(independent_volume.is_finite() && independent_volume > 0.0) {
+            return Err(DensityError::Geometry(format!(
+                "independent-sample volume {independent_volume} is not positive"
+            )));
+        }
         Ok(Self {
             center,
             radius: options.radius_angstrom,
@@ -389,7 +429,7 @@ impl SiteLikelihood {
             g0_inverse,
             sse0,
             noise_variance: sse0 / s.volume,
-            independent_volume: (options.resolution_angstrom / 2.0).powi(3),
+            independent_volume,
         })
     }
 
@@ -422,26 +462,29 @@ impl SiteLikelihood {
             d_obs[a] = go_grad.map(|g| z * g);
             d_prot[a] = gp_grad.map(|g| z * g);
         }
+        // <g, g>: symmetric pair sum (self terms once, each unordered pair twice)
         let mut d_gg = vec![[0.0; 3]; n];
+        let norm0 = 1.0 / (2.0 * std::f64::consts::PI * s2).powf(1.5);
         for a in 0..n {
             let za = atomic_numbers[a];
             if za == 0.0 {
                 continue;
             }
-            for b in 0..n {
+            gg += za * za * norm0;
+            for b in a + 1..n {
                 let zb = atomic_numbers[b];
                 if zb == 0.0 {
                     continue;
                 }
                 let d = [0, 1, 2].map(|i| positions[a][i] - positions[b][i]);
                 let r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                let k = za * zb * gauss_norm(r2, s2);
-                gg += k;
-                if a != b {
-                    // d/dx_a of the (a,b) and (b,a) terms: 2 * k * (-(x_a - x_b) / s2)
-                    for i in 0..3 {
-                        d_gg[a][i] += -k * d[i] / s2 * 2.0;
-                    }
+                let k = za * zb * (-r2 / (2.0 * s2)).exp() * norm0;
+                gg += 2.0 * k;
+                // d/dx_a of the (a,b) and (b,a) terms: 2 k (-(x_a - x_b) / s2)
+                for i in 0..3 {
+                    let g = -2.0 * k * d[i] / s2;
+                    d_gg[a][i] += g;
+                    d_gg[b][i] -= g;
                 }
             }
         }
@@ -483,6 +526,99 @@ impl SiteLikelihood {
     }
 }
 
+/// Volume of one independent sample of a residual map (A^3): the integral of
+/// its normalised autocorrelation within `mask` (corrected for the mask
+/// overlap at every lag) over lags up to `max_lag`, positive part only.
+/// Converts squared-error gains into log-likelihood units.
+///
+/// `residual` and `mask` are boxes laid out as [`SiteBox`] data (`dims`,
+/// spacing `h`). Lags whose mask overlap is below half the mask size are
+/// skipped. Direct sum over lag offsets (the Python reference
+/// `density.noise_correlation_volume` uses zero-padded FFTs; the sums are the
+/// same). On blurred white noise this recovers the analytic value
+/// `(4 pi sigma^2)^(3/2)` once `max_lag >= 3 A`.
+pub fn noise_correlation_volume(
+    residual: &[f64],
+    mask: &[bool],
+    dims: [usize; 3],
+    h: f64,
+    max_lag: f64,
+) -> f64 {
+    use rayon::prelude::*;
+    let count = mask.iter().filter(|m| **m).count();
+    if count == 0 {
+        return f64::NAN;
+    }
+    let mean = residual
+        .iter()
+        .zip(mask)
+        .filter(|(_, m)| **m)
+        .map(|(r, _)| *r)
+        .sum::<f64>()
+        / count as f64;
+    let r = residual
+        .iter()
+        .zip(mask)
+        .map(|(v, m)| if *m { v - mean } else { 0.0 })
+        .collect::<Vec<_>>();
+    let masked = mask
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| **m)
+        .map(|(i, _)| {
+            let k = i % dims[2];
+            let j = (i / dims[2]) % dims[1];
+            [i / (dims[1] * dims[2]), j, k]
+        })
+        .collect::<Vec<_>>();
+    let rad = (max_lag / h).floor() as i64;
+    let mut lags = Vec::new();
+    for dx in -rad..=rad {
+        for dy in -rad..=rad {
+            for dz in -rad..=rad {
+                let d2 = ((dx * dx + dy * dy + dz * dz) as f64) * h * h;
+                if d2 <= max_lag * max_lag {
+                    lags.push([dx, dy, dz]);
+                }
+            }
+        }
+    }
+    // (autocorrelation, mask overlap) per lag
+    let sums = lags
+        .par_iter()
+        .map(|lag| {
+            let mut ac = 0.0;
+            let mut am = 0usize;
+            for p in &masked {
+                let q = [0, 1, 2].map(|a| p[a] as i64 + lag[a]);
+                if (0..3).any(|a| q[a] < 0 || q[a] >= dims[a] as i64) {
+                    continue;
+                }
+                let qi = (q[0] as usize * dims[1] + q[1] as usize) * dims[2] + q[2] as usize;
+                if mask[qi] {
+                    am += 1;
+                    let pi = (p[0] * dims[1] + p[1]) * dims[2] + p[2];
+                    ac += r[pi] * r[qi];
+                }
+            }
+            (ac, am as f64)
+        })
+        .collect::<Vec<_>>();
+    let zero = lags.iter().position(|l| *l == [0, 0, 0]).unwrap_or(0);
+    let (ac0, am0) = sums[zero];
+    let norm0 = ac0 / am0.max(1.0);
+    if norm0.is_nan() || norm0 <= 0.0 {
+        return f64::NAN;
+    }
+    sums.iter()
+        .filter(|(_, am)| *am > 0.5 * am0)
+        .map(|(ac, am)| (ac / am.max(1.0) / norm0).max(0.0))
+        .sum::<f64>()
+        * h
+        * h
+        * h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +644,7 @@ mod tests {
             radius_angstrom: 8.0,
             resolution_angstrom: 2.0,
             periodic: false,
+            independent_volume: None,
         };
         let center = [0.0, 0.0, 0.0];
         let (origin, dims) = SiteLikelihood::box_geometry(center, &options);
@@ -568,5 +705,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn correlation_volume_of_blurred_white_noise() {
+        // white noise blurred with sigma: autocorrelation integral (4 pi sigma^2)^(3/2)
+        let dims = [48, 48, 48];
+        let mut noise = SiteBox::zeros([0.0; 3], 0.5, dims);
+        let mut state = 12345u64;
+        for v in &mut noise.data {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *v = ((state >> 33) as f64 / (1u64 << 31) as f64 - 0.5) as f32;
+        }
+        let sigma = 0.8;
+        let blurred = gaussian_blur(&noise, sigma);
+        let residual = blurred.data.iter().map(|v| *v as f64).collect::<Vec<_>>();
+        let mask = (0..residual.len())
+            .map(|i| {
+                let (x, y, z) = (i / (48 * 48), (i / 48) % 48, i % 48);
+                [x, y, z].iter().all(|c| (8..40).contains(c))
+            })
+            .collect::<Vec<_>>();
+        let volume = noise_correlation_volume(&residual, &mask, dims, 0.5, 4.0);
+        let analytic = (4.0 * std::f64::consts::PI * sigma * sigma).powf(1.5);
+        assert!(
+            (volume - analytic).abs() < 0.1 * analytic,
+            "correlation volume {volume} vs analytic {analytic}"
+        );
     }
 }
