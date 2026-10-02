@@ -2,7 +2,7 @@
 
 Fits a glycan of known sequence to a protein site in a density map with the frozen GlycoFlow
 flow model. Rust port of the Python reference `glycoflow/fitting/` (GlycoFlow repository);
-used by `reglyco refine --objective density --density-search glycoflow`.
+used by `reglyco refine --objective density`.
 
 ## Cross-repository dependency
 
@@ -56,7 +56,7 @@ interface.
 # and residue_library.json (GlycoFlow glycoflow/resources/)
 export GLYCOFLOW_MODEL=/path/to/model
 reglyco refine --protein 5KZC.pdb --density-map eds-5kzc.ccp4 --objective density \
-    --density-search glycoflow --replace-glycan A:79 --seed 0 -o out/
+    --replace-glycan A:79 --seed 0 -o out/
 # GPU: cargo build --release -p reglyco --features reglyco-cli/glycoflow-cuda
 #      (CUDA_COMPUTE_CAP=<cc>, nvcc on PATH), then --glycoflow-device cuda
 ```

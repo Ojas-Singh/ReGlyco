@@ -164,216 +164,30 @@ Add `--obc2` for the more expensive solvent-aware OBC2 GBSA objective. It is
 deliberately opt-in because its global solvent derivatives are much slower on
 large proteins.
 
-Density-guided replacement uses the deterministic connected-arm ensemble
-search by default. In `deep` mode, a fixed protein-subtracted ROI is also
-searched for map-derived ring hypotheses and topology-constrained complete
-trees before the ensemble manifold is used as a weak prior/fallback. It
-establishes the attachment and conserved core from
-distinct GlycoShape clusters, screens every supplied conformer at that
-placement, and then recombines complete correlated GlycoShape subtrees on the
-same core. Parent-child torsions are refined together when independent moves
-stall. Each arm is judged in one fixed density region using ring and continuous
-linkage-path support, which prevents a disconnected nearby blob from receiving
-credit as the intended branch.
-It has no default wall-clock cutoff; `--density-time-limit`
-and `--max-density-evaluations` are explicit emergency failsafes.  Ambiguous
-fits are written as a posterior credible set (95% and at most ten models by
-default) in `candidates.pdb` and `candidates.json`:
+Density fitting (`refine --objective density`) fits the glycan of known
+sequence at each `--replace-glycan` site into a CCP4/MRC map with the GlycoFlow
+flow model (crate `reglyco-glycoflow`). It needs the GlycoFlow model directory
+(`glycoflow.safetensors`, `glycoflow.json`, `residue_library.json`) through
+`--glycoflow-model` or `$GLYCOFLOW_MODEL`:
 
 ```console
+export GLYCOFLOW_MODEL=/path/to/model
 cargo run --release -- refine \
-  --pdb-id 5KZC \
-  --assembly 1 \
-  --replace-glycan A:79=G63337SS \
-  --anomer beta \
-  --level 1 \
-  --objective density \
-  --density-map auto \
-  --density-map-source pdbe \
-  --density-difference-map auto \
-  --density-effort deep \
-  --post-relax none \
-  --report \
-  --output example-output/5kzc-density-deep \
-  --overwrite
+  --protein 5KZC.pdb --density-map eds-5kzc.ccp4 \
+  --objective density --replace-glycan A:79 \
+  --seed 0 --output example-output/5kzc-density
 ```
 
-This is the one-shot scientific example: it downloads the 5KZC biological
-assembly and the PDBe EDS density map, replaces the deposited glycan at `A:79` with
-the public Level 1 GlycoShape `G63337SS` Man9 ensemble, fits correlated complete
-arms, and writes `fitted.pdb`, `candidates.pdb`, `candidates.json`,
-`density.json`, `validation.json`, `search.json`, `report.json`, `report.pdf`,
-`report.typ`, `glycoshape-density-best.pdb`, `glycoshape-nearest-fit.pdb`,
-`glycoshape-baselines.json`, `density-ring-hypotheses.pdb`,
-`density-ring-hypotheses.json`, `density-ring-graph.pdb`,
-`density-graph-best.pdb`, `deep-internal-best.pdb`, `deep-arm-best.pdb`,
-`deep-cartesian-best.pdb`,
-and the three local visualization maps. To fit a different entry, change
-`--pdb-id`, the `SITE=GLYCAN` pair, and (optionally) `--density-site`. When
-`--density-sigma` is omitted, ReGlyco tests a deterministic width grid against
-held-out voxels around nearby fixed protein atoms and uses the selected width
-for every glycan candidate. A numeric value remains an expert override.
-`--density-effort fast`, `adaptive` (default), and
-`deep` control evidence-driven escalation without imposing a time cutoff.
-Deep mode uses deterministic graph growth, parallel exact scoring of
-independent ring/arm hypotheses, exact fixed-ROI torsion gradients, and
-validation-gated restrained Cartesian cleanup. `density.json` records the
-ring-hypothesis count, graph evaluation count, calibrated glycan B factor,
-training/held-out likelihoods, and stage timings.
-The experimental native detector/topology solver can be selected explicitly
-with `--density-effort deep --density-deep-strategy ring-graph`; it writes
-`density-ring-hypotheses.json`, `density-ring-graph.pdb`, and
-`ring_graph_diagnostics` in `density.json`. The established adaptive result
-is not changed by this option.
-For PDB-ID workflows, `--density-difference-map auto` attempts to acquire a
-PDBe Fo-Fc map and records its provenance; use `none` for a primary-map-only
-fit or pass a local CCP4/MRC path explicitly.
-
-Use `--density-search swarm` or `--density-search staged` only to reproduce
-legacy diagnostic searches.  `fitted.pdb` is always the highest-posterior
-complete model; deposited glycan coordinates are used only for recovery
-diagnostics and never for fitting or ranking.
-
-### Fast progressive adaptive example
-
-For a cached PDB-ID workflow, Adaptive is fully automatic: omit both the
-sigma override and the basin-index diagnostic.  ReGlyco calibrates a shared
-protein-shell kernel, uses its broader capture scale to find attachment/core
-basins, and compares the surviving basins on one fixed nominal ROI:
-
-```console
-RAYON_NUM_THREADS=4 cargo run --release -- refine \
-  --pdb-id 5KZC --assembly 1 \
-  --replace-glycan A:79=G63337SS \
-  --anomer beta --level 1 \
-  --objective density \
-  --density-map auto --density-map-source pdbe \
-  --density-difference-map none \
-  --density-effort adaptive \
-  --post-relax none --report \
-  --density-time-limit 300 \
-  --output example-output/5kzc-adaptive-auto-kernel \
-  --overwrite
-```
-
-`--density-time-limit` is an optional emergency failsafe only; omitting it
-lets basin competition finish through evidence exhaustion and numerical
-convergence.  `--density-sigma` remains an expert reproducibility override.
-`REGLYCO_ADAPTIVE_BASIN_INDEX` is intentionally undocumented and is retained
-only for diagnosing a particular pilot basin; normal fitting never requires
-it.
-
-Adaptive interprets every complete branch independently after fitting.  The
-report and `density.json` distinguish three evidence states:
-
-- `density_determined`: positive fixed-ROI gain and one dominant connected
-  arm mode;
-- `ambiguous`: positive evidence remains distributed across distinct arm-root
-  modes, which are reported as a 95% marginal credible set;
-- `ensemble_prior_determined`: adding the density-driven arm has negative
-  fixed-ROI gain, so `fitted.pdb` uses a chemically compatible GlycoShape
-  population-prior subtree and does not claim that its coordinates came from
-  density.
-
-Arm posteriors are conditional on the fitted core and marginalize the other
-arms.  Consequently a strongly determined arm cannot manufacture certainty
-for an unrelated weak arm.  When a prior fallback is required, the rejected
-density-maximizing complete pose remains available in `candidates.pdb` for
-diagnosis, while `fitted.pdb` is the evidence-aware representative.
-
-Adaptive first places and freezes the attachment/core, then grows each
-topology-authorized branch against the residual left by the accepted prefix.
-The child ROI is fixed before proposals are scored, so a distal peak cannot
-move the mask or skip an intervening residue. Parent linkages are reopened
-only when fixed-ROI evidence supports it. The final cleanup now includes a
-bounded terminal-ring-pose search: the anomeric C1 and parent linkage remain
-fixed while the terminal pyranose frame is locally rotated and accepted only
-when prefix-subtracted density, held-out likelihood, and clash checks improve.
-
-Adaptive also ships an opt-in experimental full-domain torsion supplement:
-set `REGLYCO_ADAPTIVE_GLOBAL_TORSIONS=1` to add a small, space-diverse sweep
-over the complete periodic torsion domain.  Those "global" modes carry no
-conformer membership, so any phi/psi/omega basin outside the 512-conformer
-library is reachable and must be earned by density alone.  Measured on cached
-5KZC this supplement is currently inert: the beam's seed-preserving exact
-selection keeps the outcome identical whether the sweep is on or off, so it
-is opt-in until it demonstrates a recovery win rather than being the default.
-
-The automatic run records both the nominal shell-calibrated width and the
-broader capture width in `density.json` (`sigma_calibration`).  Adaptive uses
-the capture width only to cross basin/manifold gaps, then re-scores every
-finalist with the shared nominal kernel and fixed ROI.  Per-residue blur is
-tested only after a connected pose exists and is accepted only with a held-out
-likelihood and BIC gain.
-
-The benchmarks below were recorded with a locally cached 512-conformer Level 3
-`G63337SS` ensemble; Level 3 is not distributed publicly, so public runs use
-Level 1 or a local bundle. The canonical no-override cached Adaptive benchmark is
-recorded in
-`example-output/5kzc-parallel-default-final`.  The accepted optimization only
-parallelizes independent proposal/refinement work and defers native-arm
-alternatives until final reporting.  It keeps the
-same candidate ordering, evidence classes, and validation outcome as the
-committed implementation:
-
-| Case | Optimization | Evaluations | CC | Full-tree RMSD | Result |
-| --- | ---: | ---: | ---: | ---: | --- |
-| 5KZC A:79 | 379.79 s | 53,825 | 0.6899946 | 2.56324 Å | identical to baseline |
-| 5GSQ A:297 | 388.60 s | 41,312 | 0.4949787 | 2.17925 Å | identical to baseline |
-| 5GSQ B:297 | 188.14 s | 27,277 | 0.5103363 | 1.27006 Å | identical to baseline |
-
-The previous committed timings were 398.47 s, 418.83 s, and 199.91 s,
-respectively, so this is an approximately 5–7% speedup without a scientific
-tradeoff.  Recovery RMSD values are diagnostics only; deposited coordinates
-never participate in proposal generation, fitting, or ranking.  No sigma or
-basin override is required for these runs.
-
-`density.json` separates setup, root/core capture, basin handoff, local
-branch/evidence work, and finalization.  In the accepted parallel profile the
-5KZC local phase is 286.60 s (down from 303.07 s); it remains the dominant
-phase and is the next target for further work.
-
-The production timing breakdown and optimization guardrails are recorded in
-[`docs/density-performance.md`](docs/density-performance.md). The largest
-measured cost is the adaptive local/evidence stage; capture-only shortcuts are
-not accepted unless they preserve the selected pose, evidence classifications,
-validation state, and fixed-ROI candidate ordering. The diagnostic environment
-flags and their cleanup policy are inventoried in
-[`docs/density-env-flags.md`](docs/density-env-flags.md).
-The repeatable cached benchmark harness is
-[`scripts/benchmark-density.sh`](scripts/benchmark-density.sh); it records the
-exact command, wall-clock resource usage, and `density.json` for 5KZC and both
-5GSQ sites without applying a default failsafe.
-
-For a PDB-ID density run with no explicit attachment, ReGlyco defaults to
-biological assembly 1 and discovers every carbohydrate component with an
-explicit protein LINK through crabWURCS 0.3.1. Each site is resolved against
-GlycoShape at the requested `--level` (Level 1 by default), checked for exact
-canonical topology, fitted with its
-own Adaptive scorer/ROI/conformer state, and merged only after fitting. This
-preflight is atomic: an unsupported attachment or missing exact ensemble stops
-before the input is stripped. Use `--asymmetric-unit` for the old asymmetric
-unit, or `--assembly N` for another assembly.
-
-```console
-RAYON_NUM_THREADS=4 cargo run --release -- refine \
-  --pdb-id 5GSQ \
-  --objective density \
-  --density-effort adaptive \
-  --post-relax none --report \
-  --output example-output/5gsq-adaptive \
-  --overwrite
-```
-
-The merged model is `fitted.pdb`; per-site models and diagnostics are under
-`sites/<chain>_<residue>/`, and `discovered-glycans.json` records canonical
-WURCS/IUPAC, GlyTouCan/GlycoShape identifiers, and source residues.
-For a multi-site run, an explicit `--density-time-limit` is applied independently
-to each site; the reported total can therefore exceed that per-site failsafe.
-Sites are never jointly coordinate-optimized during this stage, and the final
-merge reports any retained cross-site clash; when a density pose clearly
-dominates its native alternatives, it is preserved instead of silently being
-replaced by an unrelated fallback.
+`--density-map auto` resolves a sidecar map next to a local model or, with
+`--pdb-id`, downloads the PDBe EDS map (`--density-map-source rcsb` for the
+RCSB 2Fo-Fc map). `--replace-glycan SITE=<GLYCAM sequence>` fits a different
+sequence than the deposited one. The run writes `fitted.pdb`, `candidates.pdb`,
+`glycoflow-fit.json` and `validation.json`; build with
+`--features reglyco-cli/glycoflow-cuda` and pass `--glycoflow-device cuda` for
+the GPU path. Options, outputs and the method are described in
+[`docs/glycoflow-fitting.md`](docs/glycoflow-fitting.md);
+[`scripts/benchmark-glycoflow.sh`](scripts/benchmark-glycoflow.sh) runs the
+fit on a list of sites and records wall time and peak memory.
 
 For a quick report-generation smoke check only, use one iteration and omit
 the second stage. It verifies the workflow but is not a converged model:
@@ -562,9 +376,12 @@ The workspace crates are:
   linkage-angle genes, and deterministic compatible-set GA search
 - `reglyco-relax`, fixed/movable vacuum or opt-in OBC2 L-BFGS minimization
 - `reglyco-refine`, search → build → parameterize → relax orchestration
+  (steric objective)
 - `reglyco-report`, common serializable reports and provenance
 - `reglyco-validate`, structural and attachment-metadata checks
-- `reglyco-density`, density-guided fitting and report integration
+- `reglyco-density`, CCP4/MRC maps, map acquisition, map-agreement scoring,
+  and the site likelihood used by the GlycoFlow fitter
+- `reglyco-glycoflow`, GlycoFlow fitting of glycans into density maps
 - `reglyco-saxs`, the in-memory ReGlyco adapter for the sibling crabSAXS SAXS
   modeling, reweighting, and glycoform-search APIs
 - `reglyco-cli`, command implementation used by the `reglyco` binary
@@ -579,6 +396,5 @@ relaxation. Workspace crates exchange `Structure` and
 
 The published build resolves GlySys and crabSAXS through their registry
 versions. A checkout build may use local path overrides for development;
-those overrides are kept out of published package metadata. Density-specific
-scientific objectives and a PyO3 compatibility layer remain separate
-milestones.
+those overrides are kept out of published package metadata. A PyO3
+compatibility layer remains a separate milestone.
