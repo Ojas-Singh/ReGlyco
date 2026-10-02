@@ -53,6 +53,9 @@ pub(crate) struct GlycoflowArgs {
     /// Weight of the GlycoFlow marginal prior in the objective.
     #[arg(long = "glycoflow-prior-weight", default_value_t = 1.0)]
     pub(crate) prior_weight: f64,
+    /// Weight of the protein/environment and intra-glycan contact energies.
+    #[arg(long = "glycoflow-clash-weight", default_value_t = 10.0)]
+    pub(crate) clash_weight: f64,
     /// Fit without the GlycoFlow marginal prior.
     #[arg(long = "glycoflow-no-prior")]
     pub(crate) no_prior: bool,
@@ -142,6 +145,8 @@ pub(crate) fn run_refine_glycoflow(arguments: RefineArgs, started: Instant) -> a
     options.fit.n_basins = g.basins;
     options.prior.enabled = !g.no_prior;
     options.problem.w_prior = g.prior_weight;
+    options.problem.w_env = g.clash_weight;
+    options.problem.w_self = g.clash_weight;
     options.site.symmetry = match g.symmetry {
         GlycoflowSymmetryArg::Auto => SymmetryMode::Auto,
         GlycoflowSymmetryArg::Off => SymmetryMode::Off,
