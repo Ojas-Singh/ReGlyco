@@ -18,6 +18,7 @@
 pub mod counter;
 pub mod error;
 pub mod evaluation;
+pub mod infer;
 pub mod model;
 pub mod observation;
 pub mod output;
