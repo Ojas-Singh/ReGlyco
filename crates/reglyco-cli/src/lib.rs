@@ -2978,9 +2978,17 @@ fn run_validate(arguments: ValidateArgs) -> anyhow::Result<()> {
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    // --site focuses the structural checks on those sites (as refine does for its targets),
+    // so other deposited glycans and unrelated protein contacts do not decide validity.
+    let focus_sites = arguments
+        .density_sites
+        .iter()
+        .map(|site| parse_site(site))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let validation_options = reglyco_validate::ValidationOptions {
         min_density_cc: arguments.min_density_cc,
         references,
+        focus_sites,
         ..reglyco_validate::ValidationOptions::default()
     };
     let density_scorer = if let Some(path) = &arguments.density_map {
