@@ -74,6 +74,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fit = &result.fits[0];
             let best = &fit.outcome.basins[fit.outcome.best];
             let rec = fit.recovery.as_ref();
+            let dep =
+                fit.site.deposited.as_ref().map(|d| {
+                    reglyco_glycoflow::evaluation::deposited_score(&fit.problem, d, &best.x)
+                });
             println!(
                 "{}",
                 serde_json::json!({
@@ -86,6 +90,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "claimed": rec.map(|r| r.claimed_supported.len()),
                     "valid": result.validation.as_ref().map(|v| v.valid),
                     "final_contact_weight": fit.outcome.final_contact_weight,
+                    "e_env": best.terms.e_env, "e_self": best.terms.e_self, "e_restraint": best.e_restraint,
+                    "deposited": dep.as_ref().map(|d| serde_json::json!({
+                        "loglik": d.terms.loglik, "total": d.terms.total, "e_env": d.terms.e_env,
+                        "e_self": d.terms.e_self, "e_att": d.terms.e_att, "e_prior": d.terms.e_prior,
+                        "matched_atoms": d.matched_atoms, "scored_atoms": d.scored_atoms})),
                 })
             );
         }

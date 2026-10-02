@@ -3,7 +3,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::problem::{SiteProblem, V3};
+use crate::cartesian::coordinate_objective;
+use crate::problem::{SiteProblem, Terms, V3};
 use crate::site::{DepositedGlycan, Site};
 
 /// Core of an N-glycan: the chitobiose and the beta-mannose.
@@ -94,4 +95,46 @@ pub fn contacts_below(problem: &SiteProblem, site: &Site, x: &[V3], cutoff: f64)
         .filter(|(i, j, _)| d2(x[*i], problem.site_xyz[*j]) < c2)
         .count();
     grid + pairs
+}
+
+/// The deposited glycan scored by the fitting objective (the problem's current weights, no
+/// restraints; psi_N and prior torsions measured on the coordinates).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DepositedScore {
+    pub terms: Terms,
+    /// scored template atoms present in the deposit (missing ones take the fitted positions)
+    pub matched_atoms: usize,
+    pub scored_atoms: usize,
+}
+
+/// Score the deposited coordinates of the glycan with the same objective as the fit, so a fit
+/// can be compared with the deposited model on the map (`fallback`: the fitted pose, used for
+/// atoms the deposit lacks).
+pub fn deposited_score(
+    problem: &SiteProblem,
+    deposited: &DepositedGlycan,
+    fallback: &[V3],
+) -> DepositedScore {
+    let mut x = fallback.to_vec();
+    let (mut matched, mut scored) = (0, 0);
+    for (i, xi) in x.iter_mut().enumerate().take(problem.n_atoms) {
+        if !problem.keep[i] {
+            continue;
+        }
+        scored += 1;
+        let key = (
+            problem.glycan.res_paths[i].clone(),
+            problem.glycan.atom_names[i].clone(),
+        );
+        if let Some(r) = deposited.atoms.get(&key) {
+            *xi = *r;
+            matched += 1;
+        }
+    }
+    let (terms, _) = coordinate_objective(problem, &x, None);
+    DepositedScore {
+        terms,
+        matched_atoms: matched,
+        scored_atoms: scored,
+    }
 }
