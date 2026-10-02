@@ -5,10 +5,13 @@
 //! ```text
 //! # in the GlycoFlow checkout
 //! .venv/bin/python scripts/fitting/export_fit_fixtures.py --sites sites.json \
-//!     --only 5KZC_A79 5GSQ_A297 --out-dir /path/to/fixtures
+//!     --only 5KZC_A79 5GSQ_A297 5GSQ_B297 --out-dir /path/to/fixtures
 //! # in ReGlyco
 //! GLYCOFLOW_FIT_FIXTURES=/path/to/fixtures cargo test --release -p reglyco-glycoflow \
-//!     --test parity -- --ignored --nocapture
+//!     --test parity parity_ -- --ignored --nocapture
+//! # full pipeline on the reference's templates and prior samples (also GLYCOFLOW_MODEL;
+//! # GLYCOFLOW_DEVICE=cuda with --features cuda)
+//! ... --test parity controlled_fit -- --ignored --nocapture
 //! ```
 //!
 //! Tolerances: environment atom count exact; likelihood constants rel. 1e-4; objective terms
@@ -753,6 +756,12 @@ fn controlled_fit_5gsq_a297() {
 }
 
 #[test]
+#[ignore = "needs GLYCOFLOW_FIT_FIXTURES, GLYCOFLOW_MODEL, the 5GSQ model and map"]
+fn controlled_fit_5gsq_b297() {
+    controlled_fit("5GSQ_B297");
+}
+
+#[test]
 #[ignore = "needs GLYCOFLOW_FIT_FIXTURES, GLYCOFLOW_MODEL, the 5KZC model and map"]
 fn controlled_fit_5kzc_a79() {
     controlled_fit("5KZC_A79");
@@ -768,4 +777,10 @@ fn parity_5kzc_a79() {
 #[ignore = "needs GLYCOFLOW_FIT_FIXTURES (GlycoFlow export_fit_fixtures.py), the 5GSQ model and map"]
 fn parity_5gsq_a297() {
     parity("5GSQ_A297");
+}
+
+#[test]
+#[ignore = "needs GLYCOFLOW_FIT_FIXTURES (GlycoFlow export_fit_fixtures.py), the 5GSQ model and map"]
+fn parity_5gsq_b297() {
+    parity("5GSQ_B297");
 }

@@ -76,9 +76,12 @@ The model's `REMARK 2 RESOLUTION` and `CRYST1` records are read from the input P
 cargo test -p reglyco-glycoflow            # offline: unit tests, finite-difference gradients on a synthetic site
 # parity with the Python reference (needs the site models and maps):
 #   GlycoFlow: .venv/bin/python scripts/fitting/export_fit_fixtures.py --sites sites.json \
-#                  --only 5KZC_A79 5GSQ_A297 --out-dir /path/to/fixtures
+#                  --only 5KZC_A79 5GSQ_A297 5GSQ_B297 --out-dir /path/to/fixtures
 GLYCOFLOW_FIT_FIXTURES=/path/to/fixtures cargo test --release -p reglyco-glycoflow --test parity \
-    -- --ignored --nocapture
+    parity_ -- --ignored --nocapture
+# the full pipeline on the reference's templates and prior samples (removes RNG differences):
+GLYCOFLOW_FIT_FIXTURES=... GLYCOFLOW_MODEL=/path/to/model cargo test --release -p reglyco-glycoflow \
+    --test parity controlled_fit -- --ignored --nocapture
 ```
 
 ## Differences from the Python reference
