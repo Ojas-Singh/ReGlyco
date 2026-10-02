@@ -3133,40 +3133,12 @@ impl DensityScorer {
             let amplitude = self.scoring_atom_amplitude(atom);
             for (index, voxel) in region.voxels.iter().enumerate() {
                 let displacement = if region.periodic {
-                    let mut fractional = [
-                        voxel.fractional[0] - atom_fractional[0],
-                        voxel.fractional[1] - atom_fractional[1],
-                        voxel.fractional[2] - atom_fractional[2],
-                    ];
-                    for component in &mut fractional {
-                        *component -= component.round();
-                    }
-                    let base = self.map.fractional_to_cartesian(fractional);
-                    if periodic_orthogonal {
-                        [
-                            base[0] * base[0] + base[1] * base[1] + base[2] * base[2],
-                            0.0,
-                            0.0,
-                        ]
-                    } else {
-                        let mut best = f64::INFINITY;
-                        for translation in &translations {
-                            let candidate = [
-                                base[0] + translation[0],
-                                base[1] + translation[1],
-                                base[2] + translation[2],
-                            ];
-                            let norm = candidate.iter().map(|value| value * value).sum::<f64>();
-                            if norm < best {
-                                best = norm;
-                            }
-                        }
-                        if best.is_infinite() {
-                            [f64::INFINITY, 0.0, 0.0]
-                        } else {
-                            [best.sqrt(), 0.0, 0.0]
-                        }
-                    }
+                    self.periodic_displacement(
+                        voxel.fractional,
+                        atom_fractional,
+                        &translations,
+                        periodic_orthogonal,
+                    )
                 } else {
                     [
                         voxel.cartesian[0] - center[0],
@@ -3365,6 +3337,47 @@ impl DensityScorer {
     /// Exact coordinate derivative of the profiled fixed-ROI likelihood.
     /// Linear scale and intercept derivatives vanish by the envelope theorem;
     /// only each atom-local Gaussian derivative remains.
+    /// Minimum-image Cartesian displacement (voxel minus atom) between two
+    /// fractional positions of a periodic map. The direction is kept: the
+    /// fixed-region field needs |d|^2 and its gradient needs the vector.
+    /// `orthogonal` cells use the wrapped fractional difference directly;
+    /// skew cells also test the 27 neighbouring lattice images.
+    fn periodic_displacement(
+        &self,
+        voxel_fractional: [f64; 3],
+        atom_fractional: [f64; 3],
+        translations: &[[f64; 3]],
+        orthogonal: bool,
+    ) -> [f64; 3] {
+        let mut fractional = [
+            voxel_fractional[0] - atom_fractional[0],
+            voxel_fractional[1] - atom_fractional[1],
+            voxel_fractional[2] - atom_fractional[2],
+        ];
+        for component in &mut fractional {
+            *component -= component.round();
+        }
+        let base = self.map.fractional_to_cartesian(fractional);
+        if orthogonal || translations.is_empty() {
+            return base;
+        }
+        let mut best = base;
+        let mut best_norm = f64::INFINITY;
+        for translation in translations {
+            let candidate = [
+                base[0] + translation[0],
+                base[1] + translation[1],
+                base[2] + translation[2],
+            ];
+            let norm = candidate.iter().map(|value| value * value).sum::<f64>();
+            if norm < best_norm {
+                best_norm = norm;
+                best = candidate;
+            }
+        }
+        best
+    }
+
     pub fn score_fixed_region_with_gradients(
         &self,
         region: &DensityFixedRegion,
@@ -3423,32 +3436,12 @@ impl DensityScorer {
             let mut gradient = [0.0; 3];
             for (index, voxel) in region.voxels.iter().enumerate() {
                 let displacement = if region.periodic {
-                    let mut fractional = [
-                        voxel.fractional[0] - atom_fractional[0],
-                        voxel.fractional[1] - atom_fractional[1],
-                        voxel.fractional[2] - atom_fractional[2],
-                    ];
-                    for component in &mut fractional {
-                        *component -= component.round();
-                    }
-                    let base = self.map.fractional_to_cartesian(fractional);
-                    let mut best = f64::INFINITY;
-                    for translation in &translations {
-                        let candidate = [
-                            base[0] + translation[0],
-                            base[1] + translation[1],
-                            base[2] + translation[2],
-                        ];
-                        let norm = candidate.iter().map(|value| value * value).sum::<f64>();
-                        if norm < best {
-                            best = norm;
-                        }
-                    }
-                    if best.is_infinite() {
-                        [f64::INFINITY, 0.0, 0.0]
-                    } else {
-                        [best.sqrt(), 0.0, 0.0]
-                    }
+                    self.periodic_displacement(
+                        voxel.fractional,
+                        atom_fractional,
+                        &translations,
+                        false,
+                    )
                 } else {
                     [
                         voxel.cartesian[0] - center[0],
@@ -5963,6 +5956,134 @@ mod tests {
             .unwrap();
         assert!((exact.correlation - exact.sites[0].correlation).abs() < 1.0e-12);
         assert!((exact.correlation - wrapped.correlation).abs() < 1.0e-8);
+    }
+
+    #[test]
+    fn periodic_fixed_region_matches_interior_scoring_and_finite_differences() {
+        // A full-cell orthogonal map: away from the cell boundary the periodic
+        // minimum-image field must equal the ordinary field, and the analytic
+        // gradient must match finite differences along every axis.
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("periodic-fixed.mrc");
+        let pdb = "HETATM    1  C1  NAG B   1       7.300   7.000   7.200  1.00  0.00           C\nHETATM    2  C2  NAG B   1       8.500   7.100   7.000  1.00  0.00           C\nHETATM    3  C3  NAG B   1       9.100   8.000   7.300  1.00  0.00           C\nHETATM    4  C4  NAG B   1       8.500   9.000   7.100  1.00  0.00           C\nHETATM    5  C5  NAG B   1       7.400   8.700   6.900  1.00  0.00           C\nHETATM    6  O5  NAG B   1       6.800   7.800   7.000  1.00  0.00           O\nEND\n";
+        let mut structure = read_pdb_str(pdb, &BuildOptions::default()).unwrap();
+        let site = ResidueId {
+            chain: "A".into(),
+            number: 1,
+            insertion_code: None,
+        };
+        let glycan = ResidueId {
+            chain: "B".into(),
+            number: 1,
+            insertion_code: None,
+        };
+        structure.metadata_mut().glycan_trees.push(GlycanTree {
+            chain: "B".into(),
+            residue_ids: vec![glycan.clone()],
+            attachment_site: Some(site.clone()),
+        });
+        let shape = [16, 16, 16];
+        let atoms = structure
+            .atoms()
+            .into_iter()
+            .filter(|atom| atom.residue == glycan)
+            .collect::<Vec<_>>();
+        let mut data = vec![0.0_f32; shape[0] * shape[1] * shape[2]];
+        for z in 0..shape[2] {
+            for y in 0..shape[1] {
+                for x in 0..shape[0] {
+                    let point = [x as f64, y as f64, z as f64];
+                    data[x + shape[0] * (y + shape[1] * z)] = atoms
+                        .iter()
+                        .map(|atom| {
+                            let d = distance(
+                                point,
+                                [
+                                    atom.position.x + 0.4,
+                                    atom.position.y - 0.3,
+                                    atom.position.z + 0.2,
+                                ],
+                            );
+                            (-d * d / 2.0).exp()
+                        })
+                        .sum::<f64>()
+                        as f32;
+                }
+            }
+        }
+        write_map(&path, data, shape);
+        let scorer_with = |periodic: bool| {
+            DensityScorer::new(
+                DensityMap::open(&path).unwrap(),
+                DensityScoreOptions {
+                    sigma_angstrom: Some(1.0),
+                    periodic,
+                    ..DensityScoreOptions::default()
+                },
+            )
+            .unwrap()
+        };
+        let periodic = scorer_with(true);
+        let ordinary = scorer_with(false);
+        let target = DensityTarget::for_site(&structure, &site).unwrap();
+        let region_periodic = periodic
+            .fixed_region(&[&structure], std::slice::from_ref(&target), 1.0)
+            .unwrap();
+        let region_ordinary = ordinary
+            .fixed_region(&[&structure], std::slice::from_ref(&target), 1.0)
+            .unwrap();
+        let a = periodic
+            .score_fixed_region(&region_periodic, &structure, std::slice::from_ref(&target))
+            .unwrap();
+        let b = ordinary
+            .score_fixed_region(&region_ordinary, &structure, std::slice::from_ref(&target))
+            .unwrap();
+        assert_eq!(a.voxel_count, b.voxel_count);
+        assert!(
+            (a.correlation - b.correlation).abs() < 1.0e-6,
+            "{} vs {}",
+            a.correlation,
+            b.correlation
+        );
+        assert!(
+            (a.likelihood_gain - b.likelihood_gain).abs()
+                < 1.0e-6 * b.likelihood_gain.abs().max(1.0)
+        );
+
+        let gradient = periodic
+            .score_fixed_region_with_gradients(
+                &region_periodic,
+                &structure,
+                std::slice::from_ref(&target),
+            )
+            .unwrap();
+        let atom = structure
+            .find_atom(&target.glycan_residues[0], "C3")
+            .unwrap();
+        let position = structure.atom(atom).unwrap().position;
+        let epsilon = 1.0e-4;
+        for axis in 0..3 {
+            let shifted = |sign: f64| {
+                let mut moved = structure.clone();
+                let mut p = position;
+                match axis {
+                    0 => p.x += sign * epsilon,
+                    1 => p.y += sign * epsilon,
+                    _ => p.z += sign * epsilon,
+                }
+                moved.set_atom_position(atom, p).unwrap();
+                periodic
+                    .score_fixed_region(&region_periodic, &moved, std::slice::from_ref(&target))
+                    .unwrap()
+                    .likelihood_gain
+            };
+            let finite = (shifted(1.0) - shifted(-1.0)) / (2.0 * epsilon);
+            let analytic = gradient.atom_gradients[&atom][axis];
+            assert!(
+                (analytic - finite).abs() < 2.0e-2 * finite.abs().max(1.0),
+                "axis {axis}: analytic {analytic} finite {finite}"
+            );
+        }
     }
 
     #[test]
