@@ -177,6 +177,7 @@ pub fn calibrate_sigma(site: &Site, map: &DensityMap, resolution: f64) -> Result
                 resolution_angstrom: resolution,
                 periodic: map.is_full_unit_cell(),
                 independent_volume: Some(1.0),
+                solvent_distance: Some(reglyco_density::site_likelihood::SOLVENT_DISTANCE),
             };
             let lik = SiteLikelihood::from_map(map, link, &rest, options)?;
             Ok((
@@ -220,6 +221,7 @@ pub fn density_problem(
         resolution_angstrom: resolution,
         periodic: map.is_full_unit_cell(),
         independent_volume: None,
+        solvent_distance: Some(reglyco_density::site_likelihood::SOLVENT_DISTANCE),
     };
     let env = env_atoms(site, |_| true);
     let likelihood = SiteLikelihood::from_map(map, site.anchor[2], &env, lik_options)?;
@@ -248,12 +250,14 @@ pub struct DensityConstants {
     pub dims: [usize; 3],
     pub spacing: f64,
     pub sigma: f64,
-    /// protein-only fit (a0, b0)
-    pub theta: [f64; 2],
+    /// environment-only fit (a0, b0, bulk-solvent level c_s0)
+    pub theta: [f64; 3],
     pub sse0: f64,
     pub noise_variance: f64,
     /// independent-sample volume (A^3) from the residual autocorrelation
     pub independent_volume: f64,
+    /// empirical noise inflation (decoy null, >= 1)
+    pub inflation: f64,
 }
 
 pub fn density_constants(problem: &SiteProblem) -> Option<DensityConstants> {
@@ -268,6 +272,7 @@ pub fn density_constants(problem: &SiteProblem) -> Option<DensityConstants> {
         sse0: lik.sse0,
         noise_variance: lik.noise_variance,
         independent_volume: lik.independent_volume,
+        inflation: lik.inflation,
     })
 }
 

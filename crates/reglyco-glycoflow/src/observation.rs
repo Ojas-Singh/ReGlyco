@@ -54,6 +54,10 @@ pub trait Observation: Send + Sync {
         None
     }
 
+    /// Empirical noise inflation of the log-likelihood (density: `null_inflation`); no-op for
+    /// observations without one.
+    fn set_noise_inflation(&mut self, _inflation: f64) {}
+
     /// Batch evaluation (parallel over conformers).
     fn evaluate_batch(
         &self,
@@ -114,6 +118,10 @@ impl Observation for DensityObservation {
 
     fn density(&self) -> Option<&SiteLikelihood> {
         Some(&self.likelihood)
+    }
+
+    fn set_noise_inflation(&mut self, inflation: f64) {
+        self.likelihood.inflation = inflation;
     }
 
     fn prepare(&mut self, atoms: &ObservedAtoms) -> Result<()> {

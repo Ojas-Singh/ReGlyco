@@ -102,6 +102,7 @@ fn problem(site: &Site, observed: Option<SiteBox>) -> SiteProblem {
         resolution_angstrom: 2.5,
         periodic: false,
         independent_volume: None,
+        solvent_distance: Some(reglyco_density::site_likelihood::SOLVENT_DISTANCE),
     };
     let env: Vec<SiteEnvironmentAtom> = site
         .environment

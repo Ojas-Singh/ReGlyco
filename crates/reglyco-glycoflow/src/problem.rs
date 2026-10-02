@@ -264,6 +264,8 @@ pub struct ProblemOptions {
     pub template_seed: u64,
     /// scoring-ball radius; default: bound on the glycan's reach + 2.5 A
     pub region_radius: Option<f64>,
+    /// measure the density likelihood's empirical noise inflation (`null_inflation`)
+    pub null_calibration: bool,
 }
 
 impl Default for ProblemOptions {
@@ -276,6 +278,7 @@ impl Default for ProblemOptions {
             n_templates: 16,
             template_seed: 0,
             region_radius: None,
+            null_calibration: true,
         }
     }
 }
@@ -469,7 +472,7 @@ impl SiteProblem {
         }
         let (bond, angle) = linkage(&site.residue_name);
         let tokens = glycan.tokens(vocab);
-        Ok(Self {
+        let mut problem = Self {
             sequence: site.sequence.sequence.clone(),
             tokens,
             templates,
@@ -498,7 +501,12 @@ impl SiteProblem {
             radius,
             counter: Counter::default(),
             glycan,
-        })
+        };
+        if options.null_calibration {
+            let inflation = null_inflation(&problem);
+            problem.observation.set_noise_inflation(inflation);
+        }
+        Ok(problem)
     }
 
     /// Replace the pucker templates (e.g. by the reference's, for parity tests).
@@ -704,4 +712,124 @@ impl SiteProblem {
             }),
         }
     }
+}
+
+/// Decoys of the empirical null (`null_inflation`).
+pub const NULL_DECOYS: usize = 2048;
+pub const NULL_MIN_DECOYS: usize = 100;
+/// Minimum decoy distance from the site residue's linking atoms (A).
+pub const NULL_CLEARANCE: f64 = 2.8;
+
+/// Deterministic decoy design (`density.decoy_poses`): unit direction (Fibonacci sphere),
+/// cube-root radial fraction and Shoemake rotation quaternion (x, y, z, w) from low-discrepancy
+/// sequences, identical in the Python reference.
+pub fn decoy_poses(n: usize) -> Vec<(V3, f64, [f64; 4])> {
+    let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
+    let tau = 2.0 * std::f64::consts::PI;
+    (0..n)
+        .map(|k| {
+            let kk = k as f64 + 0.5;
+            let y = 1.0 - 2.0 * kk / n as f64;
+            let rho = (1.0 - y * y).max(0.0).sqrt();
+            let phi = k as f64 * golden;
+            let d = [rho * phi.cos(), y, rho * phi.sin()];
+            let u = (kk * 0.6180339887498949) % 1.0;
+            let a1 = (kk * 0.8191725133961645) % 1.0;
+            let a2 = (kk * 0.6710436067037893) % 1.0;
+            let a3 = (kk * 0.5497004779019703) % 1.0;
+            let q = [
+                (1.0 - a1).sqrt() * (tau * a2).sin(),
+                (1.0 - a1).sqrt() * (tau * a2).cos(),
+                a1.sqrt() * (tau * a3).sin(),
+                a1.sqrt() * (tau * a3).cos(),
+            ];
+            (d, u.cbrt(), q)
+        })
+        .collect()
+}
+
+fn quat_matrix(q: [f64; 4]) -> [[f64; 3]; 3] {
+    let [x, y, z, w] = q;
+    [
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+        ],
+        [
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+        ],
+        [
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ]
+}
+
+fn lower_median(v: &mut [f64]) -> f64 {
+    v.sort_by(|a, b| a.total_cmp(b));
+    v[(v.len() - 1) / 2]
+}
+
+/// Empirical noise inflation of a density observation (`problem.null_inflation`): the root
+/// residue (template 0) at `NULL_DECOYS` deterministic poses in the scoring ball, kept where it
+/// touches no environment atom (carbon-probe clash grid zero, > `NULL_CLEARANCE` from the site
+/// residue); its standardised projection is N(0, 1) under the noise model. Returns
+/// max(1, (1.4826 MAD)^2), or 1 with fewer than `NULL_MIN_DECOYS` decoys or no density.
+pub fn null_inflation(problem: &SiteProblem) -> f64 {
+    let Some(lik) = problem.observation.density() else {
+        return 1.0;
+    };
+    let sel: Vec<usize> = (0..problem.n_atoms)
+        .filter(|&i| problem.glycan.res_paths[i] == "r" && problem.keep[i])
+        .collect();
+    let tpl = &problem.templates[0];
+    let n = sel.len() as f64;
+    let mean = [0, 1, 2].map(|k| sel.iter().map(|&i| tpl[i][k]).sum::<f64>() / n);
+    let res: Vec<V3> = sel
+        .iter()
+        .map(|&i| [0, 1, 2].map(|k| tpl[i][k] - mean[k]))
+        .collect();
+    let z: Vec<f64> = sel
+        .iter()
+        .map(|&i| crate::observation::glycan_z(&problem.glycan.elements[i]).unwrap_or(0.0))
+        .collect();
+    let link = problem.anchor[2];
+    let mut t: Vec<f64> = decoy_poses(NULL_DECOYS)
+        .into_iter()
+        .filter_map(|(d, u, q)| {
+            let r = quat_matrix(q);
+            let centre = [0, 1, 2].map(|k| link[k] + d[k] * (problem.radius - 3.0) * u);
+            let x: Vec<V3> = res
+                .iter()
+                .map(|a| [0, 1, 2].map(|i| (0..3).map(|j| r[i][j] * a[j]).sum::<f64>() + centre[i]))
+                .collect();
+            // float32 positions, as the reference
+            let x: Vec<V3> = x.iter().map(|p| p.map(|v| v as f32 as f64)).collect();
+            let pen: f64 = x.iter().map(|p| problem.grids.sample(true, *p).0).sum();
+            if pen > 1e-9 {
+                return None;
+            }
+            let near_site = x.iter().any(|p| {
+                problem
+                    .site_xyz
+                    .iter()
+                    .any(|s| norm(sub(*p, *s)) <= NULL_CLEARANCE)
+            });
+            if near_site {
+                return None;
+            }
+            Some(lik.projection(&x, &z))
+        })
+        .collect();
+    if t.len() < NULL_MIN_DECOYS {
+        return 1.0;
+    }
+    let med = lower_median(&mut t.clone());
+    let mut dev: Vec<f64> = t.iter_mut().map(|v| (*v - med).abs()).collect();
+    let mad = lower_median(&mut dev) * 1.4826;
+    (mad * mad).max(1.0)
 }
