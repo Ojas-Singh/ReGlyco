@@ -156,7 +156,7 @@ pub fn fit_one(
         prior_network_evaluations = options.prior.n_samples * options.prior.steps;
     }
     let prior_seconds = t1.elapsed().as_secs_f64();
-    let outcome = fit_site(&problem, &sampler, &options.fit)?;
+    let outcome = fit_site(&mut problem, &sampler, &options.fit)?;
     let naming = residue_naming(&problem, &site, protein)?;
     let recovery = site.deposited.as_ref().map(|dep| {
         let claimed: Vec<String> = std::iter::once("r".to_string())

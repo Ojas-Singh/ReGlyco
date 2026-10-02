@@ -49,6 +49,14 @@ pub struct FitConfig {
     pub flow_steps: usize,
     pub guidance_scale: f64,
     pub guidance_start: f64,
+    /// contact-energy weight (w_env = w_self) during the search
+    pub search_clash_weight: f64,
+    /// contact-energy weight of the final objective (None: keep the search weight). Every retained
+    /// basin is re-scored with it, the best few are refined under it, and selection, support,
+    /// completions and alternatives use it (continuation; one objective for all final comparisons).
+    pub final_clash_weight: Option<f64>,
+    pub steric_steps: usize,
+    pub steric_lr: f64,
 }
 
 impl Default for FitConfig {
@@ -70,6 +78,10 @@ impl Default for FitConfig {
             flow_steps: 32,
             guidance_scale: 1.0,
             guidance_start: 0.3,
+            search_clash_weight: 10.0,
+            final_clash_weight: Some(100.0),
+            steric_steps: 150,
+            steric_lr: 0.005,
         }
     }
 }
@@ -282,46 +294,69 @@ pub struct FitOutcome {
     pub wall_seconds: f64,
 }
 
-/// Fit one site (`pipeline.fit_site`). The problem's prior (if any) must already be set.
+/// Fit one site (`pipeline.fit_site`). The problem's prior (if any) must already be set. The
+/// problem is left with the final contact weights, so later evaluations use the final objective.
 pub fn fit_site(
-    problem: &SiteProblem,
+    problem: &mut SiteProblem,
     sampler: &Sampler,
     config: &FitConfig,
 ) -> Result<FitOutcome> {
     let started = Instant::now();
-    let c = &problem.counter;
-    let r = method_b(
-        problem,
-        sampler,
-        config.n_samples,
-        config.n_basins,
-        config.refine_steps,
-        config.refine_lr,
-        config.flow_steps,
-        config.guidance_scale,
-        config.guidance_start,
-        config.seed,
-    )?;
-    let mut poses = r.poses;
-    let mut energies = r.energies;
-    // polish the best few basins
-    let t0 = Instant::now();
-    let mut order: Vec<usize> = (0..energies.len()).collect();
-    order.sort_by(|&a, &b| energies[a].total_cmp(&energies[b]));
-    let top: Vec<usize> = order.iter().copied().take(config.polish_top).collect();
-    let starts: Vec<Pose> = top.iter().map(|&i| poses[i].clone()).collect();
-    for (&i, (pose, e)) in top.iter().zip(refine(
-        problem,
-        &starts,
-        config.polish_steps,
-        config.polish_lr,
-    )) {
-        if e < energies[i] {
-            poses[i] = pose;
-            energies[i] = e;
-        }
+    problem.w_env = config.search_clash_weight;
+    problem.w_self = config.search_clash_weight;
+    // search on the (smoother) search weights
+    let (mut poses, mut energies, unrefined) = {
+        let problem: &SiteProblem = problem;
+        let c = &problem.counter;
+        let r = method_b(
+            problem,
+            sampler,
+            config.n_samples,
+            config.n_basins,
+            config.refine_steps,
+            config.refine_lr,
+            config.flow_steps,
+            config.guidance_scale,
+            config.guidance_start,
+            config.seed,
+        )?;
+        let mut poses = r.poses;
+        let mut energies = r.energies;
+        let t0 = Instant::now();
+        polish_top(
+            problem,
+            &mut poses,
+            &mut energies,
+            config.polish_top,
+            config.polish_steps,
+            config.polish_lr,
+        );
+        c.add_stage("polish", t0);
+        (poses, energies, r.unrefined)
+    };
+    // final objective: re-score every basin, refine the best few under it
+    if let Some(w) = config.final_clash_weight {
+        problem.w_env = w;
+        problem.w_self = w;
+        let problem: &SiteProblem = problem;
+        let t0 = Instant::now();
+        energies = poses
+            .par_iter()
+            .map(|pose| problem.evaluate(pose, false).terms.total)
+            .collect();
+        problem.counter.add_objective(poses.len());
+        polish_top(
+            problem,
+            &mut poses,
+            &mut energies,
+            config.polish_top,
+            config.steric_steps,
+            config.steric_lr,
+        );
+        problem.counter.add_stage("steric polish", t0);
     }
-    c.add_stage("polish", t0);
+    let problem: &SiteProblem = problem;
+    let c = &problem.counter;
     let t0 = Instant::now();
     let evaluated: Vec<_> = poses
         .par_iter()
@@ -330,7 +365,7 @@ pub fn fit_site(
     let basins: Vec<Basin> = poses
         .into_iter()
         .zip(evaluated)
-        .zip(&r.unrefined)
+        .zip(&unrefined)
         .map(|((pose, ev), &unrefined)| Basin {
             pose,
             x: ev.x,
@@ -379,4 +414,25 @@ pub fn fit_site(
         counters: c.snapshot(),
         wall_seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+/// Refine the `top` lowest-objective poses (Adam) and keep improvements.
+fn polish_top(
+    problem: &SiteProblem,
+    poses: &mut [Pose],
+    energies: &mut [f64],
+    top: usize,
+    steps: usize,
+    lr: f64,
+) {
+    let mut order: Vec<usize> = (0..energies.len()).collect();
+    order.sort_by(|&a, &b| energies[a].total_cmp(&energies[b]));
+    let top: Vec<usize> = order.into_iter().take(top).collect();
+    let starts: Vec<Pose> = top.iter().map(|&i| poses[i].clone()).collect();
+    for (&i, (pose, e)) in top.iter().zip(refine(problem, &starts, steps, lr)) {
+        if e < energies[i] {
+            poses[i] = pose;
+            energies[i] = e;
+        }
+    }
 }

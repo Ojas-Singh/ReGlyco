@@ -723,7 +723,7 @@ fn controlled_fit(name: &str) {
             seed,
             ..Default::default()
         };
-        let out = reglyco_glycoflow::fit_site(&problem, &sampler, &config).unwrap();
+        let out = reglyco_glycoflow::fit_site(&mut problem, &sampler, &config).unwrap();
         let best = &out.basins[out.best];
         let rec = reglyco_glycoflow::evaluation::recovery(
             &problem,
