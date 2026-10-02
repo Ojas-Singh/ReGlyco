@@ -45,8 +45,11 @@ pub(crate) struct GlycoflowArgs {
     #[arg(long = "glycoflow-precision", value_enum, default_value_t = GlycoflowPrecisionArg::F32)]
     pub(crate) precision: GlycoflowPrecisionArg,
     /// Observation-guided GlycoFlow samples per site.
-    #[arg(long = "glycoflow-samples", default_value_t = 768)]
+    #[arg(long = "glycoflow-samples", default_value_t = 384)]
     pub(crate) samples: usize,
+    /// Heun steps of the guided GlycoFlow sampler.
+    #[arg(long = "glycoflow-steps", default_value_t = 8)]
+    pub(crate) steps: usize,
     /// Distinct basins refined per site.
     #[arg(long = "glycoflow-basins", default_value_t = 24)]
     pub(crate) basins: usize,
@@ -156,6 +159,7 @@ pub(crate) fn run_refine_glycoflow(arguments: RefineArgs, started: Instant) -> a
     let mut options = WorkflowOptions::default();
     options.fit.seed = arguments.common.seed;
     options.fit.n_samples = g.samples;
+    options.fit.flow_steps = g.steps;
     options.fit.n_basins = g.basins;
     options.prior.enabled = !g.no_prior;
     options.problem.w_prior = g.prior_weight;

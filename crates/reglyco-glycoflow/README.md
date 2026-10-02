@@ -37,8 +37,8 @@ E = -loglik_density + w_env E_env + w_self E_self + E_attach(psi_N) + w_prior E_
 Gradients are analytic (`dE/dx` of every term, `dE/dtau` through the torsion Jacobian,
 `dE/dpsi_N` / `dE/dphi_N` as rigid rotations about CG->ND2 / ND2->C1).
 
-Pipeline (`pipeline.rs`, = `pipeline.fit_site` + `methods.method_b`): 768 observation-guided
-GlycoFlow samples (Heun 32 steps; from t >= 0.3 the velocity gets `-g/rms(g)`, g = dE/dtau at the
+Pipeline (`pipeline.rs`, = `pipeline.fit_site` + `search.method_b`): 384 observation-guided
+GlycoFlow samples (Heun 8 steps; from t >= 0.3 the velocity gets `-g/rms(g)`, g = dE/dtau at the
 predicted endpoint, through `glycoflow_core::sampler::Guidance`; attachment angles grid-searched
 every 4 steps; batches of 256) -> attachment grid search -> 24 distinct basins (1.5 A) -> Adam refinement (150
 steps) -> polish of the best 4 (300 steps) -> subtree support test (gain > 3 + 0.5 per torsion) -> prior completion of

@@ -24,7 +24,7 @@ The model directory is produced by `scripts/export_rust_fixtures.py` in GlycoFlo
 `glycoflow/resources/residue_library.json`. Build with `--features reglyco-cli/glycoflow-cuda`
 (`CUDA_COMPUTE_CAP=121` on a GB10) for the GPU path; the CPU path needs no feature.
 
-What it does: observation-guided GlycoFlow generation (768 samples), refinement of 24 distinct
+What it does: observation-guided GlycoFlow generation (384 samples, 8 Heun steps), refinement of 24 distinct
 basins on one candidate-independent site likelihood (`reglyco-density::site_likelihood`) plus
 contact, amide and GlycoFlow-prior terms; a final contact-validity stage; a calibrated support
 test that marks residues without density, which are then regenerated from the GlycoFlow prior and
@@ -38,7 +38,8 @@ the deposited glycan when present - evaluation only) and `validation.json`.
 Report bundles: the GlycoFlow fit does not write `report.json`/`report.pdf`; `glycoflow-fit.json`
 is its report.
 
-Options: `--glycoflow-samples`, `--glycoflow-basins`, `--glycoflow-prior-weight`,
+Options: `--glycoflow-samples` (default 384), `--glycoflow-steps` (default 8; 768 x 32 gave the
+same core/supported recovery on 6 sites x 3 seeds at 8x the network cost), `--glycoflow-basins`, `--glycoflow-prior-weight`,
 `--glycoflow-no-prior`, `--glycoflow-clash-weight` (final contact weight, default 100),
 `--glycoflow-symmetry`, `--glycoflow-precision`.
 

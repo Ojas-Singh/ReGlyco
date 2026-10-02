@@ -32,8 +32,9 @@ use crate::support::{
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FitConfig {
     pub seed: u64,
-    // defaults: the calibrated reference settings (support threshold 3 + 0.5 per torsion,
-    // calibrated on synthetic maps with known absent residues)
+    // defaults: support threshold 3 + 0.5 per torsion (calibrated on synthetic maps with known
+    // absent residues); 384 samples x 8 Heun steps (same core/supported recovery and validity as
+    // 768 x 32 on 6 X-ray and cryo-EM sites x 3 seeds, at ~1/8 of the network evaluations)
     pub n_samples: usize,
     pub n_basins: usize,
     pub refine_steps: usize,
@@ -70,7 +71,7 @@ impl Default for FitConfig {
     fn default() -> Self {
         Self {
             seed: 0,
-            n_samples: 768,
+            n_samples: 384,
             n_basins: 24,
             refine_steps: 150,
             refine_lr: 0.03,
@@ -82,7 +83,7 @@ impl Default for FitConfig {
             n_completions: 16,
             completion_guidance: 0.3,
             alt_margin: 5.0,
-            flow_steps: 32,
+            flow_steps: 8,
             guidance_scale: 1.0,
             guidance_start: 0.3,
             search_clash_weight: 10.0,
