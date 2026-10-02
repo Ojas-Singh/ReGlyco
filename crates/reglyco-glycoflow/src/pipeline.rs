@@ -18,7 +18,7 @@ use reglyco_density::site_likelihood::{
 };
 
 use crate::counter::CounterSnapshot;
-use crate::error::Result;
+use crate::error::{Result, invalid};
 use crate::model::GlycoflowModel;
 use crate::observation::{DensityObservation, Observation};
 use crate::prior::MarginalPrior;
@@ -312,6 +312,11 @@ pub fn fit_site(
     sampler: &Sampler,
     config: &FitConfig,
 ) -> Result<FitOutcome> {
+    if config.n_samples == 0 || config.n_basins == 0 || config.flow_steps == 0 {
+        return Err(invalid(
+            "samples, basins and flow steps must each be at least 1",
+        ));
+    }
     let started = Instant::now();
     problem.w_env = config.search_clash_weight;
     problem.w_self = config.search_clash_weight;
