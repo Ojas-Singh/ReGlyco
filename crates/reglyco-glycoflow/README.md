@@ -1,0 +1,93 @@
+# reglyco-glycoflow
+
+Fits a glycan of known sequence to a protein site in a density map with the frozen GlycoFlow
+flow model. Rust port of the Python reference `glycoflow/fitting/` (GlycoFlow repository);
+used by `reglyco refine --objective density --density-search glycoflow`.
+
+## Cross-repository dependency
+
+The GlycoFlow inference engine (`glycoflow-core`: GLYCAM builder, torsion kinematics, network,
+ODE sampler with a guidance hook) lives in the GlycoFlow repository and is used by path,
+`../../../GlycoFlow/rust/glycoflow-core`, with GlycoFlow checked out next to ReGlyco (like GlySys
+and crabWURCS). The dependency is one-way: GlycoFlow never depends on ReGlyco. The offline tests
+read the residue library from the same checkout (`GlycoFlow/glycoflow/resources/`).
+
+`glycoflow-core` brings candle; its `gemm` crates are optimised in dev/test builds too (root
+`Cargo.toml`), because their fp16 NEON assembly does not assemble at opt-level 0 on aarch64.
+
+## Method
+
+One objective, used for search and for selection (`problem.rs`):
+
+```
+E = -loglik_density + w_env E_env + w_self E_self + E_attach(psi_N) + w_prior E_prior(tau)
+```
+
+* `loglik_density`: profiled least-squares site likelihood (`reglyco_density::site_likelihood`),
+  in log-likelihood units through the independent-sample volume measured from the residual
+  autocorrelation on the protein shell (`noise_correlation_volume`);
+* `E_env`: carbon/polar-probe penalty grids over protein, ligands, other glycans and crystal
+  symmetry mates (`symmetry.rs`, all settings of the 65 Sohncke space groups generated with
+  gemmi), plus explicit pairs with the site residue beyond three bonds;
+* `E_self`: GlycoFlow's contact energy over glycan atom pairs >= 4 bonds apart;
+* `E_attach = kappa (1 + cos psi_N)`, kappa = 1/(10 deg)^2;
+* `E_prior`: von Mises KDE of each torsion over 512 GlycoFlow samples of the glycan (product of
+  marginals; an approximation that ignores torsion couplings).
+
+Gradients are analytic (`dE/dx` of every term, `dE/dtau` through the torsion Jacobian,
+`dE/dpsi_N` / `dE/dphi_N` as rigid rotations about CG->ND2 / ND2->C1).
+
+Pipeline (`pipeline.rs`, = `pipeline.fit_site` + `methods.method_b`): 768 observation-guided
+GlycoFlow samples (Heun 32 steps; from t >= 0.3 the velocity gets `-g/rms(g)`, g = dE/dtau at the
+predicted endpoint, through `glycoflow_core::sampler::Guidance`; attachment angles grid-searched
+every 4 steps; batches of 256) -> attachment grid search -> 24 distinct basins (1.5 A) -> Adam refinement (150
+steps) -> polish of the best 4 (300 steps) -> subtree support test (gain > 3 + 0.5 per torsion) -> prior completion of
+unsupported subtrees (pinned-torsion GlycoFlow inpainting with clash guidance, labelled as
+prior-driven) -> density-ambiguous alternatives within 5 objective units.
+
+`observation.rs` defines the `Observation` trait (prepare per glycan; evaluate energy and `dE/dx`
+per conformer, batched). The density map is its first implementation; SAXS can implement the same
+interface.
+
+## Use
+
+```bash
+# model directory: glycoflow.safetensors + glycoflow.json (GlycoFlow scripts/export_rust_fixtures.py)
+# and residue_library.json (GlycoFlow glycoflow/resources/)
+export GLYCOFLOW_MODEL=/path/to/model
+reglyco refine --protein 5KZC.pdb --density-map eds-5kzc.ccp4 --objective density \
+    --density-search glycoflow --replace-glycan A:79 --seed 0 -o out/
+# GPU: cargo build --release -p reglyco --features reglyco-cli/glycoflow-cuda
+#      (CUDA_COMPUTE_CAP=<cc>, nvcc on PATH), then --glycoflow-device cuda
+```
+
+`--replace-glycan SITE` fits the deposited glycan's sequence (GLYCAM from crabWURCS
+`write_glycam`, checked against the deposited tree); `SITE=<GLYCAM sequence>` fits another one.
+Outputs: `fitted.pdb` (protein with the glycan replaced; deposited CCD residue names and numbers,
+PDB atom names, CONECT for every glycan bond, LINK to the Asn), `candidates.pdb` (best fit,
+density-ambiguous alternatives, prior completions; `REMARK 250` labels), `glycoflow-fit.json`
+(objective terms, support classes, alternatives, completions, costs, evaluation against the
+deposited glycan) and `validation.json` (`reglyco-validate` with the density score).
+The model's `REMARK 2 RESOLUTION` and `CRYST1` records are read from the input PDB.
+
+## Tests
+
+```bash
+cargo test -p reglyco-glycoflow            # offline: unit tests, finite-difference gradients on a synthetic site
+# parity with the Python reference (needs the site models and maps):
+#   GlycoFlow: .venv/bin/python scripts/fitting/export_fit_fixtures.py --sites sites.json \
+#                  --only 5KZC_A79 5GSQ_A297 --out-dir /path/to/fixtures
+GLYCOFLOW_FIT_FIXTURES=/path/to/fixtures cargo test --release -p reglyco-glycoflow --test parity \
+    -- --ignored --nocapture
+```
+
+## Differences from the Python reference
+
+* Random numbers (initial torsions, pucker draws of the 15 non-majority templates, prior samples)
+  come from the engine's SplitMix64, so runs are statistically, not bitwise, equal to Python's.
+* The objective is evaluated in float64 (the reference: float32 on the GPU, including
+  `torch.cdist`), CPU-parallel over candidates with rayon; the network runs on candle (CPU, or
+  CUDA with the `cuda` feature).
+* Symmetry operators come from the embedded table: the model's CRYST1 symbol (else the map
+  header's space-group number) and cell; expansion only for full-cell maps whose cell matches.
+* Maps are resampled with ReGlyco's reader (non-periodic maps must contain the site box).

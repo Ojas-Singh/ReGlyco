@@ -40,6 +40,15 @@ tempfile = "3"
 lto = "thin"
 strip = true
 
+# gemm (candle, via reglyco-glycoflow -> glycoflow-core) inlines fp16 NEON assembly into
+# `fp16`-enabled functions; at opt-level 0 nothing is inlined and the aarch64 assembler rejects
+# it ("instruction requires: fullfp16"). Optimise those crates in dev/test builds too.
+[profile.dev.package.gemm-common]
+opt-level = 3
+
+[profile.dev.package.gemm-f16]
+opt-level = 3
+
 [workspace]
 members = [
     "crates/reglyco-build",
@@ -47,6 +56,7 @@ members = [
     "crates/reglyco-core",
     "crates/reglyco-density",
     "crates/reglyco-ensemble",
+    "crates/reglyco-glycoflow",
     "crates/reglyco-refine",
     "crates/reglyco-relax",
     "crates/reglyco-report",
