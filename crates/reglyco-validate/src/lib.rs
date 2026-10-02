@@ -352,6 +352,24 @@ pub fn validate_with_options(
             continue;
         };
         let length = distance(left.position, right.position);
+        // Metal coordination bonds (LINK records to Zn, Ca, Mg, ...) are
+        // legitimately 2.0-2.6 A; only flag them when clearly broken.
+        if is_metal(&left.element) || is_metal(&right.element) {
+            if length > METAL_BOND_LIMIT_ANGSTROM {
+                finding(
+                    &mut findings,
+                    "geometry.bond_length",
+                    Severity::Error,
+                    "explicit metal coordination bond is implausibly long",
+                    None,
+                    Some(left.residue.clone()),
+                    Some(left.name.clone()),
+                    Some(length),
+                    Some("metal coordination <= 3.0 Å"),
+                );
+            }
+            continue;
+        }
         // PDB connectivity may contain glycosidic, disulfide, and peptide
         // bonds.  A generic physical bound catches malformed records without
         // pretending that one ideal length applies to every element pair.
@@ -744,6 +762,17 @@ pub fn validate_with_options(
     }
 
     for tree in &structure.metadata().glycan_trees {
+        // Like the attachment checks below, a focused validation only judges the
+        // trees attached at the focus sites; other deposited glycans (often written
+        // without CONECT records) must not make the focused site invalid.
+        if !options.focus_sites.is_empty()
+            && !tree
+                .attachment_site
+                .as_ref()
+                .is_some_and(|site| options.focus_sites.contains(site))
+        {
+            continue;
+        }
         if tree.residue_ids.len() > 1 && !tree_is_connected(structure, &tree.residue_ids) {
             finding(
                 &mut findings,
@@ -1356,6 +1385,40 @@ fn ideal_bond_length(left: &str, right: &str) -> f64 {
     }
 }
 
+/// Longest plausible metal coordination bond (Zn/Ca/Mg/... to N/O/S ligands).
+const METAL_BOND_LIMIT_ANGSTROM: f64 = 3.0;
+
+fn is_metal(element: &str) -> bool {
+    matches!(
+        element.trim().to_ascii_uppercase().as_str(),
+        "LI" | "NA"
+            | "K"
+            | "MG"
+            | "CA"
+            | "SR"
+            | "BA"
+            | "MN"
+            | "FE"
+            | "CO"
+            | "NI"
+            | "CU"
+            | "ZN"
+            | "CD"
+            | "HG"
+            | "PT"
+            | "AU"
+            | "AG"
+            | "PB"
+            | "TB"
+            | "YB"
+            | "GD"
+            | "SM"
+            | "EU"
+            | "AL"
+            | "GA"
+    )
+}
+
 fn ideal_bond_length_for_atoms(left: &glysys::StructureAtom, right: &glysys::StructureAtom) -> f64 {
     let names = [
         left.name.trim().to_ascii_uppercase(),
@@ -1690,6 +1753,56 @@ mod tests {
 
     use super::*;
     use glysys::{BuildOptions, read_pdb_str};
+
+    #[test]
+    fn metal_coordination_bonds_use_a_coordination_limit() {
+        let pdb = "HETATM    1 ZN    ZN A 900      10.000  10.000  10.000  1.00  0.00          ZN\nATOM      2  NE2 HIS A  20      12.300  10.000  10.000  1.00  0.00           N\nCONECT    1    2\nEND\n";
+        let structure = read_pdb_str(pdb, &BuildOptions::default()).unwrap();
+        let report = validate_with_options(&structure, &ValidationOptions::default());
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.code == "geometry.bond_length"),
+            "a 2.3 Å Zn-N coordination bond is normal"
+        );
+        assert!(is_metal("Zn") && is_metal(" CA") && !is_metal("C") && !is_metal("N"));
+    }
+
+    #[test]
+    fn focused_validation_ignores_disconnected_trees_at_other_sites() {
+        let pdb = "HETATM    1  C1  NAG B   1      10.000  10.000  10.000  1.00  0.00           C\nHETATM    2  C1  NAG B   2      20.000  10.000  10.000  1.00  0.00           C\nEND\n";
+        let mut structure = read_pdb_str(pdb, &BuildOptions::default()).unwrap();
+        let residue = |chain: &str, number: i32| ResidueId {
+            chain: chain.into(),
+            number,
+            insertion_code: None,
+        };
+        structure
+            .metadata_mut()
+            .glycan_trees
+            .push(glysys::GlycanTree {
+                chain: "B".into(),
+                residue_ids: vec![residue("B", 1), residue("B", 2)],
+                attachment_site: Some(residue("A", 5)),
+            });
+        let code = "topology.disconnected_glycan";
+        let has = |focus: Vec<ResidueId>| {
+            validate_with_options(
+                &structure,
+                &ValidationOptions {
+                    focus_sites: focus,
+                    ..ValidationOptions::default()
+                },
+            )
+            .findings
+            .iter()
+            .any(|f| f.code == code)
+        };
+        assert!(has(Vec::new()));
+        assert!(!has(vec![residue("A", 9)]));
+        assert!(has(vec![residue("A", 5)]));
+    }
 
     #[test]
     fn empty_structure_is_invalid_without_panicking() {
