@@ -99,6 +99,14 @@ pub fn dihedral(a: V3, b: V3, c: V3, d: V3) -> f64 {
     glycoflow_core::geometry::dihedral(a, b, c, d)
 }
 
+/// Polar-polar contact floor of the fitting objective (A). GlycoFlow's sampler guidance uses 2.5
+/// (MD H-bonded minimum); the fit uses 2.6 so refined contacts stay clear of ReGlyco's
+/// validator limit (heavy-atom van der Waals overlap > 0.6 A: O-O < 2.44, N-O < 2.47 A).
+pub const FIT_POLAR_FLOOR: f64 = 2.6;
+/// Floor for carbon-oxygen/nitrogen pairs three bonds apart within the glycan (eclipsed
+/// hydroxymethyl and glycosidic geometries; the validator checks these pairs too).
+pub const FIT_ONE_FOUR_FLOOR: f64 = 2.7;
+
 /// Penalty grids `sum_j relu(floor - d)^2` over environment atoms for a carbon probe and a polar
 /// probe (`problem.clash_grids`), on the density box.
 #[derive(Debug, Clone)]
@@ -121,7 +129,7 @@ impl ClashGrids {
             let (floor_c, floor_p) = if is_c {
                 (CC_FLOOR as f64, C_POLAR_FLOOR as f64)
             } else {
-                (C_POLAR_FLOOR as f64, POLAR_FLOOR as f64)
+                (C_POLAR_FLOOR as f64, FIT_POLAR_FLOOR)
             };
             let base = [0, 1, 2]
                 .map(|a| ((atom.position[a] - origin[a]) / spacing).round_ties_even() as i64);
@@ -434,7 +442,7 @@ impl SiteProblem {
                         if is_c[i] {
                             C_POLAR_FLOOR as f64
                         } else {
-                            POLAR_FLOOR as f64
+                            FIT_POLAR_FLOOR
                         },
                     ));
                 }
@@ -443,13 +451,19 @@ impl SiteProblem {
         let mut self_pairs = Vec::new();
         for i in 0..n {
             for j in i + 1..n {
-                if keep[i] && keep[j] && topo[i * n + j] >= 4 {
+                if !(keep[i] && keep[j]) {
+                    continue;
+                }
+                let t = topo[i * n + j];
+                if t >= 4 {
                     let floor = match (is_c[i], is_c[j]) {
-                        (true, true) => CC_FLOOR,
-                        (false, false) => POLAR_FLOOR,
-                        _ => C_POLAR_FLOOR,
+                        (true, true) => CC_FLOOR as f64,
+                        (false, false) => FIT_POLAR_FLOOR,
+                        _ => C_POLAR_FLOOR as f64,
                     };
-                    self_pairs.push((i, j, floor));
+                    self_pairs.push((i, j, floor as _));
+                } else if t == 3 && is_c[i] != is_c[j] {
+                    self_pairs.push((i, j, FIT_ONE_FOUR_FLOOR as _));
                 }
             }
         }
