@@ -15,7 +15,8 @@ use crate::error::{Result, invalid, write_file};
 use crate::evaluation::{Recovery, recovery};
 use crate::model::GlycoflowModel;
 use crate::output::{
-    PlacedGlycan, ResidueNaming, candidates_pdb, fitted_structure, residue_naming,
+    PlacedGlycan, ResidueNaming, candidates_pdb, fitted_structure, overlapping_water_count,
+    residue_naming,
 };
 use crate::pipeline::{
     FitConfig, FitOutcome, PriorConfig, SigmaCalibration, build_prior, calibrate_sigma,
@@ -333,6 +334,7 @@ pub fn run(input: &WorkflowInput) -> Result<WorkflowResult> {
             x: &f.outcome.basins[f.outcome.best].x,
         })
         .collect();
+    let waters_removed = overlapping_water_count(&protein, &best_glycans);
     let fitted = fitted_structure(&protein, &best_glycans)?;
     // candidate models: per site, best, alternatives and prior completions (others at their best)
     let mut models: Vec<(String, Vec<PlacedGlycan>)> = Vec::new();
@@ -415,6 +417,8 @@ pub fn run(input: &WorkflowInput) -> Result<WorkflowResult> {
         "sites": fits.iter().map(|f| site_report(f, input)).collect::<Vec<_>>(),
         "validation": validation.as_ref().map(|v| json!({"valid": v.valid, "errors": v.errors.len(), "warnings": v.warnings.len()})),
         "validation_error": validation_error,
+        "waters_removed": {"count": waters_removed, "cutoff_angstrom": crate::output::WATER_OVERLAP_ANGSTROM,
+                           "note": "deposited waters overlapping the fitted glycan are dropped from fitted.pdb/candidates.pdb"},
         "wall_seconds": started.elapsed().as_secs_f64(),
         "peak_rss_mb": peak_rss_mb(),
     });

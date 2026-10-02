@@ -214,9 +214,65 @@ fn protein_records(protein: &Structure) -> (Vec<String>, Vec<String>, Vec<String
     (head, body, conect, max_serial)
 }
 
+/// Deposited waters closer than this to a fitted glycan heavy atom are removed from the output:
+/// the objective ignores waters on purpose (a model built without the glycan may have placed
+/// waters into glycan density), so overlapping waters are artefacts of the replacement.
+pub const WATER_OVERLAP_ANGSTROM: f64 = 2.6;
+
+fn is_water_record(line: &str) -> bool {
+    (line.starts_with("HETATM") || line.starts_with("ATOM"))
+        && matches!(
+            line.get(17..20).map(str::trim),
+            Some("HOH" | "WAT" | "DOD" | "H2O")
+        )
+}
+
+fn record_position(line: &str) -> Option<[f64; 3]> {
+    Some([
+        line.get(30..38)?.trim().parse().ok()?,
+        line.get(38..46)?.trim().parse().ok()?,
+        line.get(46..54)?.trim().parse().ok()?,
+    ])
+}
+
+/// Body records without the waters that overlap any fitted glycan atom, and how many were removed.
+fn without_overlapping_waters(body: &[String], glycans: &[PlacedGlycan]) -> (Vec<String>, usize) {
+    let limit = WATER_OVERLAP_ANGSTROM * WATER_OVERLAP_ANGSTROM;
+    let mut removed = 0;
+    let kept = body
+        .iter()
+        .filter(|line| {
+            if !is_water_record(line) {
+                return true;
+            }
+            let Some(p) = record_position(line) else {
+                return true;
+            };
+            let overlaps = glycans.iter().any(|g| {
+                g.x.iter()
+                    .skip(1)
+                    .any(|a| (0..3).map(|i| (a[i] - p[i]).powi(2)).sum::<f64>() < limit)
+            });
+            if overlaps {
+                removed += 1;
+            }
+            !overlaps
+        })
+        .cloned()
+        .collect();
+    (kept, removed)
+}
+
+/// Number of deposited waters that the output drops because they overlap the fitted glycans.
+pub fn overlapping_water_count(protein: &Structure, glycans: &[PlacedGlycan]) -> usize {
+    let (_, body, _, _) = protein_records(protein);
+    without_overlapping_waters(&body, glycans).1
+}
+
 /// The protein (target glycans already removed) with the fitted glycans, as a GlySys structure.
 pub fn fitted_structure(protein: &Structure, glycans: &[PlacedGlycan]) -> Result<Structure> {
     let (head, body, conect, max_serial) = protein_records(protein);
+    let (body, _) = without_overlapping_waters(&body, glycans);
     let (atoms, g_conect, links) = glycan_records(glycans, max_serial + 1)?;
     let mut text = Vec::new();
     text.extend(head);
@@ -255,7 +311,7 @@ pub fn candidates_pdb(
             glycan_conect = g_conect;
         }
         out.push(format!("MODEL     {:>4}", k + 1));
-        out.extend(body.iter().cloned());
+        out.extend(without_overlapping_waters(&body, glycans).0);
         out.extend(atoms);
         out.push("TER".into());
         out.push("ENDMDL".into());
