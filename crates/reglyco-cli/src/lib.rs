@@ -18,24 +18,18 @@ use reglyco_core::{
     SearchBudgetResolution, SearchConfig, SearchScoringMode, SearchSelectionPolicy, SearchSite,
 };
 use reglyco_density::rcsb::{RcsbMapAcquisition, fetch_2fo_fc_map};
-use reglyco_density::{
-    DensityKernelProfile, DensityMap, DensityScoreOptions, DensityScorer, DensityTarget,
-};
+use reglyco_density::{DensityMap, DensityScoreOptions, DensityScorer, DensityTarget};
 use reglyco_ensemble::{
     CachingProvider, EnsembleProvider, GlycoShapeProvider, LocalBundleProvider, SearchPhase,
     SearchProgress, build_from_outcome, calculate_sasa, configure_threads, resolve_search_budget,
     sample_attached_ensemble, search, search_with_progress, steric_site_scores,
 };
-use reglyco_refine::{
-    DensityDeepStrategy, DensityEffort, DensityRefinementConfig, DensitySearchStrategy,
-    RefineObjective, RefineProgress, RefineRequest, refine_with_progress,
-};
+use reglyco_refine::{RefineProgress, RefineRequest, refine_with_progress};
 use reglyco_relax::{MovableSelection, RelaxOptions, RelaxProgress, relax_with_progress};
 use reglyco_report::{
-    ClusterObservation, DensityAnalysis, DensityArmAlternativeAnalysis, DensityArmAnalysis,
-    DensityBaselineAnalysis, DensityBasinAnalysis, DensityKernelAnalysis, DensityRecoveryAnalysis,
-    DensitySiteAnalysis, DensityStageAnalysis, EnsembleAnalysis, Provenance, ReportAnalysis,
-    SamplingSegmentAnalysis, ScanAnalysis, ScanSequon, ValidationAnalysis, WorkflowReport,
+    ClusterObservation, DensityAnalysis, DensitySiteAnalysis, EnsembleAnalysis, Provenance,
+    ReportAnalysis, SamplingSegmentAnalysis, ScanAnalysis, ScanSequon, ValidationAnalysis,
+    WorkflowReport,
 };
 use sha2::{Digest, Sha256};
 
@@ -63,7 +57,9 @@ enum Command {
     Search(SearchArgs),
     /// Minimize an already assembled structure in vacuum or with opt-in OBC2 GBSA.
     Relax(RelaxArgs),
-    /// Run search, build, parameterization, and relaxation.
+    /// Run search, build, parameterization, and relaxation (`--objective steric`), or fit the
+    /// glycans at `--replace-glycan` sites into a density map with GlycoFlow
+    /// (`--objective density`).
     Refine(RefineArgs),
     /// Attach GlcNAc to every unoccupied N-X-S/T sequon.
     Scan(ScanArgs),
@@ -440,80 +436,35 @@ struct RefineArgs {
     relaxation: RelaxCommon,
     #[arg(long)]
     solvate: bool,
-    /// Refinement objective. For PDB-ID workflows, density defaults to the
-    /// cached/remote `auto` map resolver; local workflows may still provide a
-    /// sidecar or explicit `--density-map` path.
+    /// Refinement objective: `steric` (ensemble search + energy relaxation) or `density`
+    /// (GlycoFlow fit of the glycan at each `--replace-glycan` site; needs
+    /// `--glycoflow-model` or $GLYCOFLOW_MODEL).
     #[arg(long, value_enum, default_value_t = ObjectiveArg::Steric)]
     objective: ObjectiveArg,
-    /// CCP4/MRC map path, or `auto` for a nearby map/EDS download.
+    /// CCP4/MRC map path, or `auto` for a nearby sidecar map or (with --pdb-id) a PDBe EDS /
+    /// RCSB 2Fo-Fc download.
     #[arg(long)]
     density_map: Option<String>,
+    /// Atom width of the density model (default: calibrated on the protein around each site).
     #[arg(long)]
     density_sigma: Option<f64>,
+    /// Map resolution (default: the model's REMARK 2 RESOLUTION record).
     #[arg(long)]
     density_resolution: Option<f64>,
-    #[arg(long)]
-    density_periodic: bool,
-    #[arg(long, default_value_t = 2.0)]
-    density_mask_radius: f64,
-    #[arg(long, default_value_t = 1.0)]
-    density_mask_falloff: f64,
-    /// Optional post-fit force-field relaxation. Density fitting itself never
-    /// parameterizes or evaluates energy unless this is explicitly enabled.
-    #[arg(long, value_enum, default_value_t = PostRelaxArg::None)]
-    post_relax: PostRelaxArg,
-    /// Margin around the fitted glycan when writing local visualization maps.
-    #[arg(long, default_value_t = 8.0)]
-    density_crop_margin: f64,
-    /// Density search strategy. Adaptive is the evidence-driven default;
-    /// swarm and staged are retained for diagnostic compatibility.
-    #[arg(long = "density-search", value_enum, default_value_t = DensitySearchArg::Adaptive)]
-    density_search: DensitySearchArg,
-    /// Adaptive fitting effort. This controls evidence-driven escalation and
-    /// does not impose a wall-clock cutoff.
-    #[arg(long = "density-effort", value_enum, default_value_t = DensityEffortArg::Adaptive)]
-    density_effort: DensityEffortArg,
-    /// Deep solver implementation. Frontier is the fast residue-wise
-    /// density solver; ring-graph detects residue-sized density components
-    /// and connects them with the requested topology; legacy-global is
-    /// retained for diagnostics.
-    #[arg(long = "density-deep-strategy", value_enum, default_value_t = DensityDeepStrategyArg::Frontier)]
-    density_deep_strategy: DensityDeepStrategyArg,
-    /// Optional emergency per-site optimization ceiling in seconds. Normal
-    /// adaptive fitting stops by convergence and has no wall-clock cutoff.
-    #[arg(long = "density-time-limit")]
-    density_time_limit: Option<f64>,
-    /// Posterior mass covered by the alternate-model bundle.
-    #[arg(long = "density-credible-mass", default_value_t = 0.95)]
-    density_credible_mass: f64,
-    /// Maximum number of structurally diverse alternate models.
-    #[arg(long = "density-max-alternates", default_value_t = 10)]
-    density_max_alternates: usize,
-    /// Parent-gated residue support threshold used by density diagnostics.
-    #[arg(long = "density-support-threshold", default_value_t = 0.60)]
-    density_support_threshold: f64,
     /// Map acquisition source for `--density-map auto`.
     #[arg(long = "density-map-source", value_enum, default_value_t = DensityMapSourceArg::Auto)]
     density_map_source: DensityMapSourceArg,
-    /// Optional Fo-Fc difference map: `auto`, `none`, or a CCP4/MRC path.
-    /// Auto is used for PDB-ID workflows and silently falls back to primary
-    /// density when the provider has no difference map.
-    #[arg(long = "density-difference-map")]
-    density_difference_map: Option<String>,
     /// RCSB VolumeServer detail level (0 is native; larger values are more
     /// aggressively downsampled).
     #[arg(long = "density-map-detail", default_value_t = 4)]
     density_map_detail: u8,
-    #[arg(long = "density-site")]
-    density_sites: Vec<String>,
-    /// Optional density objective failsafe. The normal stopping rule is the
-    /// phase deadline and convergence, not a fixed evaluation budget.
-    #[arg(long)]
-    max_density_evaluations: Option<usize>,
+    /// Deprecated: density refinement always uses GlycoFlow. Accepted only as `glycoflow`.
+    #[arg(long = "density-search", hide = true)]
+    density_search: Option<String>,
     /// Remove the exact glycan tree at a site before fitting a replacement.
-    /// Repeat as `SITE` or `SITE=SOURCE`; when `SOURCE` is present it also
-    /// supplies the replacement ensemble, so --attach is optional.
-    /// With `--density-search glycoflow`, SOURCE may be a GLYCAM sequence.
+    /// Repeat as `SITE` or `SITE=SOURCE`. With `--objective steric`, SOURCE supplies the
+    /// replacement ensemble (so --attach is optional); with `--objective density`, SOURCE may
+    /// be a GLYCAM sequence (default: the deposited glycan's sequence).
     #[arg(long = "replace-glycan")]
     replace_glycans: Vec<String>,
     #[arg(long)]
@@ -522,20 +473,9 @@ struct RefineArgs {
     glycoflow: glycoflow::GlycoflowArgs,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-struct RecoveryMeasurement {
-    site: String,
-    root_c1_distance_angstrom: Option<f64>,
-    three_residue_heavy_atom_rmsd_angstrom: Option<f64>,
-    supported_heavy_atom_rmsd_angstrom: Option<f64>,
-    full_tree_heavy_atom_rmsd_angstrom: Option<f64>,
-    per_residue_heavy_atom_rmsd_angstrom: std::collections::BTreeMap<String, f64>,
-    arm_heavy_atom_rmsd_angstrom: std::collections::BTreeMap<String, f64>,
-}
-
 /// A carbohydrate component discovered from the deposited PDB connectivity.
 /// This is an input/preflight record only: its coordinates are never passed to
-/// the density optimizer.
+/// the search.
 #[derive(Debug, Clone, serde::Serialize)]
 struct DiscoveredGlycanSite {
     site: ResidueId,
@@ -553,36 +493,6 @@ struct DiscoveredGlycanSite {
 enum ObjectiveArg {
     Steric,
     Density,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum PostRelaxArg {
-    None,
-    Energy,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum DensitySearchArg {
-    Adaptive,
-    Swarm,
-    Staged,
-    /// GlycoFlow observation-guided generation of the glycan of known sequence
-    /// (crate reglyco-glycoflow; needs --glycoflow-model or $GLYCOFLOW_MODEL).
-    Glycoflow,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum DensityEffortArg {
-    Fast,
-    Adaptive,
-    Deep,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum DensityDeepStrategyArg {
-    Frontier,
-    LegacyGlobal,
-    RingGraph,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1330,10 +1240,18 @@ fn run_relax(arguments: RelaxArgs) -> anyhow::Result<()> {
 
 fn run_refine(arguments: RefineArgs) -> anyhow::Result<()> {
     let started = Instant::now();
-    if matches!(arguments.density_search, DensitySearchArg::Glycoflow) {
+    if let Some(search) = arguments.density_search.as_deref() {
+        if !search.eq_ignore_ascii_case("glycoflow") {
+            anyhow::bail!(
+                "--density-search {search} was removed together with the legacy density fitter; \
+                 `--objective density` always fits with GlycoFlow (drop --density-search)"
+            );
+        }
         if !matches!(arguments.objective, ObjectiveArg::Density) {
             anyhow::bail!("--density-search glycoflow requires --objective density");
         }
+    }
+    if matches!(arguments.objective, ObjectiveArg::Density) {
         return glycoflow::run_refine_glycoflow(arguments, started);
     }
     let quiet = arguments.common.quiet;
@@ -1425,10 +1343,6 @@ fn run_refine(arguments: RefineArgs) -> anyhow::Result<()> {
     }
     let (mut protein, sites, dry_builder, search_config) =
         load_search_with_anomers(&search_arguments, Some(&discovered_anomers))?;
-    // Keep a private copy only for post-fit diagnostics.  The density scorer
-    // and optimizer receive the stripped structure and never consult this
-    // recovery reference.
-    let recovery_reference = (!replacement_requests.is_empty()).then(|| protein.clone());
     if !quiet {
         let conformers = sites
             .iter()
@@ -1467,264 +1381,17 @@ fn run_refine(arguments: RefineArgs) -> anyhow::Result<()> {
             })
         })
         .transpose()?;
-    let objective = match arguments.objective {
-        ObjectiveArg::Steric => RefineObjective::StericEnergy,
-        ObjectiveArg::Density => {
-            let map_value = arguments.density_map.as_deref().unwrap_or("auto");
-            if !quiet {
-                eprintln!("refine: resolving density map {map_value} (cache/EDS/sidecar)...");
-            }
-            let (map_path, rcsb_acquisition) = resolve_density_map_for_refine(
-                map_value,
-                arguments.common.protein.protein.as_deref(),
-                Some(&arguments.common.protein),
-                arguments.density_map_source,
-                arguments.density_map_detail,
-            )?;
-            if !quiet {
-                eprintln!("refine: opening density map {}...", map_path.display());
-            }
-            let mut map = DensityMap::open(&map_path)?;
-            if let Some(acquisition) = &rcsb_acquisition {
-                map.set_provenance(
-                    "rcsb",
-                    Some(acquisition.channel.clone()),
-                    Some(acquisition.source_url.clone()),
-                    Some(acquisition.raw_sha256.clone()),
-                    Some(acquisition.raw_cache_path.clone()),
-                    Some(acquisition.detail),
-                );
-            } else if map_value == "auto" && arguments.common.protein.pdb_id.is_some() {
-                // This branch is reached for the explicit PDBe source and
-                // for an automatic RCSB→PDBe fallback.  Keep that distinction
-                // in the result bundle instead of leaving a converted map
-                // provenance-free.
-                let identifier = arguments
-                    .common
-                    .protein
-                    .pdb_id
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                map.set_provenance(
-                    "pdbe",
-                    Some("EDS".into()),
-                    Some(format!(
-                        "https://www.ebi.ac.uk/pdbe/coordinates/files/{identifier}.ccp4"
-                    )),
-                    None,
-                    Some(map_path.clone()),
-                    None,
-                );
-            }
-            if !quiet {
-                eprintln!(
-                    "refine: map ready ({}x{}x{}, mode {}, SHA-256 {}); periodic={}",
-                    map.metadata().nx,
-                    map.metadata().ny,
-                    map.metadata().nz,
-                    map.metadata().mode,
-                    &map.metadata().sha256[..12.min(map.metadata().sha256.len())],
-                    arguments.density_periodic || map.is_full_unit_cell()
-                );
-            }
-            let mut options = DensityScoreOptions {
-                sigma_angstrom: arguments.density_sigma,
-                glycan_b_factor: None,
-                periodic: arguments.density_periodic || map.is_full_unit_cell(),
-                mask_radius_angstrom: arguments.density_mask_radius,
-                mask_falloff_angstrom: arguments.density_mask_falloff,
-                support_threshold: arguments.density_support_threshold,
-            };
-            if let Some(resolution) = arguments.density_resolution {
-                options = options.with_resolution(resolution)?;
-            }
-            let calibration_sites = if arguments.density_sites.is_empty() {
-                search_arguments
-                    .attachments
-                    .iter()
-                    .filter_map(|attachment| attachment.split_once('=').map(|(site, _)| site))
-                    .map(parse_site)
-                    .collect::<anyhow::Result<Vec<_>>>()?
-            } else {
-                arguments
-                    .density_sites
-                    .iter()
-                    .map(|site| parse_site(site))
-                    .collect::<anyhow::Result<Vec<_>>>()?
-            };
-            let sigma_calibration =
-                if arguments.density_sigma.is_none() && arguments.density_resolution.is_none() {
-                    if std::env::var_os("REGLYCO_DENSITY_DEBUG").is_some() {
-                        eprintln!("refine: density sigma calibration (automatic)");
-                    }
-                    let calibration = DensityScorer::calibrate_sigma_from_protein(
-                        &map,
-                        &protein,
-                        &calibration_sites,
-                        options,
-                        &[0.65, 0.80, 1.00, 1.20, 1.40, 1.70],
-                    )?;
-                    options.sigma_angstrom = Some(calibration.selected_sigma_angstrom);
-                    // Automatic mode uses one kernel model for every effort:
-                    // protein B factors and the fallback B assigned to
-                    // generated glycan atoms must be treated identically.
-                    options.glycan_b_factor = Some(calibration.estimated_glycan_b_factor);
-                    if !quiet {
-                        eprintln!(
-                            "refine: calibrated density sigma {:.2} Å from {} nearby protein atoms",
-                            calibration.selected_sigma_angstrom,
-                            calibration
-                                .trials
-                                .first()
-                                .map(|trial| trial.atom_count)
-                                .unwrap_or_default()
-                        );
-                    }
-                    Some(calibration)
-                } else {
-                    // Even with an explicit map sigma, generated GlycoShape
-                    // atoms have no deposited B value. Estimate one fixed
-                    // site B from the protein shell without changing the
-                    // expert-selected sigma.
-                    if std::env::var_os("REGLYCO_DENSITY_DEBUG").is_some() {
-                        eprintln!("refine: density B-factor calibration (explicit sigma)");
-                    }
-                    if let Ok(calibration) = DensityScorer::calibrate_sigma_from_protein(
-                        &map,
-                        &protein,
-                        &calibration_sites,
-                        options,
-                        &[options.sigma_angstrom.unwrap_or(1.0)],
-                    ) {
-                        // An explicit sigma disables the automatic multiscale
-                        // bank, but it does not make generated glycan atoms
-                        // magically B-free.  Use the same fixed shell B in
-                        // Fast, Adaptive, and Deep so the expert override is
-                        // reproducible without reintroducing the old
-                        // protein/glycan kernel mismatch.
-                        options.glycan_b_factor = Some(calibration.estimated_glycan_b_factor);
-                    }
-                    if std::env::var_os("REGLYCO_DENSITY_DEBUG").is_some() {
-                        eprintln!("refine: density kernel calibration complete");
-                    }
-                    None
-                };
-            let auto_kernel_profile =
-                sigma_calibration
-                    .as_ref()
-                    .map(|calibration| DensityKernelProfile {
-                        map_sigma_angstrom: calibration.selected_sigma_angstrom,
-                        fallback_b_factor: Some(calibration.estimated_glycan_b_factor),
-                        scales: calibration.search_scales.clone(),
-                        residue_kernels: calibration.residue_kernels.clone(),
-                        element_weighted: true,
-                    });
-            let scorer = DensityScorer::new(map, options).map(|scorer| {
-                auto_kernel_profile
-                    .clone()
-                    .map_or(scorer.clone(), |profile| {
-                        scorer.with_kernel_profile(profile)
-                    })
-            })?;
-            let difference = resolve_difference_map_for_refine(
-                arguments.density_difference_map.as_deref(),
-                &arguments.common.protein,
-            )?;
-            let difference_scorer = difference
-                .as_ref()
-                .map(|(path, url)| {
-                    let mut map = DensityMap::open(path)?;
-                    if let Some(url) = url {
-                        map.set_provenance(
-                            "pdbe",
-                            Some("Fo-Fc".into()),
-                            Some(url.clone()),
-                            None,
-                            Some(path.clone()),
-                            None,
-                        );
-                    }
-                    DensityScorer::new(map, options).map(|scorer| {
-                        auto_kernel_profile
-                            .clone()
-                            .map_or(scorer.clone(), |profile| {
-                                scorer.with_kernel_profile(profile)
-                            })
-                    })
-                })
-                .transpose()?;
-            let targets = calibration_sites
-                .into_iter()
-                .map(|site| DensityTarget {
-                    site,
-                    glycan_residues: Vec::new(),
-                })
-                .collect();
-            let mut config = DensityRefinementConfig::new(scorer, targets);
-            config.difference_scorer = difference_scorer;
-            config.difference_map_url = difference.and_then(|(_, url)| url);
-            config.sigma_calibration = sigma_calibration;
-            if let Some(acquisition) = rcsb_acquisition {
-                config.map_url = Some(acquisition.source_url);
-            } else if map_value == "auto" {
-                if let Some(identifier) = &arguments.common.protein.pdb_id {
-                    config.map_url = Some(format!(
-                        "https://www.ebi.ac.uk/pdbe/coordinates/files/{}.ccp4",
-                        identifier.to_ascii_lowercase()
-                    ));
-                }
-            }
-            config.max_evaluations = arguments.max_density_evaluations;
-            config.search_strategy = match arguments.density_search {
-                DensitySearchArg::Adaptive => DensitySearchStrategy::Adaptive,
-                DensitySearchArg::Swarm => DensitySearchStrategy::Swarm,
-                DensitySearchArg::Staged => DensitySearchStrategy::Staged,
-                DensitySearchArg::Glycoflow => unreachable!("handled by run_refine_glycoflow"),
-            };
-            config.effort = match arguments.density_effort {
-                DensityEffortArg::Fast => DensityEffort::Fast,
-                DensityEffortArg::Adaptive => DensityEffort::Adaptive,
-                DensityEffortArg::Deep => DensityEffort::Deep,
-            };
-            config.deep_strategy = match arguments.density_deep_strategy {
-                DensityDeepStrategyArg::Frontier => DensityDeepStrategy::Frontier,
-                DensityDeepStrategyArg::LegacyGlobal => DensityDeepStrategy::LegacyGlobal,
-                DensityDeepStrategyArg::RingGraph => DensityDeepStrategy::RingGraph,
-            };
-            config.time_limit_seconds = arguments.density_time_limit;
-            if !(0.0..=1.0).contains(&arguments.density_credible_mass) {
-                anyhow::bail!("--density-credible-mass must be between 0 and 1");
-            }
-            if arguments.density_max_alternates == 0 {
-                anyhow::bail!("--density-max-alternates must be positive");
-            }
-            config.credible_mass = arguments.density_credible_mass;
-            config.max_alternates = arguments.density_max_alternates;
-            config.support_threshold = arguments.density_support_threshold;
-            config.post_relax_energy = matches!(arguments.post_relax, PostRelaxArg::Energy);
-            config.crop_margin_angstrom = arguments.density_crop_margin;
-            RefineObjective::Density(config)
-        }
-    };
     let result = refine_with_progress(
         RefineRequest {
             protein,
-            // The pre-strip protein keeps the deposited neighbor glycans as
-            // fixed nuisance for multi-site Adaptive fitting.  It is never
-            // used to fit or rank the current target site.
-            nuisance_protein: recovery_reference.clone(),
             sites,
             search: search_config,
             relaxation,
-            objective,
         },
         &dry_builder,
         final_builder.as_ref(),
         |event| print_refine_progress(event, quiet, started),
     )?;
-    let density_only = result.density.is_some() && result.relaxation.is_none();
-    let mut density_recovery: Option<Vec<RecoveryMeasurement>> = None;
     if !quiet {
         eprintln!(
             "refine: optimization complete in {:.1}s; writing output bundle...",
@@ -1738,15 +1405,6 @@ fn run_refine(arguments: RefineArgs) -> anyhow::Result<()> {
             &discovered_glycans,
         )?;
     }
-    if density_only {
-        // An overwrite run must not leave a relaxation artifact produced by
-        // an earlier `--post-relax energy` invocation in the density-only
-        // bundle.
-        let stale_relaxation = arguments.common.output.join("relaxation.json");
-        if stale_relaxation.is_file() {
-            std::fs::remove_file(stale_relaxation)?;
-        }
-    }
     write_pdb(
         &result.initial.structure,
         arguments.common.output.join("fitted.pdb"),
@@ -1755,374 +1413,24 @@ fn run_refine(arguments: RefineArgs) -> anyhow::Result<()> {
         &result.relaxed_structure,
         arguments.common.output.join("structure.pdb"),
     )?;
-    let mut search_json = serde_json::to_value(&result.search)?;
-    if let Some(fit) = &result.density
-        && let Some(object) = search_json.as_object_mut()
-    {
-        object.insert(
-            "density".into(),
-            serde_json::json!({
-                "evaluations": fit.evaluations,
-                "max_evaluations": fit.max_evaluations,
-                "rejection_count": fit.rejection_count,
-                "stopping_reason": fit.stopping_reason,
-                "optimizer": fit.optimizer,
-                "stages": fit.stages,
-                "timings": fit.timings,
-                "candidate_ordering": "posterior_desc, correlation_desc, conformer_id_asc",
-                "candidates": fit.candidates.iter().map(|candidate| serde_json::json!({
-                    "rank": candidate.rank,
-                    "correlation": candidate.correlation,
-                    "support_score": candidate.support_score,
-                    "posterior_weight": candidate.posterior_weight,
-                    "cumulative_posterior": candidate.cumulative_posterior,
-                    "likelihood_gain": candidate.likelihood_gain,
-                    "prior_log_probability": candidate.prior_log_probability,
-                    "active_residues": candidate.active_residues,
-                    "unsupported_residues": candidate.unsupported_residues,
-                    "conformer_ids": candidate.conformer_ids,
-                    "stage": candidate.stage,
-                    "angles_degrees": candidate.angles_degrees,
-                    "glycosidic_torsion_offsets_degrees": candidate.glycosidic_torsion_offsets_degrees,
-                })).collect::<Vec<_>>(),
-            }),
-        );
-    }
-    if density_only {
-        strip_density_energy_fields(&mut search_json);
-    }
-    write_json(arguments.common.output.join("search.json"), &search_json)?;
+    write_json(arguments.common.output.join("search.json"), &result.search)?;
     if let Some(relaxation) = &result.relaxation {
         write_json(arguments.common.output.join("relaxation.json"), relaxation)?;
     }
-    if let Some(fit) = &result.density {
-        if !quiet {
-            eprintln!("refine: final density scoring and writing visualization maps...");
-        }
-        let target_sites = if arguments.density_sites.is_empty() {
-            search_arguments
-                .attachments
-                .iter()
-                .filter_map(|attachment| attachment.split_once('=').map(|(site, _)| site))
-                .map(parse_site)
-                .collect::<anyhow::Result<Vec<_>>>()?
-        } else {
-            arguments
-                .density_sites
-                .iter()
-                .map(|site| parse_site(site))
-                .collect::<anyhow::Result<Vec<_>>>()?
-        };
-        let targets = target_sites
-            .into_iter()
-            .map(|site| DensityTarget {
-                site,
-                glycan_residues: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        let recovery = recovery_reference.as_ref().map(|reference| {
-            recovery_measurements(
-                reference,
-                &result.relaxed_structure,
-                &targets,
-                &fit.pre_relax,
-                &fit.arm_evidence,
-            )
-        });
-        write_density_fit_outputs(
-            fit,
-            &result.relaxed_structure,
-            &targets,
-            arguments.common.output.as_path(),
-            recovery.as_deref(),
-        )?;
-        for site in &fit.independent_sites {
-            let site_dir = arguments
-                .common
-                .output
-                .join("sites")
-                .join(site.site.to_string().replace(':', "_"));
-            std::fs::create_dir_all(&site_dir)?;
-            write_pdb(&site.structure, site_dir.join("fitted.pdb"))?;
-            write_json(
-                site_dir.join("density.json"),
-                &serde_json::json!({
-                    "site": site.site,
-                    "evaluations": site.evaluations,
-                    "seconds": site.seconds,
-                    "score": site.score,
-                    "warnings": site.warnings,
-                    "ownership": site.ownership,
-                    "arm_evidence": site.arm_evidence,
-                }),
-            )?;
-        }
-        density_recovery = recovery;
-    }
     if !quiet {
-        eprintln!("refine: validating fitted structure and density diagnostics...");
+        eprintln!("refine: validating fitted structure...");
     }
-    let mut validation_options = reglyco_validate::ValidationOptions::default();
-    if result.density.is_some() {
-        validation_options.focus_sites = if arguments.density_sites.is_empty() {
-            search_arguments
-                .attachments
-                .iter()
-                .filter_map(|attachment| attachment.split_once('=').map(|(site, _)| site))
-                .map(parse_site)
-                .collect::<anyhow::Result<Vec<_>>>()?
-        } else {
-            arguments
-                .density_sites
-                .iter()
-                .map(|site| parse_site(site))
-                .collect::<anyhow::Result<Vec<_>>>()?
-        };
-    }
-    let mut validation =
-        reglyco_validate::validate_with_options(&result.relaxed_structure, &validation_options);
-    if let Some(fit) = &result.density {
-        validation.density = fit
-            .post_relax
-            .clone()
-            .or_else(|| Some(fit.pre_relax.clone()));
-    }
+    let validation = reglyco_validate::validate_with_options(
+        &result.relaxed_structure,
+        &reglyco_validate::ValidationOptions::default(),
+    );
     write_json(arguments.common.output.join("validation.json"), &validation)?;
     let mut report = result.report;
-    if let Some(fit) = &result.density {
-        report.analysis.density = Some(DensityAnalysis {
-            pre_relax_correlation: fit.pre_relax.correlation,
-            sigma_angstrom: Some(fit.pre_relax.sigma_angstrom),
-            effective_sigma_angstrom: fit
-                .sigma_calibration
-                .as_ref()
-                .map(|calibration| calibration.effective_sigma_angstrom),
-            capture_sigma_angstrom: fit
-                .sigma_calibration
-                .as_ref()
-                .map(|calibration| calibration.capture_sigma_angstrom),
-            anti_alias_floor_angstrom: fit
-                .sigma_calibration
-                .as_ref()
-                .map(|calibration| calibration.anti_alias_floor_angstrom),
-            voxel_spacing_angstrom: fit
-                .sigma_calibration
-                .as_ref()
-                .map(|calibration| calibration.voxel_spacing_angstrom)
-                .unwrap_or([0.0; 3]),
-            training_likelihood_gain: Some(fit.pre_relax.training_likelihood_gain),
-            heldout_likelihood_gain: Some(fit.pre_relax.heldout_likelihood_gain),
-            difference_score: fit
-                .difference_map
-                .as_ref()
-                .map(|_| fit.pre_relax.difference_score),
-            post_relax_correlation: fit.post_relax.as_ref().map(|score| score.correlation),
-            evaluations: fit.evaluations,
-            graph_evaluations: fit.optimizer.graph_evaluations,
-            ring_hypothesis_count: fit.ring_hypotheses.len(),
-            estimated_glycan_b_factor: fit
-                .sigma_calibration
-                .as_ref()
-                .map(|calibration| calibration.estimated_glycan_b_factor),
-            candidate_correlations: fit
-                .candidates
-                .iter()
-                .map(|candidate| candidate.correlation)
-                .collect(),
-            candidate_posterior_weights: fit
-                .candidates
-                .iter()
-                .map(|candidate| candidate.posterior_weight)
-                .collect(),
-            density_determined_residues: fit
-                .pre_relax
-                .residue_support
-                .iter()
-                .filter(|support| support.supported)
-                .map(|support| support.residue.to_string())
-                .collect(),
-            ensemble_prior_residues: fit
-                .pre_relax
-                .residue_support
-                .iter()
-                .filter(|support| !support.supported)
-                .map(|support| support.residue.to_string())
-                .collect(),
-            warnings: fit.warnings.clone(),
-            optimization_seconds: Some(fit.timings.optimization_seconds),
-            relaxation_seconds: fit.timings.relaxation_seconds,
-            total_seconds: Some(fit.timings.total_seconds),
-            stage_timings: fit
-                .timings
-                .stages
-                .iter()
-                .map(|stage| DensityStageAnalysis {
-                    stage: stage.stage.clone(),
-                    seconds: stage.seconds,
-                    evaluations: stage.evaluations,
-                })
-                .collect(),
-            supported_atom_fraction: Some(fit.pre_relax.supported_atom_fraction),
-            ring_support: Some(fit.pre_relax.ring_support),
-            connectivity_support: Some(fit.pre_relax.connectivity_support),
-            site_diagnostics: fit
-                .pre_relax
-                .sites
-                .iter()
-                .map(|site| DensitySiteAnalysis {
-                    site: site.site.to_string(),
-                    correlation: site.correlation,
-                    voxel_count: site.voxel_count,
-                    supported_atom_fraction: site.supported_atom_fraction,
-                    ring_support: site.ring_support,
-                    connectivity_support: site.connectivity_support,
-                })
-                .collect(),
-            recovery: density_recovery
-                .as_ref()
-                .map(|values| {
-                    values
-                        .iter()
-                        .map(|value| DensityRecoveryAnalysis {
-                            site: value.site.clone(),
-                            root_c1_distance_angstrom: value.root_c1_distance_angstrom,
-                            three_residue_heavy_atom_rmsd_angstrom: value
-                                .three_residue_heavy_atom_rmsd_angstrom,
-                            supported_heavy_atom_rmsd_angstrom: value
-                                .supported_heavy_atom_rmsd_angstrom,
-                            full_tree_heavy_atom_rmsd_angstrom: value
-                                .full_tree_heavy_atom_rmsd_angstrom,
-                            per_residue_heavy_atom_rmsd_angstrom: value
-                                .per_residue_heavy_atom_rmsd_angstrom
-                                .clone(),
-                            arm_heavy_atom_rmsd_angstrom: value
-                                .arm_heavy_atom_rmsd_angstrom
-                                .clone(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            ensemble_baselines: fit
-                .ensemble_baselines
-                .iter()
-                .map(|baseline| DensityBaselineAnalysis {
-                    kind: baseline.kind.clone(),
-                    conformer_ids: baseline.conformer_ids.clone(),
-                    correlation: baseline.correlation,
-                    likelihood_gain: baseline.likelihood_gain,
-                    rmsd_to_fitted_angstrom: baseline.rmsd_to_fitted_angstrom,
-                })
-                .collect(),
-            arm_evidence: fit
-                .arm_evidence
-                .iter()
-                .map(|arm| DensityArmAnalysis {
-                    label: arm.label.clone(),
-                    residues: arm.residues.iter().map(ToString::to_string).collect(),
-                    classification: arm.classification.clone(),
-                    selected_mode: arm.selected_mode.clone(),
-                    source_conformer_ids: arm.source_conformer_ids.clone(),
-                    fixed_roi_likelihood_gain: arm.fixed_roi_likelihood_gain,
-                    normalized_density_gain: arm.normalized_density_gain,
-                    prior_log_probability: arm.prior_log_probability,
-                    clash_score: arm.clash_score,
-                    selected_mode_posterior: arm.selected_mode_posterior,
-                    credible_mass: arm.credible_mass,
-                    credible_set_size: arm.credible_set_size,
-                    bic_penalty: arm.bic_penalty,
-                    ring_support: arm.ring_support,
-                    linkage_path_support: arm.linkage_path_support,
-                    evaluations: arm.evaluations,
-                    escalation_reason: arm.escalation_reason.clone(),
-                    alternatives: arm
-                        .alternatives
-                        .iter()
-                        .map(|alternative| DensityArmAlternativeAnalysis {
-                            mode_id: alternative.mode_id.clone(),
-                            source_conformer_ids: alternative.source_conformer_ids.clone(),
-                            population_prior: alternative.population_prior,
-                            objective: alternative.objective,
-                            posterior_weight: alternative.posterior_weight,
-                            cumulative_posterior_weight: alternative.cumulative_posterior_weight,
-                            in_credible_set: alternative.in_credible_set,
-                        })
-                        .collect(),
-                })
-                .collect(),
-            basin_diagnostics: fit
-                .optimizer
-                .basin_diagnostics
-                .iter()
-                .map(|basin| DensityBasinAnalysis {
-                    basin_id: basin.basin_id.clone(),
-                    pilot_score: basin.pilot_score,
-                    improvement_bound: basin.improvement_bound,
-                    pilot_posterior: basin.pilot_posterior,
-                    selected: basin.selected,
-                    fully_polished: basin.fully_polished,
-                    final_score: basin.final_score,
-                    evaluations: basin.evaluations,
-                    seconds: basin.seconds,
-                    status: basin.status.clone(),
-                })
-                .collect(),
-            kernel_decisions: fit
-                .sigma_calibration
-                .as_ref()
-                .map(|calibration| {
-                    calibration
-                        .residue_kernels
-                        .iter()
-                        .map(|kernel| DensityKernelAnalysis {
-                            residue: kernel.residue.to_string(),
-                            b_factor: kernel.b_factor,
-                            effective_sigma_angstrom: kernel.effective_sigma_angstrom,
-                            heldout_gain: kernel.heldout_gain,
-                            bic_gain: kernel.bic_gain,
-                            accepted: kernel.accepted,
-                            reason: kernel.reason.clone(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        });
-    }
-    if let Some(recovery) = &density_recovery {
-        for value in recovery {
-            if let Some(distance) = value.root_c1_distance_angstrom {
-                report.diagnostics.push(format!(
-                    "recovery_{}_root_c1_distance_angstrom={distance:.4}",
-                    value.site
-                ));
-            }
-            if let Some(rmsd) = value.three_residue_heavy_atom_rmsd_angstrom {
-                report.diagnostics.push(format!(
-                    "recovery_{}_three_residue_heavy_atom_rmsd_angstrom={rmsd:.4}",
-                    value.site
-                ));
-            }
-            if let Some(rmsd) = value.supported_heavy_atom_rmsd_angstrom {
-                report.diagnostics.push(format!(
-                    "recovery_{}_supported_heavy_atom_rmsd_angstrom={rmsd:.4}",
-                    value.site
-                ));
-            }
-            if let Some(rmsd) = value.full_tree_heavy_atom_rmsd_angstrom {
-                report.diagnostics.push(format!(
-                    "recovery_{}_full_tree_heavy_atom_rmsd_angstrom={rmsd:.4}",
-                    value.site
-                ));
-            }
-        }
-    }
     report.analyze_structure(&result.relaxed_structure);
     if !quiet {
         eprintln!("refine: generating report bundle...");
     }
     write_workflow_report(&report, &arguments.common.output, arguments.common.report)?;
-    if density_only {
-        strip_density_energy_fields_from_file(&arguments.common.output.join("report.json"))?;
-    }
     if let Some(system) = result.final_system {
         system.write_bundle(&arguments.common.output)?;
     }
@@ -2215,39 +1523,22 @@ fn run_density(arguments: DensityArgs) -> anyhow::Result<()> {
                 warning_count: validation.warnings.len(),
             }),
             density: Some(DensityAnalysis {
-                pre_relax_correlation: score.correlation,
+                correlation: score.correlation,
                 sigma_angstrom: Some(score.sigma_angstrom),
-                effective_sigma_angstrom: None,
-                capture_sigma_angstrom: None,
-                anti_alias_floor_angstrom: None,
-                voxel_spacing_angstrom: [0.0; 3],
                 training_likelihood_gain: Some(score.training_likelihood_gain),
                 heldout_likelihood_gain: Some(score.heldout_likelihood_gain),
-                difference_score: None,
-                post_relax_correlation: None,
-                evaluations: 1,
-                graph_evaluations: 0,
-                ring_hypothesis_count: 0,
-                estimated_glycan_b_factor: None,
-                candidate_correlations: vec![score.correlation],
-                candidate_posterior_weights: vec![1.0],
-                density_determined_residues: score
+                supported_residues: score
                     .residue_support
                     .iter()
                     .filter(|support| support.supported)
                     .map(|support| support.residue.to_string())
                     .collect(),
-                ensemble_prior_residues: score
+                unsupported_residues: score
                     .residue_support
                     .iter()
                     .filter(|support| !support.supported)
                     .map(|support| support.residue.to_string())
                     .collect(),
-                warnings: Vec::new(),
-                optimization_seconds: None,
-                relaxation_seconds: None,
-                total_seconds: None,
-                stage_timings: Vec::new(),
                 supported_atom_fraction: Some(score.supported_atom_fraction),
                 ring_support: Some(score.ring_support),
                 connectivity_support: Some(score.connectivity_support),
@@ -2263,11 +1554,6 @@ fn run_density(arguments: DensityArgs) -> anyhow::Result<()> {
                         connectivity_support: site.connectivity_support,
                     })
                     .collect(),
-                recovery: Vec::new(),
-                ensemble_baselines: Vec::new(),
-                arm_evidence: Vec::new(),
-                basin_diagnostics: Vec::new(),
-                kernel_decisions: Vec::new(),
             }),
             ..ReportAnalysis::default()
         },
@@ -2280,417 +1566,6 @@ fn run_density(arguments: DensityArgs) -> anyhow::Result<()> {
         score.sites.len()
     );
     Ok(())
-}
-
-fn write_density_fit_outputs(
-    fit: &reglyco_refine::DensityFitResult,
-    structure: &glysys::Structure,
-    targets: &[DensityTarget],
-    output: &Path,
-    recovery: Option<&[RecoveryMeasurement]>,
-) -> anyhow::Result<()> {
-    let prefix = targets
-        .first()
-        .map(|target| format!("density-{}", target.site.to_string().replace(':', "-")))
-        .unwrap_or_else(|| "density-glycan".into());
-    let visualization = fit
-        .scorer
-        .write_visualization_maps(
-            structure,
-            targets,
-            output,
-            &prefix,
-            fit.crop_margin_angstrom,
-        )
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let candidate_json = fit
-        .candidates
-        .iter()
-        .map(|candidate| serde_json::to_value(candidate))
-        .collect::<Result<Vec<_>, _>>()?;
-    write_json(
-        output.join("density.json"),
-        &serde_json::json!({
-            "map": fit.map,
-            "map_url": fit.map_url,
-            "difference_map": fit.difference_map,
-            "difference_map_url": fit.difference_map_url,
-            "sigma_calibration": fit.sigma_calibration,
-            "map_cache_path": fit.map.path,
-            "map_sha256": fit.map.sha256,
-            "map_provenance": {
-                "source": fit.map.source,
-                "channel": fit.map.channel,
-                "source_url": fit.map.source_url,
-                "raw_sha256": fit.map.raw_sha256,
-                "raw_cache_path": fit.map.raw_cache_path,
-                "detail": fit.map.map_detail,
-            },
-            "map_transform": {
-                "map_axes": fit.map.map_axes,
-                "sampling": fit.map.sampling,
-                "nstart": [fit.map.nxstart, fit.map.nystart, fit.map.nzstart],
-                "origin_angstrom": fit.map.origin_angstrom,
-                "cell_lengths_angstrom": fit.map.cell_lengths_angstrom,
-                "cell_angles_degrees": fit.map.cell_angles_degrees,
-            },
-            "pre_relax": fit.pre_relax,
-            "post_relax": fit.post_relax,
-            "evaluations": fit.evaluations,
-            "max_evaluations": fit.max_evaluations,
-            "rejection_count": fit.rejection_count,
-            "stopping_reason": fit.stopping_reason,
-            "optimizer": fit.optimizer,
-            "stages": fit.stages,
-            "timings": fit.timings,
-            "candidates": candidate_json,
-            "ensemble_baselines": fit.ensemble_baselines,
-            "arm_evidence": fit.arm_evidence,
-            "ring_hypotheses": fit.ring_hypotheses,
-            "ring_graph_diagnostics": fit.ring_graph_diagnostics,
-            "independent_sites": fit.independent_sites.iter().map(|site| serde_json::json!({
-                "site": site.site,
-                "evaluations": site.evaluations,
-                "seconds": site.seconds,
-                "score": site.score,
-                "ownership": site.ownership,
-                "warnings": site.warnings,
-                "arm_evidence": site.arm_evidence,
-            })).collect::<Vec<_>>(),
-            "trace": fit.trace,
-            "warnings": fit.warnings,
-            "recovery": recovery,
-            "visualization": visualization,
-        }),
-    )?;
-    write_json(output.join("candidates.json"), &candidate_json)?;
-    write_json(
-        output.join("glycoshape-baselines.json"),
-        &fit.ensemble_baselines,
-    )?;
-    if !fit.ring_hypotheses.is_empty() {
-        let mut ring_pdb = String::new();
-        for (index, hypothesis) in fit.ring_hypotheses.iter().enumerate() {
-            let [x, y, z] = hypothesis.center_angstrom;
-            ring_pdb.push_str(&format!(
-                "HETATM{:>5}  CEN RGH Z{:>4}    {:>8.3}{:>8.3}{:>8.3}{:>6.2}{:>6.2}          C\n",
-                index + 1,
-                hypothesis.component_id as i32 + 1,
-                x,
-                y,
-                z,
-                1.0,
-                hypothesis.normalized_score,
-            ));
-        }
-        ring_pdb.push_str("END\n");
-        std::fs::write(output.join("density-ring-hypotheses.pdb"), ring_pdb)?;
-        write_json(
-            output.join("density-ring-hypotheses.json"),
-            &fit.ring_hypotheses,
-        )?;
-    }
-    for baseline in &fit.ensemble_baselines {
-        let filename = match baseline.kind.as_str() {
-            "density_best" => "glycoshape-density-best.pdb",
-            "nearest_fitted" => "glycoshape-nearest-fit.pdb",
-            _ => continue,
-        };
-        write_pdb(&baseline.structure, output.join(filename))?;
-    }
-    if let Some(structure) = &fit.deep_arm_best {
-        write_pdb(structure, output.join("deep-arm-best.pdb"))?;
-    }
-    if let Some(structure) = &fit.deep_graph_best {
-        write_pdb(structure, output.join("density-graph-best.pdb"))?;
-        write_pdb(structure, output.join("density-ring-graph.pdb"))?;
-    }
-    if let Some(structure) = &fit.deep_internal_best {
-        write_pdb(structure, output.join("deep-internal-best.pdb"))?;
-    }
-    if let Some(structure) = &fit.deep_cartesian_best {
-        write_pdb(structure, output.join("deep-cartesian-best.pdb"))?;
-    }
-    let mut models = String::new();
-    for (index, candidate) in fit.candidates.iter().enumerate() {
-        models.push_str(&format!("MODEL     {:>4}\n", index + 1));
-        for line in candidate.structure.to_pdb_string().lines() {
-            if line != "END" {
-                models.push_str(line);
-                models.push('\n');
-            }
-        }
-        models.push_str("ENDMDL\n");
-    }
-    models.push_str("END\n");
-    std::fs::write(output.join("candidates.pdb"), models)?;
-    Ok(())
-}
-
-fn recovery_measurements(
-    reference: &glysys::Structure,
-    fitted: &glysys::Structure,
-    targets: &[DensityTarget],
-    density: &reglyco_density::DensityScore,
-    arm_evidence: &[reglyco_refine::DensityArmEvidence],
-) -> Vec<RecoveryMeasurement> {
-    targets
-        .iter()
-        .map(|target| {
-            let reference_tree = reference
-                .metadata()
-                .glycan_trees
-                .iter()
-                .find(|tree| tree.attachment_site.as_ref() == Some(&target.site));
-            let fitted_tree = fitted
-                .metadata()
-                .glycan_trees
-                .iter()
-                .find(|tree| tree.attachment_site.as_ref() == Some(&target.site));
-            let root_c1_distance_angstrom =
-                reference_tree
-                    .zip(fitted_tree)
-                    .and_then(|(reference_tree, fitted_tree)| {
-                        let reference_root =
-                            reference_tree.residue_ids.iter().find_map(|residue| {
-                                reference
-                                    .find_atom(residue, "C1")
-                                    .and_then(|atom| reference.atom(atom))
-                            })?;
-                        let fitted_root = fitted_tree.residue_ids.iter().find_map(|residue| {
-                            fitted
-                                .find_atom(residue, "C1")
-                                .and_then(|atom| fitted.atom(atom))
-                        })?;
-                        Some(coordinate_distance(
-                            reference_root.position,
-                            fitted_root.position,
-                        ))
-                    });
-            let three_residue_heavy_atom_rmsd_angstrom =
-                reference_tree
-                    .zip(fitted_tree)
-                    .and_then(|(reference_tree, fitted_tree)| {
-                        let mut squared = 0.0;
-                        let mut count = 0usize;
-                        for (reference_residue, fitted_residue) in reference_tree
-                            .residue_ids
-                            .iter()
-                            .zip(&fitted_tree.residue_ids)
-                            .take(3)
-                        {
-                            for atom in reference.atoms().into_iter().filter(|atom| {
-                                atom.residue == *reference_residue
-                                    && !atom.element.eq_ignore_ascii_case("H")
-                            }) {
-                                let Some(fitted_atom) = fitted
-                                    .find_atom(fitted_residue, &atom.name)
-                                    .and_then(|id| fitted.atom(id))
-                                else {
-                                    continue;
-                                };
-                                squared += coordinate_distance(atom.position, fitted_atom.position)
-                                    .powi(2);
-                                count += 1;
-                            }
-                        }
-                        (count > 0).then(|| (squared / count as f64).sqrt())
-                    });
-            let supported = density
-                .residue_support
-                .iter()
-                .filter(|support| support.supported)
-                .map(|support| support.residue.clone())
-                .collect::<std::collections::BTreeSet<_>>();
-            let topology_pairs = reference_tree
-                .zip(fitted_tree)
-                .map(|(reference_tree, fitted_tree)| {
-                    let reference_signatures =
-                        glycan_topology_signatures(reference, reference_tree);
-                    let fitted_signatures = glycan_topology_signatures(fitted, fitted_tree);
-                    reference_signatures
-                        .into_iter()
-                        .filter_map(|(signature, reference_residue)| {
-                            fitted_signatures
-                                .get(&signature)
-                                .cloned()
-                                .map(|fitted_residue| (reference_residue, fitted_residue))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let tree_rmsd = |supported_only: bool| {
-                (!topology_pairs.is_empty())
-                    .then(|| {
-                        let mut squared = 0.0;
-                        let mut count = 0usize;
-                        for (reference_residue, fitted_residue) in &topology_pairs {
-                            if supported_only && !supported.contains(fitted_residue) {
-                                continue;
-                            }
-                            for atom in reference.atoms().into_iter().filter(|atom| {
-                                atom.residue == *reference_residue
-                                    && !atom.element.eq_ignore_ascii_case("H")
-                            }) {
-                                let Some(fitted_atom) = fitted
-                                    .find_atom(fitted_residue, &atom.name)
-                                    .and_then(|id| fitted.atom(id))
-                                else {
-                                    continue;
-                                };
-                                squared += coordinate_distance(atom.position, fitted_atom.position)
-                                    .powi(2);
-                                count += 1;
-                            }
-                        }
-                        (count > 0).then(|| (squared / count as f64).sqrt())
-                    })
-                    .flatten()
-            };
-            let subset_rmsd = |selected: &std::collections::BTreeSet<ResidueId>| {
-                let mut squared = 0.0;
-                let mut count = 0usize;
-                for (reference_residue, fitted_residue) in &topology_pairs {
-                    if !selected.contains(fitted_residue) {
-                        continue;
-                    }
-                    for atom in reference.atoms().into_iter().filter(|atom| {
-                        atom.residue == *reference_residue
-                            && !atom.element.eq_ignore_ascii_case("H")
-                    }) {
-                        let Some(fitted_atom) = fitted
-                            .find_atom(fitted_residue, &atom.name)
-                            .and_then(|id| fitted.atom(id))
-                        else {
-                            continue;
-                        };
-                        squared += coordinate_distance(atom.position, fitted_atom.position).powi(2);
-                        count += 1;
-                    }
-                }
-                (count > 0).then(|| (squared / count as f64).sqrt())
-            };
-            let per_residue_heavy_atom_rmsd_angstrom = topology_pairs
-                .iter()
-                .filter_map(|(_, fitted_residue)| {
-                    let selected = [fitted_residue.clone()].into_iter().collect();
-                    subset_rmsd(&selected).map(|rmsd| (fitted_residue.to_string(), rmsd))
-                })
-                .collect();
-            let arm_heavy_atom_rmsd_angstrom = arm_evidence
-                .iter()
-                .filter_map(|arm| {
-                    let selected = arm.residues.iter().cloned().collect();
-                    subset_rmsd(&selected).map(|rmsd| (arm.label.clone(), rmsd))
-                })
-                .collect();
-            RecoveryMeasurement {
-                site: target.site.to_string(),
-                root_c1_distance_angstrom,
-                three_residue_heavy_atom_rmsd_angstrom,
-                supported_heavy_atom_rmsd_angstrom: tree_rmsd(true),
-                full_tree_heavy_atom_rmsd_angstrom: tree_rmsd(false),
-                per_residue_heavy_atom_rmsd_angstrom,
-                arm_heavy_atom_rmsd_angstrom,
-            }
-        })
-        .collect()
-}
-
-fn glycan_topology_signatures(
-    structure: &glysys::Structure,
-    tree: &glysys::GlycanTree,
-) -> std::collections::BTreeMap<String, ResidueId> {
-    let tree_residues = tree
-        .residue_ids
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let atom_by_id = structure
-        .atoms()
-        .into_iter()
-        .map(|atom| (atom.id, atom))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let residue_name = structure
-        .residues()
-        .into_iter()
-        .map(|residue| {
-            let normalized = match residue.name.as_str() {
-                "NDG" => "NAG".to_string(),
-                value => value.to_string(),
-            };
-            (residue.id, normalized)
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let root = structure
-        .metadata()
-        .glycosylation_sites
-        .iter()
-        .find(|site| tree.attachment_site.as_ref() == Some(&site.protein_residue))
-        .map(|site| site.glycan_residue.clone())
-        .or_else(|| tree.residue_ids.first().cloned());
-    let Some(root) = root else {
-        return Default::default();
-    };
-    let mut adjacency =
-        std::collections::BTreeMap::<ResidueId, Vec<(ResidueId, String, String)>>::new();
-    for (left, right) in structure.bonds() {
-        let (Some(left_atom), Some(right_atom)) = (atom_by_id.get(&left), atom_by_id.get(&right))
-        else {
-            continue;
-        };
-        if left_atom.residue == right_atom.residue
-            || !tree_residues.contains(&left_atom.residue)
-            || !tree_residues.contains(&right_atom.residue)
-        {
-            continue;
-        }
-        adjacency
-            .entry(left_atom.residue.clone())
-            .or_default()
-            .push((
-                right_atom.residue.clone(),
-                left_atom.name.clone(),
-                right_atom.name.clone(),
-            ));
-        adjacency
-            .entry(right_atom.residue.clone())
-            .or_default()
-            .push((
-                left_atom.residue.clone(),
-                right_atom.name.clone(),
-                left_atom.name.clone(),
-            ));
-    }
-    let root_name = residue_name.get(&root).cloned().unwrap_or_default();
-    let mut signatures =
-        std::collections::BTreeMap::from([(format!("root:{root_name}"), root.clone())]);
-    let mut visited = std::collections::BTreeSet::from([root.clone()]);
-    let mut queue = std::collections::VecDeque::from([(root, format!("root:{root_name}"))]);
-    while let Some((parent, parent_signature)) = queue.pop_front() {
-        let mut children = adjacency.remove(&parent).unwrap_or_default();
-        children.sort_by(|left, right| {
-            left.1
-                .cmp(&right.1)
-                .then_with(|| left.2.cmp(&right.2))
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        for (child, parent_atom, child_atom) in children {
-            if !visited.insert(child.clone()) {
-                continue;
-            }
-            let child_name = residue_name.get(&child).cloned().unwrap_or_default();
-            let signature = format!("{parent_signature}/{parent_atom}-{child_atom}:{child_name}");
-            signatures.insert(signature.clone(), child.clone());
-            queue.push_back((child, signature));
-        }
-    }
-    signatures
-}
-
-fn coordinate_distance(first: glysys::Vec3, second: glysys::Vec3) -> f64 {
-    ((first.x - second.x).powi(2) + (first.y - second.y).powi(2) + (first.z - second.z).powi(2))
-        .sqrt()
 }
 
 fn run_scan(arguments: ScanArgs) -> anyhow::Result<()> {
@@ -3072,39 +1947,22 @@ fn run_validate(arguments: ValidateArgs) -> anyhow::Result<()> {
                 warning_count: validation.warnings.len(),
             }),
             density: validation.density.as_ref().map(|score| DensityAnalysis {
-                pre_relax_correlation: score.correlation,
+                correlation: score.correlation,
                 sigma_angstrom: Some(score.sigma_angstrom),
-                effective_sigma_angstrom: None,
-                capture_sigma_angstrom: None,
-                anti_alias_floor_angstrom: None,
-                voxel_spacing_angstrom: [0.0; 3],
                 training_likelihood_gain: Some(score.training_likelihood_gain),
                 heldout_likelihood_gain: Some(score.heldout_likelihood_gain),
-                difference_score: None,
-                post_relax_correlation: None,
-                evaluations: 1,
-                graph_evaluations: 0,
-                ring_hypothesis_count: 0,
-                estimated_glycan_b_factor: None,
-                candidate_correlations: vec![score.correlation],
-                candidate_posterior_weights: vec![1.0],
-                density_determined_residues: score
+                supported_residues: score
                     .residue_support
                     .iter()
                     .filter(|support| support.supported)
                     .map(|support| support.residue.to_string())
                     .collect(),
-                ensemble_prior_residues: score
+                unsupported_residues: score
                     .residue_support
                     .iter()
                     .filter(|support| !support.supported)
                     .map(|support| support.residue.to_string())
                     .collect(),
-                warnings: Vec::new(),
-                optimization_seconds: None,
-                relaxation_seconds: None,
-                total_seconds: None,
-                stage_timings: Vec::new(),
                 supported_atom_fraction: Some(score.supported_atom_fraction),
                 ring_support: Some(score.ring_support),
                 connectivity_support: Some(score.connectivity_support),
@@ -3120,11 +1978,6 @@ fn run_validate(arguments: ValidateArgs) -> anyhow::Result<()> {
                         connectivity_support: site.connectivity_support,
                     })
                     .collect(),
-                recovery: Vec::new(),
-                ensemble_baselines: Vec::new(),
-                arm_evidence: Vec::new(),
-                basin_diagnostics: Vec::new(),
-                kernel_decisions: Vec::new(),
             }),
             ..ReportAnalysis::default()
         },
@@ -3255,51 +2108,6 @@ fn resolve_density_map_for_refine(
     }
     let path = resolve_density_map(value, input, protein)?;
     Ok((path, None))
-}
-
-fn resolve_difference_map_for_refine(
-    value: Option<&str>,
-    protein: &ProteinArgs,
-) -> anyhow::Result<Option<(PathBuf, Option<String>)>> {
-    let dynamic_default = if protein.pdb_id.is_some() {
-        "auto"
-    } else {
-        "none"
-    };
-    let value = value.unwrap_or(dynamic_default);
-    if value.eq_ignore_ascii_case("none") {
-        return Ok(None);
-    }
-    if !value.eq_ignore_ascii_case("auto") {
-        let path = PathBuf::from(value);
-        if !path.is_file() {
-            anyhow::bail!("difference density map does not exist: {}", path.display());
-        }
-        return Ok(Some((path, None)));
-    }
-    let Some(identifier) = protein.pdb_id.as_deref() else {
-        return Ok(None);
-    };
-    let provider = ProteinProvider::new(ProteinFetchOptions {
-        cache_dir: protein.protein_cache.join("maps"),
-        offline: protein.protein_offline,
-        ..ProteinFetchOptions::default()
-    })?;
-    match provider.fetch_eds_difference_map(identifier) {
-        Ok(path) => Ok(Some((
-            path,
-            Some(format!(
-                "https://www.ebi.ac.uk/pdbe/coordinates/files/{}_diff.ccp4",
-                identifier.to_ascii_lowercase()
-            )),
-        ))),
-        Err(error) => {
-            eprintln!(
-                "refine: warning: optional Fo-Fc difference map unavailable ({error}); continuing with primary density"
-            );
-            Ok(None)
-        }
-    }
 }
 
 fn load_search(
@@ -3897,100 +2705,6 @@ fn print_refine_progress(event: RefineProgress, quiet: bool, started: Instant) {
         RefineProgress::Search(event) => {
             print_search_progress_label(event, false, "refine: search")
         }
-        RefineProgress::DensityStarted {
-            max_evaluations,
-            branch_count,
-        } => eprintln!(
-            "refine: density search started (limit {}, {branch_count} rotatable glycosidic branches)",
-            max_evaluations.map_or_else(
-                || "no fixed evaluation limit".into(),
-                |limit| format!("{limit} evaluations")
-            )
-        ),
-        RefineProgress::DensityStageStarted {
-            stage,
-            candidates,
-            planned_evaluations,
-        } => eprintln!(
-            "refine: density stage {stage}: evaluating {planned_evaluations} pose(s) from {candidates} planned candidate(s)..."
-        ),
-        RefineProgress::DensityBatchProgress {
-            stage,
-            evaluated,
-            planned,
-            valid,
-            best_correlation,
-            best_support,
-            elapsed_seconds,
-        } => eprintln!(
-            "refine: density stage {stage}: evaluated {evaluated}/{planned}; {valid} valid pose(s) in last batch; best cc={}; support={}; elapsed {:.1}s{}",
-            best_correlation.map_or_else(|| "n/a".into(), |value| format!("{value:.4}")),
-            best_support.map_or_else(|| "n/a".into(), |value| format!("{value:.3}")),
-            elapsed_seconds,
-            if evaluated > 0 && elapsed_seconds > 0.0 {
-                format!(
-                    ", ETA {:.0}s",
-                    (planned.saturating_sub(evaluated) as f64) * elapsed_seconds / evaluated as f64
-                )
-            } else {
-                String::new()
-            }
-        ),
-        RefineProgress::DensityStageFinished {
-            stage,
-            evaluations,
-            retained,
-            best_correlation,
-            best_support,
-        } => eprintln!(
-            "refine: density stage {stage} finished: {evaluations} total evaluations, retained {retained}, best cc={best_correlation:.4}, support={best_support:.3}"
-        ),
-        RefineProgress::DensityEvaluation {
-            evaluation,
-            max_evaluations,
-            step_degrees,
-            parameter,
-            correlation,
-            accepted,
-            best_correlation,
-        } => {
-            if evaluation == 1
-                || max_evaluations.is_some_and(|limit| evaluation == limit)
-                || accepted
-                || evaluation.is_multiple_of(10)
-            {
-                let rate = evaluation as f64 / started.elapsed().as_secs_f64().max(1.0e-6);
-                let trial =
-                    correlation.map_or_else(|| "rejected".into(), |value| format!("cc={value:.4}"));
-                let eta = max_evaluations
-                    .filter(|_| evaluation > 1 && rate.is_finite() && rate > 0.0)
-                    .map_or_else(String::new, |limit| {
-                        format!(
-                            ", ETA {:.0}s",
-                            (limit.saturating_sub(evaluation) as f64) / rate
-                        )
-                    });
-                eprintln!(
-                    "refine: density evaluation {evaluation}/{} ({rate:.2}/s), step={step_degrees:.1}°, {parameter}: {trial}, best={best_correlation:.4}{eta}, {}",
-                    max_evaluations.map_or_else(|| "*".into(), |limit| limit.to_string()),
-                    if accepted { "accepted" } else { "kept current" },
-                );
-            }
-        }
-        RefineProgress::DensityStepFinished {
-            step_degrees,
-            evaluations,
-            best_correlation,
-        } => eprintln!(
-            "refine: density step {step_degrees:.1}° finished at evaluation {evaluations}; best cc={best_correlation:.4}"
-        ),
-        RefineProgress::DensityFinished {
-            evaluations,
-            best_correlation,
-            seconds,
-        } => eprintln!(
-            "refine: density search finished after {evaluations} evaluations in {seconds:.1}s; pre-relax cc={best_correlation:.4}"
-        ),
         RefineProgress::Relax(event) => match event {
             RelaxProgress::InitialEnergyStarted => {
                 eprintln!("refine: relaxation evaluating initial energy...")
@@ -4115,59 +2829,6 @@ fn write_json(path: impl AsRef<Path>, value: &impl serde::Serialize) -> anyhow::
     Ok(())
 }
 
-/// Density-only reports must not present the historical force-field search
-/// fields as zero-valued energy results.  Keep the generic search metadata,
-/// but remove energy-specific keys from both the standalone search JSON and
-/// the nested report copy.  The PDF renderer already gates its energy sections
-/// on a real selected energy or relaxation diagnostic.
-fn strip_density_energy_fields(value: &mut serde_json::Value) {
-    let search = if value.get("search").is_some() {
-        value.get_mut("search")
-    } else {
-        Some(value)
-    };
-    let Some(search) = search else {
-        return;
-    };
-    let Some(object) = search.as_object_mut() else {
-        return;
-    };
-    for key in [
-        "scoring_mode",
-        "selected_energy_kcal_per_mol",
-        "interaction_energy_kcal_per_mol",
-        "energy_evaluations",
-        "energy_cutoff_angstrom",
-        "minimization_radius_angstrom",
-        "interaction_vdw_kcal_per_mol",
-        "interaction_coulomb_kcal_per_mol",
-        "energy_diagnostics",
-        "minimized_coordinates",
-    ] {
-        object.remove(key);
-    }
-    if let Some(history) = object
-        .get_mut("history")
-        .and_then(|value| value.as_array_mut())
-    {
-        for generation in history {
-            if let Some(generation) = generation.as_object_mut() {
-                generation.remove("best_energy_kcal_per_mol");
-            }
-        }
-    }
-}
-
-fn strip_density_energy_fields_from_file(path: &Path) -> anyhow::Result<()> {
-    if !path.is_file() {
-        return Ok(());
-    }
-    let mut value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-    strip_density_energy_fields(&mut value);
-    std::fs::write(path, serde_json::to_string_pretty(&value)? + "\n")?;
-    Ok(())
-}
-
 fn write_workflow_report(
     report: &WorkflowReport,
     output: &Path,
@@ -4221,7 +2882,7 @@ mod tests {
     use glysys::{AtomId, BuildOptions, GlycanTree, GlycosylationSite, ResidueId, read_pdb_str};
 
     use super::{
-        Cli, Command, DensityDeepStrategyArg, OutputFormatArg, glycan_atom_count, parse_site,
+        Cli, Command, ObjectiveArg, OutputFormatArg, glycan_atom_count, parse_site,
         validate_cookbook_scan_config, verify_relaxed_glycans,
     };
 
@@ -4403,67 +3064,59 @@ mod tests {
         assert!(explicit_manual.generations.is_none());
     }
 
-    #[test]
-    fn density_refine_defaults_to_convergence_driven_adaptive_search() {
-        let cli = Cli::try_parse_from([
+    fn density_refine(extra: &[&str]) -> super::RefineArgs {
+        let mut args = vec![
             "reglyco",
             "refine",
             "--protein",
             "protein.pdb",
-            "--attach",
-            "A:42=G00028MO",
             "--objective",
             "density",
             "--density-map",
             "density.map",
+            "--replace-glycan",
+            "A:79",
             "--output",
             "result",
-        ])
-        .unwrap();
+        ];
+        args.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(args).unwrap();
         let Command::Refine(arguments) = cli.command else {
             panic!("expected refine command");
         };
-        assert!(matches!(
-            arguments.density_search,
-            super::DensitySearchArg::Adaptive
-        ));
-        assert!(matches!(
-            arguments.density_effort,
-            super::DensityEffortArg::Adaptive
-        ));
-        assert!(arguments.density_time_limit.is_none());
-        assert_eq!(arguments.density_credible_mass, 0.95);
-        assert_eq!(arguments.density_max_alternates, 10);
+        arguments
     }
 
     #[test]
-    fn density_ring_graph_strategy_is_explicit_and_deterministic() {
-        let cli = Cli::try_parse_from([
-            "reglyco",
-            "refine",
-            "--protein",
-            "protein.pdb",
-            "--attach",
-            "A:42=G00028MO",
-            "--objective",
-            "density",
-            "--density-map",
-            "density.map",
-            "--density-effort",
-            "deep",
-            "--density-deep-strategy",
-            "ring-graph",
-            "--output",
-            "result",
-        ])
-        .unwrap();
-        let Command::Refine(arguments) = cli.command else {
-            panic!("expected refine command");
-        };
-        assert!(matches!(
-            arguments.density_deep_strategy,
-            DensityDeepStrategyArg::RingGraph
-        ));
+    fn density_refine_uses_glycoflow_options() {
+        let arguments =
+            density_refine(&["--glycoflow-model", "model", "--glycoflow-samples", "64"]);
+        assert!(matches!(arguments.objective, ObjectiveArg::Density));
+        assert!(arguments.density_search.is_none());
+        assert_eq!(
+            arguments.glycoflow.model.as_deref(),
+            Some(std::path::Path::new("model"))
+        );
+        assert_eq!(arguments.glycoflow.samples, 64);
+    }
+
+    #[test]
+    fn legacy_density_search_values_are_rejected() {
+        let error = super::run_refine(density_refine(&["--density-search", "adaptive"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("legacy density fitter"), "{error}");
+    }
+
+    #[test]
+    fn density_refine_requires_a_glycoflow_model() {
+        if std::env::var_os("GLYCOFLOW_MODEL").is_some() {
+            return;
+        }
+        let error = super::run_refine(density_refine(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--glycoflow-model"), "{error}");
     }
 
     #[test]

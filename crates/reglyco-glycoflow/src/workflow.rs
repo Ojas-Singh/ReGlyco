@@ -1,6 +1,5 @@
 //! End-to-end workflow: sites of a model + a density map -> fitted structure, candidate models,
-//! JSON report and validation. Used by `reglyco refine --objective density --density-search
-//! glycoflow`.
+//! JSON report and validation. Used by `reglyco refine --objective density`.
 
 use std::path::Path;
 use std::time::Instant;

@@ -4158,18 +4158,11 @@ name = "reglyco-refine"
 version = "0.1.0"
 dependencies = [
  "glysys",
- "glysys-opt",
- "mrc",
- "rayon",
  "reglyco-build",
  "reglyco-core",
- "reglyco-density",
  "reglyco-ensemble",
  "reglyco-relax",
  "reglyco-report",
- "reglyco-validate",
- "serde",
- "tempfile",
  "thiserror 2.0.19",
 ]
 
@@ -4258,6 +4251,7 @@ dependencies = [
 name = "reglyco-workflow"
 version = "0.1.0"
 dependencies = [
+ "candle-core",
  "glysys",
  "glysys-energy",
  "maybe-async-cfg",
@@ -4265,6 +4259,7 @@ dependencies = [
  "reglyco-core",
  "reglyco-density",
  "reglyco-ensemble",
+ "reglyco-glycoflow",
  "reglyco-refine",
  "reglyco-relax",
  "reglyco-saxs",

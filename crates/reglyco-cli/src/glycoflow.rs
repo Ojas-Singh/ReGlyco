@@ -1,5 +1,5 @@
-//! `reglyco refine --objective density --density-search glycoflow`: fit the glycan at each
-//! `--replace-glycan` site with the frozen GlycoFlow model (crate `reglyco-glycoflow`).
+//! `reglyco refine --objective density`: fit the glycan at each `--replace-glycan` site with the
+//! frozen GlycoFlow model (crate `reglyco-glycoflow`).
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -32,7 +32,7 @@ pub(crate) enum GlycoflowSymmetryArg {
     Off,
 }
 
-/// Options of `--density-search glycoflow`.
+/// GlycoFlow options of `refine --objective density`.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct GlycoflowArgs {
     /// GlycoFlow model directory (glycoflow.safetensors, glycoflow.json, residue_library.json);
@@ -75,7 +75,21 @@ pub(crate) fn run_refine_glycoflow(arguments: RefineArgs, started: Instant) -> a
     let g = &arguments.glycoflow;
     if arguments.replace_glycans.is_empty() {
         anyhow::bail!(
-            "--density-search glycoflow fits the glycan at --replace-glycan SITE (or SITE=<GLYCAM sequence>)"
+            "--objective density fits the glycan at --replace-glycan SITE (or SITE=<GLYCAM sequence>)"
+        );
+    }
+    // Fail before any download or parsing when no model is configured.
+    let dir = GlycoflowModel::resolve_dir(g.model.as_deref()).map_err(|_| {
+        anyhow::anyhow!(
+            "--objective density needs a GlycoFlow model: pass --glycoflow-model <dir> or set \
+             $GLYCOFLOW_MODEL to a directory with glycoflow.safetensors, glycoflow.json and \
+             residue_library.json"
+        )
+    })?;
+    if !dir.is_dir() {
+        anyhow::bail!(
+            "GlycoFlow model directory {} does not exist (--glycoflow-model / $GLYCOFLOW_MODEL)",
+            dir.display()
         );
     }
     let sites = arguments
@@ -85,7 +99,7 @@ pub(crate) fn run_refine_glycoflow(arguments: RefineArgs, started: Instant) -> a
             let (site, sequence) = match value.split_once('=') {
                 Some((site, source)) if is_glycam(source) => (site, Some(source.to_string())),
                 Some((_, source)) => anyhow::bail!(
-                    "--density-search glycoflow takes SITE or SITE=<GLYCAM sequence ending in -OH>, not {source:?}"
+                    "--objective density takes --replace-glycan SITE or SITE=<GLYCAM sequence ending in -OH>, not {source:?}"
                 ),
                 None => (value.as_str(), None),
             };
@@ -124,7 +138,6 @@ pub(crate) fn run_refine_glycoflow(arguments: RefineArgs, started: Instant) -> a
         arguments.density_map_detail,
     )?;
     let map = DensityMap::open(&map_path)?;
-    let dir = GlycoflowModel::resolve_dir(g.model.as_deref())?;
     let device = match g.device {
         GlycoflowDeviceArg::Cpu => ComputeDevice::Cpu,
         GlycoflowDeviceArg::Cuda => ComputeDevice::Cuda,

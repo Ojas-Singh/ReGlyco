@@ -34,13 +34,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[cfg(all(feature = "full", not(target_arch = "wasm32")))]
+use reglyco_density::DensityMap;
 #[cfg(feature = "full")]
-use reglyco_density::{DensityMap, DensityScoreOptions, DensityScorer, DensityTarget};
-#[cfg(feature = "full")]
-use reglyco_refine::{
-    DensityEffort as NativeDensityEffort, DensityRefinementConfig, RefineObjective, RefineProgress,
-    RefineRequest, refine_with_progress,
-};
+use reglyco_refine::{RefineProgress, RefineRequest, refine_with_progress};
 #[cfg(feature = "full")]
 use reglyco_saxs::{
     FitOptions, MaximumEntropyOptions, PrOptions, adapt_structure, experimental_curve_from_str,
@@ -93,6 +90,11 @@ pub enum WorkflowError {
     #[cfg(feature = "full")]
     #[error("density input failed: {0}")]
     Density(#[from] reglyco_density::DensityError),
+    #[cfg(all(feature = "full", not(target_arch = "wasm32")))]
+    #[error("GlycoFlow density fitting failed: {0}")]
+    Glycoflow(#[from] reglyco_glycoflow::FitError),
+    #[error("{0}")]
+    Unavailable(String),
     #[cfg(feature = "full")]
     #[error("SAXS fitting failed: {0}")]
     Saxs(#[from] reglyco_saxs::SaxsError),
@@ -211,14 +213,6 @@ fn default_ensemble_thinning_accepted() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DensityEffort {
-    Fast,
-    Adaptive,
-    Deep,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SaxsMode {
     Model,
     Ensemble,
@@ -275,11 +269,9 @@ pub struct ReGlycoOptions {
     pub search_budget_mode: Option<SearchBudgetMode>,
     pub population_size: usize,
     pub generations: usize,
-    pub density_effort: DensityEffort,
-    pub density_support_threshold: f64,
-    pub density_credible_mass: f64,
-    pub density_max_alternates: usize,
-    pub density_post_relax: bool,
+    /// Map resolution for density fitting; default: the input's REMARK 2
+    /// RESOLUTION record.
+    pub density_resolution: Option<f64>,
     pub saxs_mode: SaxsMode,
 }
 
@@ -309,11 +301,7 @@ impl Default for ReGlycoOptions {
             search_budget_mode: Some(SearchBudgetMode::Auto),
             population_size: 128,
             generations: 100,
-            density_effort: DensityEffort::Adaptive,
-            density_support_threshold: 0.60,
-            density_credible_mass: 0.95,
-            density_max_alternates: 10,
-            density_post_relax: false,
+            density_resolution: None,
             saxs_mode: SaxsMode::Model,
         }
     }
@@ -384,7 +372,7 @@ impl AssetData {
         }
     }
 
-    #[cfg(feature = "full")]
+    #[cfg(all(feature = "full", not(target_arch = "wasm32")))]
     fn bytes(&self) -> &[u8] {
         match self {
             Self::Text(value) => value.as_bytes(),
@@ -575,7 +563,11 @@ pub fn capabilities(profile: ReGlycoProfile, threaded: bool) -> EngineCapabiliti
     workflows.push(WorkflowId::Refine);
     #[cfg(feature = "full")]
     if profile == ReGlycoProfile::Full {
-        workflows.extend([WorkflowId::Density, WorkflowId::Saxs]);
+        // Density fitting runs the GlycoFlow network natively; the browser
+        // build does not offer it yet.
+        #[cfg(not(target_arch = "wasm32"))]
+        workflows.push(WorkflowId::Density);
+        workflows.push(WorkflowId::Saxs);
     }
     EngineCapabilities {
         schema_version: SCHEMA_VERSION,
@@ -987,13 +979,11 @@ fn prepare_proline_sites(
 }
 
 fn replacement_workflow(workflow: WorkflowId) -> bool {
+    // Density fitting (GlycoFlow) fits the deposited glycan of each selected
+    // site in place and removes the deposited tree itself.
     matches!(
         workflow,
-        WorkflowId::Uniprot
-            | WorkflowId::SiteBuild
-            | WorkflowId::Ensemble
-            | WorkflowId::Refine
-            | WorkflowId::Density
+        WorkflowId::Uniprot | WorkflowId::SiteBuild | WorkflowId::Ensemble | WorkflowId::Refine
     )
 }
 
@@ -1404,7 +1394,12 @@ fn prepare_replacements(
 }
 
 fn workflow_converts_proline(workflow: WorkflowId) -> bool {
-    !matches!(workflow, WorkflowId::Validate | WorkflowId::NScan)
+    // Density fitting reads the deposited model as is (GlycoFlow fits the
+    // deposited glycan in place).
+    !matches!(
+        workflow,
+        WorkflowId::Validate | WorkflowId::NScan | WorkflowId::Density
+    )
 }
 
 fn converted_proline_sites(
@@ -2293,6 +2288,7 @@ fn is_transient_glycoshape_source(name: &str) -> bool {
         || basename == "torsion-reference.json"
         || basename.ends_with("-reference.json")
         || basename.ends_with("_reference.json")
+        || GLYCOFLOW_MODEL_ASSETS.contains(&basename)
 }
 
 /// User-owned inputs remain reproducible artifacts, while GlycoShape source
@@ -6499,11 +6495,9 @@ fn execute_full(
             let result = match refine_with_progress(
                 RefineRequest {
                     protein,
-                    nuisance_protein: None,
                     sites: search_sites,
                     search: search_config(request),
                     relaxation: relax_options(request),
-                    objective: RefineObjective::StericEnergy,
                 },
                 builder,
                 Some(builder),
@@ -6538,143 +6532,20 @@ fn execute_full(
             (result.relaxed_structure, analysis)
         }
         WorkflowId::Density => {
-            emit(
-                control,
-                "density",
-                "Decoding the density map and calibrating its kernel…",
-                None,
-                None,
-            )?;
-            let map_asset = assets
-                .get("density.map")
-                .ok_or_else(|| WorkflowError::MissingAsset("density.map".into()))?;
-            let map = DensityMap::from_bytes("density.map", map_asset.bytes())?;
-            let search_sites = search_sites(request, assets, &protein)?;
-            let targets = request
-                .assignments
-                .iter()
-                .filter(|assignment| !assignment.excluded)
-                .map(|assignment| {
-                    DensityTarget::for_site(&protein, &assignment.site.residue_id()).unwrap_or(
-                        DensityTarget {
-                            site: assignment.site.residue_id(),
-                            glycan_residues: Vec::new(),
-                        },
-                    )
-                })
-                .collect::<Vec<_>>();
-            if targets.is_empty() {
-                return Err(WorkflowError::Invalid(
-                    "density refinement requires at least one selected glycan site".into(),
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = replacements;
+                return Err(WorkflowError::Unavailable(
+                    GLYCOFLOW_BROWSER_UNAVAILABLE.into(),
                 ));
             }
-            let calibration_sites = targets
-                .iter()
-                .map(|target| target.site.clone())
-                .collect::<Vec<_>>();
-            let mut score_options = DensityScoreOptions {
-                periodic: map.is_full_unit_cell(),
-                support_threshold: request.options.density_support_threshold,
-                ..DensityScoreOptions::default()
-            };
-            let calibration = DensityScorer::calibrate_sigma_from_protein(
-                &map,
-                &protein,
-                &calibration_sites,
-                score_options,
-                &[0.65, 0.80, 1.00, 1.20, 1.40, 1.70],
-            )?;
-            score_options.sigma_angstrom = Some(calibration.selected_sigma_angstrom);
-            score_options.glycan_b_factor = Some(calibration.estimated_glycan_b_factor);
-            let scorer = DensityScorer::new(map, score_options)?;
-            if search_sites.is_empty() {
-                let score = scorer.score(&protein, &targets)?;
-                warnings.push("The deposited glycans were density-scored in place; choose a replacement GlycoShape glycan to search alternate conformers.".into());
-                let analysis = json!({ "density": { "existingModel": score, "sigmaCalibration": calibration } });
-                return finish_workflow(
-                    request,
-                    input,
-                    protein,
-                    WorkflowStatus::Succeeded,
-                    warnings,
-                    sites,
-                    add_replacement_analysis(analysis, replacements),
-                    artifacts,
-                    control,
-                );
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let fit = glycoflow_density(request, assets, input, control)?;
+                artifacts.extend(fit.artifacts);
+                warnings.extend(fit.warnings);
+                (fit.structure, fit.analysis)
             }
-            let mut density = DensityRefinementConfig::new(scorer, targets);
-            density.effort = match request.options.density_effort {
-                DensityEffort::Fast => NativeDensityEffort::Fast,
-                DensityEffort::Adaptive => NativeDensityEffort::Adaptive,
-                DensityEffort::Deep => NativeDensityEffort::Deep,
-            };
-            density.support_threshold = request.options.density_support_threshold;
-            density.credible_mass = request.options.density_credible_mass;
-            density.max_alternates = request.options.density_max_alternates;
-            density.post_relax_energy = request.options.density_post_relax;
-            emit(
-                control,
-                "density",
-                "Searching density-supported glycan poses…",
-                None,
-                None,
-            )?;
-            let refine_input = protein.clone();
-            let result = match refine_with_progress(
-                RefineRequest {
-                    protein,
-                    nuisance_protein: None,
-                    sites: search_sites,
-                    search: search_config(request),
-                    relaxation: relax_options(request),
-                    objective: RefineObjective::Density(density),
-                },
-                builder,
-                Some(builder),
-                |event| control.progress(progress_refine(event)),
-            ) {
-                Ok(result) => result,
-                Err(reglyco_refine::RefineError::Ensemble(EnsembleError::StrictVmmFailure {
-                    diagnostics,
-                })) => {
-                    return finish_strict_failure(
-                        request,
-                        input,
-                        refine_input,
-                        warnings,
-                        assignment_report_sites(request, "strict-search-failed"),
-                        *diagnostics,
-                        replacements,
-                        artifacts,
-                        control,
-                    );
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let density_summary = result
-                .density
-                .as_ref()
-                .map(|fit| {
-                    json!({
-                        "map": fit.map,
-                        "preRelax": fit.pre_relax,
-                        "postRelax": fit.post_relax,
-                        "candidates": fit.candidates,
-                        "armEvidence": fit.arm_evidence,
-                        "evaluations": fit.evaluations,
-                        "stoppingReason": fit.stopping_reason,
-                        "timings": fit.timings,
-                        "warnings": fit.warnings,
-                        "sigmaCalibration": fit.sigma_calibration,
-                    })
-                })
-                .unwrap_or_else(|| json!({}));
-            if let Some(fit) = &result.density {
-                warnings.extend(fit.warnings.clone());
-            }
-            let analysis = json!({ "density": density_summary, "nativeReport": result.report });
-            (result.relaxed_structure, analysis)
         }
         WorkflowId::Saxs => {
             emit(
@@ -6764,6 +6635,170 @@ fn execute_full(
         artifacts,
         control,
     )
+}
+
+/// Input assets holding the GlycoFlow model of the density workflow
+/// (`glycoflow.safetensors`, `glycoflow.json`, `residue_library.json`).  They are
+/// execution-only and never exported as artifacts.
+const GLYCOFLOW_MODEL_ASSETS: [&str; 3] = [
+    "glycoflow.safetensors",
+    "glycoflow.json",
+    "residue_library.json",
+];
+
+#[cfg(all(feature = "full", target_arch = "wasm32"))]
+const GLYCOFLOW_BROWSER_UNAVAILABLE: &str = "density fitting (GlycoFlow) is not available in the browser yet; run `reglyco refine --objective density` natively";
+
+#[cfg(all(feature = "full", not(target_arch = "wasm32")))]
+fn glycoflow_model_from_assets(assets: &InputAssets) -> Result<reglyco_glycoflow::GlycoflowModel> {
+    use reglyco_glycoflow::glycoflow_core::{
+        ModelMeta, ResidueLibrary, TorsionFlowNet, model::Precision,
+    };
+    let missing = GLYCOFLOW_MODEL_ASSETS
+        .iter()
+        .filter(|name| !assets.contains_key(**name))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(WorkflowError::MissingAsset(format!(
+            "{} (density fitting needs the GlycoFlow model assets glycoflow.safetensors, \
+             glycoflow.json and residue_library.json)",
+            missing.join(", ")
+        )));
+    }
+    let engine = |error: reglyco_glycoflow::glycoflow_core::Error| {
+        WorkflowError::Glycoflow(reglyco_glycoflow::FitError::from(error))
+    };
+    let meta = ModelMeta::from_json_str(assets["glycoflow.json"].text("glycoflow.json")?)
+        .map_err(engine)?;
+    let library =
+        ResidueLibrary::from_json_slice(assets["residue_library.json"].bytes()).map_err(engine)?;
+    let net = TorsionFlowNet::from_safetensors(
+        assets["glycoflow.safetensors"].bytes(),
+        meta.config.clone(),
+        &candle_core::Device::Cpu,
+        Precision::F32,
+    )
+    .map_err(engine)?;
+    Ok(reglyco_glycoflow::GlycoflowModel {
+        net,
+        meta,
+        library,
+        dir: PathBuf::from("glycoflow.safetensors"),
+        device: reglyco_glycoflow::ComputeDevice::Cpu,
+    })
+}
+
+#[cfg(all(feature = "full", not(target_arch = "wasm32")))]
+struct GlycoflowDensityFit {
+    structure: Structure,
+    analysis: Value,
+    artifacts: Vec<WorkflowArtifact>,
+    warnings: Vec<String>,
+}
+
+/// Fit the glycan at every selected site into `density.map` with GlycoFlow
+/// (`reglyco-glycoflow`, the fitter of `reglyco refine --objective density`).
+/// A GLYCAM `glycanId` (ending in `-OH`) sets the fitted sequence; otherwise
+/// (`existing`, or a GlyTouCan/GlycoShape identifier, with a warning) the
+/// deposited glycan's sequence is fitted.
+#[cfg(all(feature = "full", not(target_arch = "wasm32")))]
+fn glycoflow_density(
+    request: &ReGlycoRunRequestV1,
+    assets: &InputAssets,
+    input: &str,
+    control: &mut impl WorkflowControl,
+) -> Result<GlycoflowDensityFit> {
+    use reglyco_glycoflow::workflow::{SiteRequest, WorkflowInput, WorkflowOptions, run};
+    emit(
+        control,
+        "density",
+        "Loading the GlycoFlow model and the density map…",
+        None,
+        None,
+    )?;
+    let model = glycoflow_model_from_assets(assets)?;
+    let map_asset = assets
+        .get("density.map")
+        .ok_or_else(|| WorkflowError::MissingAsset("density.map".into()))?;
+    let map = DensityMap::from_bytes("density.map", map_asset.bytes())?;
+    // GlycoFlow reads the deposited glycans itself (default sequence and
+    // evaluation only) and removes the target trees before fitting.
+    let structure = read_pdb_str(input, &build_options(request))?;
+    let mut warnings = Vec::new();
+    let sites = request
+        .assignments
+        .iter()
+        .filter(|assignment| !assignment.excluded)
+        .map(|assignment| {
+            let glycan = assignment.glycan_id.trim();
+            let sequence =
+                (glycan.ends_with("-OH") || glycan.ends_with("-OME")).then(|| glycan.to_string());
+            if sequence.is_none() && glycan != "existing" {
+                warnings.push(format!(
+                    "{}: {glycan} is not a GLYCAM sequence; the deposited glycan's sequence was fitted",
+                    assignment.site.residue_id()
+                ));
+            }
+            SiteRequest {
+                residue: assignment.site.residue_id(),
+                sequence,
+            }
+        })
+        .collect::<Vec<_>>();
+    if sites.is_empty() {
+        return Err(WorkflowError::Invalid(
+            "density fitting requires at least one selected glycan site".into(),
+        ));
+    }
+    let mut options = WorkflowOptions::default();
+    options.fit.seed = request.options.seed;
+    options.resolution = request.options.density_resolution;
+    emit(
+        control,
+        "density",
+        format!("Fitting {} glycan site(s) with GlycoFlow…", sites.len()),
+        None,
+        None,
+    )?;
+    let result = run(&WorkflowInput {
+        structure: &structure,
+        structure_text: Some(input),
+        map: &map,
+        sites,
+        model: &model,
+        options,
+    })?;
+    if let Some(error) = &result.validation_error {
+        warnings.push(format!("validation of the fitted model failed: {error}"));
+    }
+    let artifacts = vec![
+        text_artifact(
+            "candidates.pdb",
+            "chemical/x-pdb",
+            ArtifactRole::Structure,
+            result.candidates_pdb.clone(),
+        ),
+        text_artifact(
+            "glycoflow-fit.json",
+            "application/json",
+            ArtifactRole::Analysis,
+            serde_json::to_string_pretty(&result.report)?,
+        ),
+    ];
+    let analysis = json!({
+        "density": {
+            "method": "glycoflow",
+            "fit": result.report,
+            "validation": result.validation,
+        }
+    });
+    Ok(GlycoflowDensityFit {
+        structure: result.fitted,
+        analysis,
+        artifacts,
+        warnings,
+    })
 }
 
 /// Public objective-driven refinement.  Density and SAXS are deliberately
@@ -6988,43 +7023,9 @@ fn progress_refine(event: RefineProgress) -> ProgressEvent {
             fraction: None,
         },
         RefineProgress::Search(event) => progress_search(event),
-        RefineProgress::DensityBatchProgress {
-            stage,
-            evaluated,
-            planned,
-            ..
-        } => ProgressEvent {
-            stage: "density".into(),
-            message: stage.into(),
-            current: Some(evaluated),
-            total: Some(planned),
-            fraction: (planned > 0).then_some(evaluated as f64 / planned as f64),
-        },
-        RefineProgress::DensityEvaluation {
-            evaluation,
-            max_evaluations,
-            parameter,
-            ..
-        } => ProgressEvent {
-            stage: "density".into(),
-            message: parameter,
-            current: Some(evaluation),
-            total: max_evaluations,
-            fraction: max_evaluations
-                .filter(|total| *total > 0)
-                .map(|total| evaluation as f64 / total as f64),
-        },
         RefineProgress::Relax(event) => progress_relax(event),
-        _ => ProgressEvent {
-            stage: "density".into(),
-            message: "Evaluating refinement candidates…".into(),
-            current: None,
-            total: None,
-            fraction: None,
-        },
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7661,6 +7662,37 @@ END
         assert!(value.workflows.contains(&WorkflowId::Saxs));
     }
 
+    #[cfg(all(feature = "full", not(target_arch = "wasm32")))]
+    #[test]
+    fn density_workflow_requires_glycoflow_model_assets() {
+        let request = ReGlycoRunRequestV1 {
+            schema_version: SCHEMA_VERSION,
+            workflow: WorkflowId::Density,
+            profile: ReGlycoProfile::Full,
+            input: ProteinInput {
+                kind: ProteinInputKind::Upload,
+                label: "pro.pdb".into(),
+                source_id: None,
+                asset: "protein.pdb".into(),
+                sha256: "test".into(),
+                source_url: None,
+            },
+            assignments: vec![pro_assignment("PRO")],
+            options: ReGlycoOptions::default(),
+            parent_job_id: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let assets = InputAssets::from([
+            (String::from("protein.pdb"), AssetData::Text(PROTEIN.into())),
+            ("density.map".into(), AssetData::Bytes(vec![1, 2, 3])),
+        ]);
+        let error = match execute(&request, &assets) {
+            Err(error) => error.to_string(),
+            Ok(bundle) => bundle.error.unwrap_or_default(),
+        };
+        assert!(error.contains("glycoflow.safetensors"), "{error}");
+    }
+
     #[test]
     fn clash_free_required_is_a_blocked_scan_site() {
         let error = EnsembleError::ReGlyco(ReGlycoError::ClashFreeRequired);
@@ -7959,6 +7991,9 @@ END
             ("scan-glycan.pdb".into(), AssetData::Text("MODEL\n".into())),
             ("density.map".into(), AssetData::Bytes(vec![1, 2, 3])),
             ("saxs.dat".into(), AssetData::Text("0.1 1.0\n".into())),
+            ("glycoflow.safetensors".into(), AssetData::Bytes(vec![0])),
+            ("glycoflow.json".into(), AssetData::Text("{}".into())),
+            ("residue_library.json".into(), AssetData::Text("{}".into())),
         ]);
         let artifacts = exportable_input_support_artifacts(&assets, "protein.pdb");
         let names = artifacts

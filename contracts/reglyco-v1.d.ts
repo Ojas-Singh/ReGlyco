@@ -163,6 +163,8 @@ export interface ReGlycoOptions {
   ensembleThinningAccepted: number; calculateSasa: boolean;
   calculateHotspots: boolean; scoringMode: 'steric_prior' | 'full_energy' | 'protein_glycan_interaction';
   useObc2: boolean; localRadius: number; populationSize: number; generations: number;
+  /** Density workflow (GlycoFlow, native full profile only): map resolution; default: the input's REMARK 2 record. */
+  densityResolution?: number;
   [key: string]: unknown;
 }
 export interface ReglycoRunRequestV1 {

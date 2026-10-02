@@ -411,169 +411,24 @@ pub struct DensitySiteAnalysis {
     pub connectivity_support: f64,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct DensityRecoveryAnalysis {
-    pub site: String,
-    #[serde(default)]
-    pub root_c1_distance_angstrom: Option<f64>,
-    #[serde(default)]
-    pub three_residue_heavy_atom_rmsd_angstrom: Option<f64>,
-    #[serde(default)]
-    pub supported_heavy_atom_rmsd_angstrom: Option<f64>,
-    #[serde(default)]
-    pub full_tree_heavy_atom_rmsd_angstrom: Option<f64>,
-    #[serde(default)]
-    pub per_residue_heavy_atom_rmsd_angstrom: BTreeMap<String, f64>,
-    #[serde(default)]
-    pub arm_heavy_atom_rmsd_angstrom: BTreeMap<String, f64>,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct DensityBaselineAnalysis {
-    pub kind: String,
-    #[serde(default)]
-    pub conformer_ids: Vec<String>,
-    pub correlation: f64,
-    pub likelihood_gain: f64,
-    pub rmsd_to_fitted_angstrom: f64,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct DensityArmAnalysis {
-    pub label: String,
-    pub residues: Vec<String>,
-    pub classification: String,
-    pub selected_mode: String,
-    pub source_conformer_ids: Vec<String>,
-    pub fixed_roi_likelihood_gain: f64,
-    #[serde(default)]
-    pub normalized_density_gain: f64,
-    #[serde(default)]
-    pub prior_log_probability: f64,
-    #[serde(default)]
-    pub clash_score: f64,
-    #[serde(default)]
-    pub selected_mode_posterior: f64,
-    #[serde(default = "default_density_credible_mass")]
-    pub credible_mass: f64,
-    #[serde(default)]
-    pub credible_set_size: usize,
-    #[serde(default)]
-    pub bic_penalty: f64,
-    pub ring_support: f64,
-    pub linkage_path_support: f64,
-    pub evaluations: usize,
-    pub escalation_reason: String,
-    /// Heterogeneous native-mode alternatives for an ambiguous arm.  These
-    /// make the uncertainty human-readable in the report; they never affect
-    /// ranking or `fitted.pdb`.
-    #[serde(default)]
-    pub alternatives: Vec<DensityArmAlternativeAnalysis>,
-}
-
-/// Report-local mirror of the refiner's per-arm alternative so an ambiguous
-/// arm's distinct conformations are surfaced without coupling the report
-/// crate to the refiner.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DensityArmAlternativeAnalysis {
-    pub mode_id: String,
-    pub source_conformer_ids: Vec<String>,
-    pub population_prior: f64,
-    pub objective: f64,
-    pub posterior_weight: f64,
-    #[serde(default)]
-    pub cumulative_posterior_weight: f64,
-    #[serde(default)]
-    pub in_credible_set: bool,
-}
-
-fn default_density_credible_mass() -> f64 {
-    0.95
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct DensityBasinAnalysis {
-    pub basin_id: String,
-    pub pilot_score: f64,
-    pub improvement_bound: f64,
-    pub pilot_posterior: f64,
-    #[serde(default)]
-    pub selected: bool,
-    #[serde(default)]
-    pub fully_polished: bool,
-    #[serde(default)]
-    pub final_score: Option<f64>,
-    #[serde(default)]
-    pub evaluations: usize,
-    #[serde(default)]
-    pub seconds: f64,
-    #[serde(default)]
-    pub status: String,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct DensityKernelAnalysis {
-    pub residue: String,
-    pub b_factor: f64,
-    pub effective_sigma_angstrom: f64,
-    pub heldout_gain: f64,
-    pub bic_gain: f64,
-    pub accepted: bool,
-    pub reason: String,
-}
-
+/// Density agreement of a model scored in place against a map (`reglyco density`,
+/// `reglyco validate --density-map`). GlycoFlow fits (`reglyco refine --objective density`)
+/// report in `glycoflow-fit.json` instead.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DensityAnalysis {
-    pub pre_relax_correlation: f64,
+    /// Masked map correlation of the target glycans.
+    #[serde(alias = "pre_relax_correlation")]
+    pub correlation: f64,
     #[serde(default)]
     pub sigma_angstrom: Option<f64>,
-    #[serde(default)]
-    pub effective_sigma_angstrom: Option<f64>,
-    #[serde(default)]
-    pub capture_sigma_angstrom: Option<f64>,
-    #[serde(default)]
-    pub anti_alias_floor_angstrom: Option<f64>,
-    #[serde(default)]
-    pub voxel_spacing_angstrom: [f64; 3],
     #[serde(default)]
     pub training_likelihood_gain: Option<f64>,
     #[serde(default)]
     pub heldout_likelihood_gain: Option<f64>,
-    #[serde(default)]
-    pub difference_score: Option<f64>,
-    #[serde(default)]
-    pub post_relax_correlation: Option<f64>,
-    pub evaluations: usize,
-    /// Number of exact graph-assignment proposals evaluated in deep mode.
-    #[serde(default)]
-    pub graph_evaluations: usize,
-    /// Number of map-derived ring hypotheses retained for the density-first
-    /// graph.  Zero is expected for fast/adaptive and legacy reports.
-    #[serde(default)]
-    pub ring_hypothesis_count: usize,
-    #[serde(default)]
-    pub estimated_glycan_b_factor: Option<f64>,
-    #[serde(default)]
-    pub candidate_correlations: Vec<f64>,
-    #[serde(default)]
-    pub candidate_posterior_weights: Vec<f64>,
-    #[serde(default)]
-    pub density_determined_residues: Vec<String>,
-    #[serde(default)]
-    pub ensemble_prior_residues: Vec<String>,
-    #[serde(default)]
-    pub warnings: Vec<String>,
-    #[serde(default)]
-    pub optimization_seconds: Option<f64>,
-    #[serde(default)]
-    pub relaxation_seconds: Option<f64>,
-    #[serde(default)]
-    pub total_seconds: Option<f64>,
-    /// Coarse production-stage timings copied from the fitter.  Debug traces
-    /// remain in density.json only; this compact list is intended for the
-    /// human report and stable downstream consumers.
-    #[serde(default)]
-    pub stage_timings: Vec<DensityStageAnalysis>,
+    #[serde(default, alias = "density_determined_residues")]
+    pub supported_residues: Vec<String>,
+    #[serde(default, alias = "ensemble_prior_residues")]
+    pub unsupported_residues: Vec<String>,
     #[serde(default)]
     pub supported_atom_fraction: Option<f64>,
     #[serde(default)]
@@ -582,23 +437,6 @@ pub struct DensityAnalysis {
     pub connectivity_support: Option<f64>,
     #[serde(default)]
     pub site_diagnostics: Vec<DensitySiteAnalysis>,
-    #[serde(default)]
-    pub recovery: Vec<DensityRecoveryAnalysis>,
-    #[serde(default)]
-    pub ensemble_baselines: Vec<DensityBaselineAnalysis>,
-    #[serde(default)]
-    pub arm_evidence: Vec<DensityArmAnalysis>,
-    #[serde(default)]
-    pub basin_diagnostics: Vec<DensityBasinAnalysis>,
-    #[serde(default)]
-    pub kernel_decisions: Vec<DensityKernelAnalysis>,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct DensityStageAnalysis {
-    pub stage: String,
-    pub seconds: f64,
-    pub evaluations: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -3961,31 +3799,6 @@ fn candidate_mean_support(saxs: &SaxsAnalysis, candidate: &str) -> Option<f64> {
     (count > 0).then_some(sum / count as f64)
 }
 
-fn density_classification_label(classification: &str) -> &'static str {
-    match classification {
-        "density_determined" => "Density-supported",
-        "ambiguous" => "Ambiguous",
-        "ensemble_prior_determined" => "Prior-determined",
-        "glycoshape_fallback" => "GlycoShape fallback",
-        _ => "Unclassified",
-    }
-}
-
-fn density_classification_explanation(classification: &str) -> &'static str {
-    match classification {
-        "density_determined" => {
-            "The fixed-ROI density and connected linkage path select one arm mode."
-        }
-        "ambiguous" => {
-            "Density supports the region, but multiple modes remain in the credible set."
-        }
-        "ensemble_prior_determined" | "glycoshape_fallback" => {
-            "The map does not uniquely determine this arm; native GlycoShape geometry is retained as a chemically valid representative."
-        }
-        _ => "Evidence classification was not recorded by the fitter.",
-    }
-}
-
 fn typst_source(report: &WorkflowReport) -> String {
     let mut source = String::from(TEMPLATE_HEADER);
     source.push_str(&format!(
@@ -4445,61 +4258,9 @@ fn typst_source(report: &WorkflowReport) -> String {
 
     if let Some(density) = &report.analysis.density {
         source.push_str("\n== Density agreement\n");
-        let density_arms = density.arm_evidence.len();
-        let density_determined_arms = density
-            .arm_evidence
-            .iter()
-            .filter(|arm| arm.classification == "density_determined")
-            .count();
-        let ambiguous_arms = density
-            .arm_evidence
-            .iter()
-            .filter(|arm| arm.classification == "ambiguous")
-            .count();
-        let prior_arms = density_arms.saturating_sub(density_determined_arms + ambiguous_arms);
-        source.push_str("=== Executive summary\n");
-        source.push_str(
-            "The density fit is ranked using a fixed site-local map objective and chemistry gates. Deposited coordinates are recovery diagnostics only. A density-supported label means the map selects a connected arm mode; ambiguous means alternatives remain plausible; prior-determined means the map does not resolve that arm and the native ensemble supplies the representative.\\\n",
-        );
-        source.push_str("#report-table(columns: (auto, auto, auto, auto, auto), align: (left, right, right, right, right), [*Metric*], [*Value*], [*Density-supported arms*], [*Ambiguous arms*], [*Prior-determined arms*],");
         source.push_str(&format!(
-            "[Masked map correlation], [{:.4}], [{}], [{}], [{}],",
-            density.pre_relax_correlation, density_determined_arms, ambiguous_arms, prior_arms,
-        ));
-        source.push_str(&format!(
-            "[Evaluations], [{}], [--], [--], [--],",
-            density.evaluations
-        ));
-        if let Some(seconds) = density.total_seconds {
-            source.push_str(&format!(
-                "[Total fitting time], [{seconds:.1} s], [--], [--], [--],"
-            ));
-        }
-        source.push_str(")\n");
-        if !density.stage_timings.is_empty() {
-            source.push_str("\n*Production-stage profile*\\\n");
-            source.push_str("#report-table(columns: (auto, auto, auto, auto), align: (left, right, right, right), [*Stage*], [*Seconds*], [*Evaluations*], [*Share of optimization*],");
-            let optimization_seconds = density.optimization_seconds.unwrap_or(0.0);
-            for stage in &density.stage_timings {
-                let share = if optimization_seconds > 0.0 {
-                    100.0 * stage.seconds / optimization_seconds
-                } else {
-                    0.0
-                };
-                source.push_str(&format!(
-                    "[{}], [{:.2}], [{}], [{:.1}%],",
-                    typst_escape(&stage.stage),
-                    stage.seconds,
-                    stage.evaluations,
-                    share,
-                ));
-            }
-            source.push_str(")\n");
-        }
-        source.push_str(&format!(
-            "Masked map correlation: {:.4}\\\nEvaluations: {}\\\nAtom support: {}\\\nRing support: {}\\\nConnectivity support: {}\\\n",
-            density.pre_relax_correlation,
-            density.evaluations,
+            "Masked map correlation: {:.4}\\\nAtom support: {}\\\nRing support: {}\\\nConnectivity support: {}\\\n",
+            density.correlation,
             density
                 .supported_atom_fraction
                 .map_or_else(|| "n/a".into(), |value| format!("{value:.3}")),
@@ -4511,28 +4272,7 @@ fn typst_source(report: &WorkflowReport) -> String {
                 .map_or_else(|| "n/a".into(), |value| format!("{value:.3}")),
         ));
         if let Some(sigma) = density.sigma_angstrom {
-            source.push_str(&format!("Calibrated density sigma: {sigma:.3} Å\\\n"));
-        }
-        if let Some(sigma) = density.effective_sigma_angstrom {
-            source.push_str(&format!("Effective B-broadened sigma: {sigma:.3} Å\\\\\\n"));
-        }
-        if let Some(sigma) = density.capture_sigma_angstrom {
-            source.push_str(&format!("Automatic capture sigma: {sigma:.3} Å\\\\\\n"));
-        }
-        if let Some(floor) = density.anti_alias_floor_angstrom {
-            source.push_str(&format!("Voxel anti-alias floor: {floor:.3} Å\\\\\\n"));
-        }
-        if !density.kernel_decisions.is_empty() {
-            let accepted = density
-                .kernel_decisions
-                .iter()
-                .filter(|kernel| kernel.accepted)
-                .count();
-            source.push_str(&format!(
-                "Residue-local blur trials: {} ({} accepted by held-out/BIC gate)\\\\\\n",
-                density.kernel_decisions.len(),
-                accepted
-            ));
+            source.push_str(&format!("Density sigma: {sigma:.3} Å\\\n"));
         }
         if let (Some(training), Some(heldout)) = (
             density.training_likelihood_gain,
@@ -4541,14 +4281,6 @@ fn typst_source(report: &WorkflowReport) -> String {
             source.push_str(&format!(
                 "Fixed-ROI likelihood: training {training:.3}, held-out {heldout:.3}\\\n"
             ));
-        }
-        if let Some(difference) = density.difference_score {
-            source.push_str(&format!(
-                "Signed Fo-Fc consistency score: {difference:.4}\\\n"
-            ));
-        }
-        if let Some(post) = density.post_relax_correlation {
-            source.push_str(&format!("Post-relaxation correlation: {post:.4}\\\n"));
         }
         if !density.site_diagnostics.is_empty() {
             source.push_str("#report-table(columns: (auto, auto, auto, auto, auto), align: (left, right, right, right, right), [*Site*], [*Correlation*], [*Atom support*], [*Ring support*], [*Connectivity*],");
@@ -4563,162 +4295,17 @@ fn typst_source(report: &WorkflowReport) -> String {
                 ));
             }
             source.push_str(")\n");
-            let has_detailed_recovery = density.recovery.iter().any(|recovery| {
-                !recovery.per_residue_heavy_atom_rmsd_angstrom.is_empty()
-                    || !recovery.arm_heavy_atom_rmsd_angstrom.is_empty()
-            });
-            if has_detailed_recovery {
-                source.push_str("#report-table(columns: (auto, auto, auto), align: (left, left, right), [*Site*], [*Residue / connected arm*], [*Heavy-atom RMSD (Å)*],");
-                for recovery in &density.recovery {
-                    for (residue, rmsd) in &recovery.per_residue_heavy_atom_rmsd_angstrom {
-                        source.push_str(&format!(
-                            "[{}], [{}], [{rmsd:.3}],",
-                            typst_escape(&recovery.site),
-                            typst_escape(residue),
-                        ));
-                    }
-                    for (arm, rmsd) in &recovery.arm_heavy_atom_rmsd_angstrom {
-                        source.push_str(&format!(
-                            "[{}], [arm {}], [{rmsd:.3}],",
-                            typst_escape(&recovery.site),
-                            typst_escape(arm),
-                        ));
-                    }
-                }
-                source.push_str(")\n");
-            }
         }
-        if !density.recovery.is_empty() {
-            source.push_str(
-                "Recovery comparison is informational only and is not used for pass/fail.\\\n",
-            );
-            source.push_str("#report-table(columns: (auto, auto, auto, auto, auto), align: (left, right, right, right, right), [*Site*], [*Root C1 distance (Å)*], [*Three-residue RMSD (Å)*], [*Supported RMSD (Å)*], [*Full-tree RMSD (Å)*],");
-            for recovery in &density.recovery {
-                source.push_str(&format!(
-                    "[{}], [{}], [{}], [{}], [{}],",
-                    typst_escape(&recovery.site),
-                    recovery
-                        .root_c1_distance_angstrom
-                        .map_or_else(|| "n/a".into(), |value| format!("{value:.3}")),
-                    recovery
-                        .three_residue_heavy_atom_rmsd_angstrom
-                        .map_or_else(|| "n/a".into(), |value| format!("{value:.3}")),
-                    recovery
-                        .supported_heavy_atom_rmsd_angstrom
-                        .map_or_else(|| "n/a".into(), |value| format!("{value:.3}")),
-                    recovery
-                        .full_tree_heavy_atom_rmsd_angstrom
-                        .map_or_else(|| "n/a".into(), |value| format!("{value:.3}")),
-                ));
-            }
-            source.push_str(")\n");
-        }
-        if !density.ensemble_baselines.is_empty() {
-            source.push_str("\n=== GlycoShape conformer baselines\n");
-            source.push_str("These untouched attached conformers are diagnostics and did not influence final model ranking.\\\n");
-            source.push_str("#report-table(columns: (auto, auto, auto, auto, auto), align: (left, left, right, right, right), [*Baseline*], [*Conformer*], [*CC*], [*Likelihood gain*], [*RMSD to fit (Å)*],");
-            for baseline in &density.ensemble_baselines {
-                source.push_str(&format!(
-                    "[{}], [{}], [{:.4}], [{:.3}], [{:.3}],",
-                    typst_escape(&baseline.kind.replace('_', " ")),
-                    typst_escape(&baseline.conformer_ids.join(", ")),
-                    baseline.correlation,
-                    baseline.likelihood_gain,
-                    baseline.rmsd_to_fitted_angstrom,
-                ));
-            }
-            source.push_str(")\n");
-        }
-        if !density.arm_evidence.is_empty() {
-            source.push_str("\n=== Connected-arm evidence\n");
-            source.push_str("Each arm is inferred independently conditional on the fitted core. Negative gain is prior-determined; ambiguous arms retain a 95% marginal credible set.\\\n");
-            source.push_str("#report-table(columns: (auto, auto, auto, auto, auto, auto, auto), align: (left, left, left, right, right, right, right), [*Arm*], [*Classification*], [*Selected mode*], [*Density gain*], [*Gain / heavy atom*], [*Top posterior*], [*95% modes*],");
-            for arm in &density.arm_evidence {
-                source.push_str(&format!(
-                    "[{}], [{}], [{}], [{:.3}], [{:.3}], [{:.3}], [{}],",
-                    typst_escape(&arm.label),
-                    density_classification_label(&arm.classification),
-                    typst_escape(&arm.selected_mode),
-                    arm.fixed_roi_likelihood_gain,
-                    arm.normalized_density_gain,
-                    arm.selected_mode_posterior,
-                    arm.credible_set_size,
-                ));
-            }
-            source.push_str(")\n");
-            source.push_str("\n*Per-residue evidence status*\\\n");
-            source.push_str("#report-table(columns: (auto, auto, auto, auto, auto), align: (left, left, left, right, right), [*Residue*], [*Arm*], [*Status*], [*Ring support*], [*Linkage path*],");
-            for arm in &density.arm_evidence {
-                for residue in &arm.residues {
-                    source.push_str(&format!(
-                        "[{}], [{}], [{}], [{:.3}], [{:.3}],",
-                        typst_escape(residue),
-                        typst_escape(&arm.label),
-                        density_classification_label(&arm.classification),
-                        arm.ring_support,
-                        arm.linkage_path_support,
-                    ));
-                }
-            }
-            source.push_str(")\n");
-            for arm in &density.arm_evidence {
-                source.push_str(&format!(
-                    "*{}:* {}\\\n",
-                    typst_escape(&arm.label),
-                    density_classification_explanation(&arm.classification),
-                ));
-            }
-            for arm in &density.arm_evidence {
-                if arm.alternatives.is_empty() {
-                    continue;
-                }
-                source.push_str(&format!(
-                    "\\\n*{} alternatives:* ",
-                    typst_escape(&arm.label)
-                ));
-                for alternative in arm.alternatives.iter().filter(|mode| mode.in_credible_set) {
-                    source.push_str(&format!(
-                        "{} (p={:.3}, cumulative={:.3}, sources={}); ",
-                        typst_escape(&alternative.mode_id),
-                        alternative.posterior_weight,
-                        alternative.cumulative_posterior_weight,
-                        typst_escape(&alternative.source_conformer_ids.join(", ")),
-                    ));
-                }
-                source.push_str("\\\n");
-            }
-        }
-        if !density.basin_diagnostics.is_empty() {
-            source.push_str("\\n=== Automatic basin competition\\n");
-            source.push_str("Basins are clustered by attachment/core geometry; pilot posterior and residual bounds determine polishing.\\\\\\n");
-            source.push_str("#report-table(columns: (auto, auto, auto, auto, auto, auto, auto), align: (left, right, right, right, left, right, right), [*Basin*], [*Pilot*], [*Bound*], [*Posterior*], [*State*], [*Evaluations*], [*Seconds*],");
-            for basin in &density.basin_diagnostics {
-                source.push_str(&format!(
-                    "[{}], [{:.3}], [{:.3}], [{:.3}], [{}], [{}], [{:.1}],",
-                    typst_escape(&basin.basin_id),
-                    basin.pilot_score,
-                    basin.improvement_bound,
-                    basin.pilot_posterior,
-                    typst_escape(&basin.status.replace('_', " ")),
-                    basin.evaluations,
-                    basin.seconds,
-                ));
-            }
-            source.push_str(")\\n");
-        }
-        if !density.candidate_correlations.is_empty() {
-            source.push_str("Candidate correlations and posterior weights are recorded in report.json and density.json; local observed, calculated, and mask CCP4 maps are included in the output bundle.\n");
-        }
-        if !density.density_determined_residues.is_empty() {
+        if !density.supported_residues.is_empty() {
             source.push_str(&format!(
-                "Density-determined residues: {}.\\\n",
-                typst_escape(&density.density_determined_residues.join(", "))
+                "Density-supported residues: {}.\\\n",
+                typst_escape(&density.supported_residues.join(", "))
             ));
         }
-        if !density.ensemble_prior_residues.is_empty() {
+        if !density.unsupported_residues.is_empty() {
             source.push_str(&format!(
-                "Ensemble-prior-determined residues: {}.\\\n",
-                typst_escape(&density.ensemble_prior_residues.join(", "))
+                "Residues without density support: {}.\\\n",
+                typst_escape(&density.unsupported_residues.join(", "))
             ));
         }
     }
@@ -4891,42 +4478,23 @@ mod tests {
     }
 
     #[test]
-    fn density_basin_diagnostics_render_in_report() {
+    fn density_agreement_renders_in_report() {
         let directory = tempfile::tempdir().unwrap();
-        let mut density = DensityAnalysis::default();
-        density.basin_diagnostics.push(DensityBasinAnalysis {
-            basin_id: "model-1@-150,-170".into(),
-            pilot_score: 2.0,
-            improvement_bound: 2.5,
-            pilot_posterior: 0.8,
-            selected: true,
-            fully_polished: true,
-            final_score: Some(3.0),
-            evaluations: 4,
-            seconds: 0.1,
-            status: "polished".into(),
-        });
-        density.optimization_seconds = Some(1.0);
-        density.total_seconds = Some(1.0);
-        density.evaluations = 12;
-        density.stage_timings.push(DensityStageAnalysis {
-            stage: "adaptive local".into(),
-            seconds: 1.0,
-            evaluations: 12,
-        });
-        density.arm_evidence.push(DensityArmAnalysis {
-            label: "B:3->B:6".into(),
-            residues: vec!["B:6".into()],
-            classification: "density_determined".into(),
-            selected_mode: "mode-1".into(),
-            fixed_roi_likelihood_gain: 1.0,
-            normalized_density_gain: 0.5,
-            selected_mode_posterior: 0.9,
-            credible_set_size: 1,
-            ring_support: 0.8,
-            linkage_path_support: 0.7,
-            ..DensityArmAnalysis::default()
-        });
+        let density = DensityAnalysis {
+            correlation: 0.8,
+            sigma_angstrom: Some(1.1),
+            supported_residues: vec!["B:1".into()],
+            unsupported_residues: vec!["B:6".into()],
+            site_diagnostics: vec![DensitySiteAnalysis {
+                site: "A:79".into(),
+                correlation: 0.8,
+                voxel_count: 100,
+                supported_atom_fraction: 0.9,
+                ring_support: 0.8,
+                connectivity_support: 0.7,
+            }],
+            ..DensityAnalysis::default()
+        };
         let report = WorkflowReport {
             status: "complete".into(),
             clash_status: None,

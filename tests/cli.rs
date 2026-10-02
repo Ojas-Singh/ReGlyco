@@ -1,37 +1,28 @@
 use std::process::Command;
 
 #[test]
-#[ignore = "scientific/performance regression; requires the cached 5KZC EDS map and 512-member GlycoShape ensemble"]
-fn cached_5kzc_n79_adaptive_density_regression() {
-    let cache = std::path::Path::new(".reglyco-cache");
-    let protein = cache.join("proteins/pdb-5KZC-assembly-1.pdb");
-    let map = cache.join("proteins/maps/eds-5kzc.ccp4");
-    assert!(protein.is_file(), "missing cached 5KZC assembly");
-    assert!(map.is_file(), "missing cached 5KZC EDS map");
+#[ignore = "GlycoFlow scientific regression; needs $GLYCOFLOW_MODEL and 5KZC.pdb + eds-5kzc.ccp4 under $REGLYCO_DATA"]
+fn glycoflow_5kzc_n79_density_regression() {
+    let data = std::path::PathBuf::from(
+        std::env::var_os("REGLYCO_DATA").expect("set REGLYCO_DATA (structures/, maps/)"),
+    );
+    assert!(
+        std::env::var_os("GLYCOFLOW_MODEL").is_some(),
+        "set GLYCOFLOW_MODEL"
+    );
     let directory = tempfile::tempdir().unwrap();
-    let started = std::time::Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_reglyco"))
-        .env("RAYON_NUM_THREADS", "4")
         .args(["refine", "--protein"])
-        .arg(&protein)
+        .arg(data.join("structures/5KZC.pdb"))
+        .arg("--density-map")
+        .arg(data.join("maps/eds-5kzc.ccp4"))
         .args([
-            "--replace-glycan",
-            "A:79=G63337SS",
-            "--level",
-            "3",
-            "--offline",
             "--objective",
             "density",
-            "--density-map",
-        ])
-        .arg(&map)
-        .args([
-            "--density-sigma",
-            "1.0",
-            "--density-difference-map",
-            "none",
-            "--density-effort",
-            "adaptive",
+            "--replace-glycan",
+            "A:79",
+            "--seed",
+            "0",
             "--quiet",
             "--output",
         ])
@@ -43,138 +34,15 @@ fn cached_5kzc_n79_adaptive_density_regression() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(started.elapsed().as_secs_f64() < 90.0);
-    let density: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(directory.path().join("density.json")).unwrap())
-            .unwrap();
-    assert!(density["evaluations"].as_u64().unwrap() < 15_000);
-    assert!(density["pre_relax"]["correlation"].as_f64().unwrap() >= 0.70);
-    assert!(
-        density["recovery"][0]["supported_heavy_atom_rmsd_angstrom"]
-            .as_f64()
-            .unwrap()
-            < 1.0
-    );
-    assert!(
-        density["recovery"][0]["full_tree_heavy_atom_rmsd_angstrom"]
-            .as_f64()
-            .unwrap()
-            < 1.0
-    );
-    for rmsd in density["recovery"][0]["per_residue_heavy_atom_rmsd_angstrom"]
-        .as_object()
-        .unwrap()
-        .values()
-    {
-        assert!(rmsd.as_f64().unwrap() < 1.0);
-    }
-    let validation: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(directory.path().join("validation.json")).unwrap())
-            .unwrap();
-    assert_eq!(validation["valid"], true);
-    assert!(validation["errors"].as_array().unwrap().is_empty());
-    assert!(directory.path().join("fitted.pdb").is_file());
-    assert!(directory.path().join("candidates.pdb").is_file());
-    assert!(directory.path().join("candidates.json").is_file());
-    assert!(
-        directory
-            .path()
-            .join("glycoshape-density-best.pdb")
-            .is_file()
-    );
-    assert!(
-        directory
-            .path()
-            .join("glycoshape-nearest-fit.pdb")
-            .is_file()
-    );
-    assert!(directory.path().join("glycoshape-baselines.json").is_file());
-}
-
-#[test]
-#[ignore = "deep scientific regression; requires cached 5KZC primary/Fo-Fc maps and the 512-member GlycoShape ensemble"]
-fn cached_5kzc_n79_evidence_calibrated_deep_regression() {
-    let cache = std::path::Path::new(".reglyco-cache");
-    let protein = cache.join("proteins/pdb-5KZC-assembly-1.pdb");
-    let primary = cache.join("proteins/maps/eds-5kzc.ccp4");
-    let difference = cache.join("proteins/maps/eds-5kzc-diff.ccp4");
-    for input in [&protein, &primary, &difference] {
-        assert!(input.is_file(), "missing cached input {}", input.display());
-    }
-    let directory = tempfile::tempdir().unwrap();
-    let started = std::time::Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_reglyco"))
-        .env("RAYON_NUM_THREADS", "4")
-        .args(["refine", "--protein"])
-        .arg(&protein)
-        .args([
-            "--replace-glycan",
-            "A:79=G63337SS",
-            "--level",
-            "3",
-            "--offline",
-            "--objective",
-            "density",
-            "--density-map",
-        ])
-        .arg(&primary)
-        .arg("--density-difference-map")
-        .arg(&difference)
-        .args(["--density-effort", "deep", "--quiet", "--output"])
-        .arg(directory.path())
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(started.elapsed().as_secs_f64() < 600.0);
-    let density: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(directory.path().join("density.json")).unwrap())
-            .unwrap();
-    assert!(density["sigma_calibration"]["selected_sigma_angstrom"].is_number());
-    assert_eq!(density["difference_map"]["channel"], "Fo-Fc");
-    assert!(density["pre_relax"]["correlation"].as_f64().unwrap() >= 0.70);
-    let recovery = &density["recovery"][0];
-    assert!(recovery["root_c1_distance_angstrom"].as_f64().unwrap() < 0.5);
-    assert!(
-        recovery["three_residue_heavy_atom_rmsd_angstrom"]
-            .as_f64()
-            .unwrap()
-            < 0.5
-    );
-    assert!(
-        recovery["supported_heavy_atom_rmsd_angstrom"]
-            .as_f64()
-            .unwrap()
-            < 1.0
-    );
-    assert!(
-        recovery["full_tree_heavy_atom_rmsd_angstrom"]
-            .as_f64()
-            .unwrap()
-            < 1.0
-    );
-    for rmsd in recovery["per_residue_heavy_atom_rmsd_angstrom"]
-        .as_object()
-        .unwrap()
-        .values()
-    {
-        assert!(rmsd.as_f64().unwrap() < 1.0);
-    }
-    let validation: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(directory.path().join("validation.json")).unwrap())
-            .unwrap();
-    assert_eq!(validation["valid"], true);
-    assert!(validation["errors"].as_array().unwrap().is_empty());
-    for name in [
-        "deep-arm-best.pdb",
-        "deep-cartesian-best.pdb",
-        "fitted.pdb",
-        "glycoshape-density-best.pdb",
-        "glycoshape-nearest-fit.pdb",
-    ] {
+    let fit: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.path().join("glycoflow-fit.json")).unwrap(),
+    )
+    .unwrap();
+    let recovery = &fit["sites"][0]["evaluation"]["recovery"];
+    assert!(recovery["full_rmsd"].as_f64().unwrap() < 1.3, "{recovery}");
+    assert!(recovery["core_rmsd"].as_f64().unwrap() < 0.8, "{recovery}");
+    assert_eq!(fit["validation"]["valid"], true);
+    for name in ["fitted.pdb", "candidates.pdb", "validation.json"] {
         assert!(directory.path().join(name).is_file(), "missing {name}");
     }
 }
