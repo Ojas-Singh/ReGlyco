@@ -525,17 +525,26 @@ pub fn fit_site(
                     if clear(&fits[b]) {
                         break;
                     }
-                    let w = w0 * 10f64.powi(attempt as i32 + 1);
+                    let factor = 10f64.powi(attempt as i32 + 1);
+                    let w = w0 * factor;
                     problem.w_env = w;
                     problem.w_self = w;
                     final_contact_weight = w;
+                    // restraints escalate with the contacts (sd / sqrt(factor)): only the density
+                    // is down-weighted, so clearing a contact never distorts the ring geometry
+                    let r = &config.restraints;
+                    let scaled = RestraintOptions {
+                        sd_bond: r.sd_bond / factor.sqrt(),
+                        sd_angle: r.sd_angle / factor.sqrt(),
+                        sd_volume: r.sd_volume / factor.sqrt(),
+                    };
                     let up = cartesian_refine(
                         problem,
                         &fits[b].x,
                         templates[b],
                         config.cartesian_steps,
                         config.cartesian_lr,
-                        &config.restraints,
+                        &scaled,
                     );
                     problem.counter.add_objective_grad(config.cartesian_steps);
                     problem.w_env = w0;

@@ -284,6 +284,36 @@ pub mod steric {
     /// Evaluate contacts with caller-supplied policy thresholds.  This is
     /// useful for validation options while preserving a single topology and
     /// radius implementation for search, native validation, and WASM.
+    /// Longest metal-ligand distance treated as coordination rather than a contact (A).
+    pub const METAL_COORDINATION_LIMIT_ANGSTROM: f64 = 3.0;
+
+    fn is_metal_element(element: &str) -> bool {
+        matches!(
+            element.trim().to_ascii_uppercase().as_str(),
+            "LI" | "NA"
+                | "K"
+                | "MG"
+                | "CA"
+                | "SR"
+                | "BA"
+                | "MN"
+                | "FE"
+                | "CO"
+                | "NI"
+                | "CU"
+                | "ZN"
+                | "CD"
+                | "HG"
+        )
+    }
+
+    /// A metal ion and an N/O/S ligand within `METAL_COORDINATION_LIMIT_ANGSTROM`.
+    pub fn is_metal_coordination(a: &str, b: &str, distance_angstrom: f64) -> bool {
+        let ligand = |e: &str| matches!(e.trim().to_ascii_uppercase().as_str(), "N" | "O" | "S");
+        distance_angstrom <= METAL_COORDINATION_LIMIT_ANGSTROM
+            && ((is_metal_element(a) && ligand(b)) || (is_metal_element(b) && ligand(a)))
+    }
+
     pub fn evaluate_structure_with_thresholds(
         structure: &Structure,
         focus_sites: &[ResidueId],
@@ -442,6 +472,11 @@ pub mod steric {
                 return;
             }
             let distance_angstrom = distance(first.position, second.position);
+            // a ligand (N/O/S) at coordination distance from a metal ion is a coordination
+            // bond, LINK record or not (e.g. a glycan oxygen completing a Ca2+ site)
+            if is_metal_coordination(&first.element, &second.element, distance_angstrom) {
+                return;
+            }
             let overlap_angstrom = overlap(&first.element, &second.element, distance_angstrom);
             // Pairs with no positive surface overlap are not contacts at all.
             if overlap_angstrom <= 0.0 {
@@ -561,6 +596,21 @@ pub mod steric {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn metal_ligands_at_coordination_distance_are_not_contacts() {
+            assert!(is_metal_coordination("CA", "O", 2.32));
+            assert!(is_metal_coordination("N", "Zn", 2.1));
+            assert!(!is_metal_coordination("CA", "O", 3.2));
+            assert!(
+                !is_metal_coordination("C", "O", 2.3),
+                "a carbon is not a metal"
+            );
+            assert!(
+                !is_metal_coordination("CA", "C", 2.3),
+                "carbon is not a ligand"
+            );
+        }
 
         #[test]
         fn vdw_policy_has_clear_advisory_and_hard_bands() {
@@ -691,7 +741,9 @@ pub enum GlycanSource {
 /// the authoritative residue names supplied by the structure provider; it is
 /// deliberately kept separate from the force-field/template names used by
 /// GlySys so changing the display convention cannot change scoring chemistry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum ResidueNameFormat {
     #[serde(rename = "PDB", alias = "pdb")]
     #[default]

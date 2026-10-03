@@ -106,6 +106,11 @@ pub const FIT_POLAR_FLOOR: f64 = 2.6;
 /// Floor for carbon-oxygen/nitrogen pairs three bonds apart within the glycan (eclipsed
 /// hydroxymethyl and glycosidic geometries; the validator checks these pairs too).
 pub const FIT_ONE_FOUR_FLOOR: f64 = 2.7;
+/// 1-4 pairs across a rotatable bond (glycosidic phi/psi, exocyclic omega): carbon-carbon and
+/// oxygen-oxygen floors 0.1-0.16 A above the validator's hard limits (vdW overlap 0.6 A: C-C 2.80,
+/// O-O 2.44); eclipsed torsions put these pairs closest (C-O pairs use `FIT_ONE_FOUR_FLOOR`).
+pub const FIT_ONE_FOUR_CC_FLOOR: f64 = 2.9;
+pub const FIT_ONE_FOUR_POLAR_FLOOR: f64 = 2.6;
 
 /// Penalty grids `sum_j relu(floor - d)^2` over environment atoms for a carbon probe and a polar
 /// probe (`problem.clash_grids`), on the density box.
@@ -453,6 +458,17 @@ impl SiteProblem {
                 }
             }
         }
+        // 1-4 pairs across rotatable bonds: neighbours of the two central atoms of every torsion
+        let mut across = vec![false; n * n];
+        for q in &glycan.topology.quads {
+            let (b, c) = (q[1], q[2]);
+            for i in (0..n).filter(|&i| i != c && topo[b * n + i] == 1) {
+                for j in (0..n).filter(|&j| j != b && topo[c * n + j] == 1) {
+                    across[i * n + j] = true;
+                    across[j * n + i] = true;
+                }
+            }
+        }
         let mut self_pairs = Vec::new();
         for i in 0..n {
             for j in i + 1..n {
@@ -469,6 +485,13 @@ impl SiteProblem {
                     self_pairs.push((i, j, floor as _));
                 } else if t == 3 && is_c[i] != is_c[j] {
                     self_pairs.push((i, j, FIT_ONE_FOUR_FLOOR as _));
+                } else if t == 3 && across[i * n + j] {
+                    let floor = if is_c[i] {
+                        FIT_ONE_FOUR_CC_FLOOR
+                    } else {
+                        FIT_ONE_FOUR_POLAR_FLOOR
+                    };
+                    self_pairs.push((i, j, floor as _));
                 }
             }
         }
