@@ -76,6 +76,8 @@ pub struct Restraints {
     /// (centre, first three bonded neighbours, V0)
     pub chiral: Vec<(usize, [usize; 3], f64)>,
     pub w_volume: f64,
+    /// attachment angle: |A1 - C1| held at the linkage geometry (A1 = CG for Asn, CB for Ser/Thr)
+    pub attachment: (usize, V3, f64, f64),
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -128,16 +130,29 @@ impl Restraints {
                 chiral.push((c, k, volume(refx, c, k)));
             }
         }
+        let (a1, link) = (problem.anchor[1], problem.anchor[2]);
+        let b0 = norm(sub(a1, link));
+        let d_att = (b0 * b0 + problem.bond * problem.bond
+            - 2.0 * b0 * problem.bond * problem.angle.cos())
+        .sqrt();
         Self {
             pairs,
             chiral,
             w_volume: 1.0 / options.sd_volume.powi(2),
+            attachment: (problem.c1, a1, d_att, 1.0 / options.sd_angle.powi(2)),
         }
     }
 
     /// Restraint energy; `g` receives its gradient.
     pub fn energy(&self, x: &[V3], mut g: Option<&mut [V3]>) -> f64 {
         let mut e = 0.0;
+        let (c1, a1, d0, w) = self.attachment;
+        let v = sub(x[c1], a1);
+        let d = norm(v);
+        e += 0.5 * w * (d - d0).powi(2);
+        if let Some(g) = g.as_deref_mut() {
+            axpy(&mut g[c1], w * (d - d0) / d.max(1e-12), v);
+        }
         for &(i, j, d0, w, _) in &self.pairs {
             let v = sub(x[i], x[j]);
             let d = norm(v);
