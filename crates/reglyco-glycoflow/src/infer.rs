@@ -2,7 +2,7 @@
 //!
 //! Generous candidate glycans (high-mannose, complex, hybrid, ...) are fitted on one shared
 //! scoring region. Each fit is pruned to the subtrees that pass the calibrated support test
-//! (3 + 0.5 per torsion), and the root residue itself must pass the same test against "no
+//! (5 + 0.5 per torsion), and the root residue itself must pass the same test against "no
 //! glycan". Every distinct pruned tree is refitted on its own (unsupported branches distort a
 //! fit), and the tree with the best penalised log-likelihood gain is chosen, so a candidate wins
 //! only with the density of the residues it adds. When the map supports only the core, all

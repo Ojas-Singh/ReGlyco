@@ -33,7 +33,7 @@ use crate::support::{
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FitConfig {
     pub seed: u64,
-    // defaults: support threshold 3 + 0.5 per torsion (calibrated on synthetic maps with known
+    // defaults: support threshold 5 + 0.5 per torsion (calibrated on synthetic maps with known
     // absent residues); 384 samples x 8 Heun steps (same core/supported recovery and validity as
     // 768 x 32 on 6 X-ray and cryo-EM sites x 3 seeds, at ~1/8 of the network evaluations)
     pub n_samples: usize,
@@ -100,7 +100,7 @@ impl Default for FitConfig {
             polish_top: 4,
             polish_steps: 300,
             polish_lr: 0.01,
-            support_base: 3.0,
+            support_base: 5.0,
             support_per_torsion: 0.5,
             n_completions: 16,
             completion_guidance: 0.3,
