@@ -5,7 +5,12 @@
 //! (5 + 0.5 per torsion), and the root residue itself must pass the same test against "no
 //! glycan". Every distinct pruned tree is refitted on its own (unsupported branches distort a
 //! fit), and the tree with the best penalised log-likelihood gain is chosen, so a candidate wins
-//! only with the density of the residues it adds. When the map supports only the core, all
+//! only with the density of the residues it adds.
+//!
+//! A residue is *built* only when it also sits in density at least `DENSITY_GATE` of the way from
+//! the local bulk-solvent level to the local protein level (and its parent is built). Depositors
+//! rarely model weaker density (94-100% of deposited residues in the PDB benchmark lie above 0.3);
+//! residues that pass the statistical test below the gate are reported as weak, not built. When the map supports only the core, all
 //! candidates prune to the same core and that core is the answer.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +19,9 @@ use glycoflow_core::sequence::{Sequence, parse_glycam};
 use glysys::{ResidueId, Structure};
 
 use crate::error::Result;
-use crate::problem::{SiteProblem, V3, build_glycan, max_span};
+use reglyco_density::DensityMap;
+
+use crate::problem::{SiteProblem, V3, build_glycan, decoy_poses, max_span};
 use crate::site::{DepositedGlycan, glycam_of};
 use crate::workflow::{SiteFit, SiteRequest, WorkflowInput, fit_one};
 
@@ -105,13 +112,81 @@ pub fn pruned_sequence(
     Ok((s, tokens))
 }
 
+/// Minimum density of a built residue: fraction of the way from the bulk-solvent to the protein level.
+pub const DENSITY_GATE: f64 = 0.3;
+
+/// Map levels around a site (standard deviations of the map): protein = environment atoms within
+/// 12 A of the link atom, solvent = decoy centres in the scoring ball > 3.5 A from the environment.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct DensityLevels {
+    pub protein: f64,
+    pub solvent: f64,
+    #[serde(skip)]
+    mean: f64,
+    #[serde(skip)]
+    sd: f64,
+    #[serde(skip)]
+    periodic: bool,
+}
+
+impl DensityLevels {
+    pub fn new(map: &DensityMap, problem: &SiteProblem, environment: &[V3]) -> Option<Self> {
+        let v = map.values();
+        let n = v.len() as f64;
+        let mean = v.iter().map(|x| *x as f64).sum::<f64>() / n;
+        let sd = (v.iter().map(|x| (*x as f64 - mean).powi(2)).sum::<f64>() / n).sqrt();
+        let mut levels = Self {
+            protein: 0.0,
+            solvent: 0.0,
+            mean,
+            sd,
+            periodic: map.is_full_unit_cell(),
+        };
+        let d = |a: V3, b: V3| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt();
+        let link = problem.anchor[2];
+        let protein: Vec<V3> = environment
+            .iter()
+            .copied()
+            .filter(|p| d(*p, link) < 12.0)
+            .collect();
+        let solvent: Vec<V3> = decoy_poses(2048)
+            .into_iter()
+            .map(|(dir, u, _)| [0, 1, 2].map(|k| link[k] + dir[k] * (problem.radius - 3.0) * u))
+            .filter(|p| environment.iter().all(|e| d(*p, *e) > 3.5))
+            .collect();
+        levels.protein = levels.mean_at(map, &protein)?;
+        levels.solvent = levels.mean_at(map, &solvent)?;
+        (levels.protein > levels.solvent).then_some(levels)
+    }
+
+    fn mean_at(&self, map: &DensityMap, pts: &[V3]) -> Option<f64> {
+        let vals: Vec<f64> = pts
+            .iter()
+            .filter_map(|p| map.value_at_cartesian(*p, self.periodic))
+            .map(|x| (x - self.mean) / self.sd)
+            .collect();
+        (!vals.is_empty()).then(|| vals.iter().sum::<f64>() / vals.len() as f64)
+    }
+
+    /// Density over `pts` as a fraction of the way from the solvent to the protein level.
+    pub fn fraction(&self, map: &DensityMap, pts: &[V3]) -> Option<f64> {
+        self.mean_at(map, pts)
+            .map(|v| (v - self.solvent) / (self.protein - self.solvent))
+    }
+}
+
 /// One candidate fit, pruned to its density-supported tree.
 pub struct CandidateFit {
     pub name: String,
     pub sequence: String,
     pub fit: SiteFit,
-    /// residue paths with density (root first); empty: the root itself is not supported
+    /// built residue paths (root first): statistically supported and at or above `DENSITY_GATE`,
+    /// parent built; empty: no glycan built
     pub supported: Vec<String>,
+    /// statistically supported but below the density gate (or below a weak parent): not built
+    pub weak: Vec<String>,
+    /// density fraction of every statistically supported residue
+    pub density_fraction: BTreeMap<String, f64>,
     pub root_gain: f64,
     /// penalised log-likelihood gain of the supported tree (0 when nothing is supported)
     pub score: f64,
@@ -151,13 +226,22 @@ pub fn tree_torsions(problem: &SiteProblem, paths: &BTreeSet<String>) -> usize {
         + 2
 }
 
+/// A candidate fit and its statistically supported residues (before the density gate).
+struct StatFit {
+    name: String,
+    sequence: String,
+    fit: SiteFit,
+    root_gain: f64,
+    statistical: Vec<String>,
+}
+
 fn fit_candidate(
     input: &WorkflowInput,
     residue: &ResidueId,
     protein: &Structure,
     name: &str,
     sequence: &str,
-) -> Result<CandidateFit> {
+) -> Result<StatFit> {
     let request = SiteRequest {
         residue: residue.clone(),
         sequence: Some(sequence.to_string()),
@@ -172,7 +256,7 @@ fn fit_candidate(
     let root: BTreeSet<String> = ["r".to_string()].into();
     let root_gain = tree_gain(problem, x, &root);
     let root_ok = root_gain > base + per * tree_torsions(problem, &root) as f64;
-    let supported: Vec<String> = if root_ok {
+    let statistical: Vec<String> = if root_ok {
         std::iter::once("r".to_string())
             .chain(
                 fit.outcome
@@ -185,20 +269,72 @@ fn fit_candidate(
     } else {
         Vec::new()
     };
-    let keep: BTreeSet<String> = supported.iter().cloned().collect();
+    Ok(StatFit {
+        name: name.to_string(),
+        sequence: sequence.to_string(),
+        fit,
+        root_gain,
+        statistical,
+    })
+}
+
+/// Apply the density gate (in depth order: parents before children) and score the built tree.
+fn gate(
+    input: &WorkflowInput,
+    levels: Option<&DensityLevels>,
+    stat: StatFit,
+) -> Result<CandidateFit> {
+    let (base, per) = (
+        input.options.fit.support_base,
+        input.options.fit.support_per_torsion,
+    );
+    let StatFit {
+        name,
+        sequence,
+        fit,
+        root_gain,
+        statistical,
+    } = stat;
+    let problem = &fit.problem;
+    let x = &fit.outcome.basins[fit.outcome.best].x;
+    let mut density_fraction = BTreeMap::new();
+    let mut built: Vec<String> = Vec::new();
+    let mut weak: Vec<String> = Vec::new();
+    for path in &statistical {
+        let pts: Vec<V3> = (0..problem.n_atoms)
+            .filter(|&i| problem.keep[i] && &problem.glycan.res_paths[i] == path)
+            .map(|i| x[i])
+            .collect();
+        let frac = levels.and_then(|l| l.fraction(input.map, &pts));
+        if let Some(f) = frac {
+            density_fraction.insert(path.clone(), f);
+        }
+        let parent_built = path == "r"
+            || path
+                .rsplit_once('/')
+                .is_some_and(|(parent, _)| built.iter().any(|b| b == parent));
+        if parent_built && frac.is_none_or(|f| f >= DENSITY_GATE) {
+            built.push(path.clone());
+        } else {
+            weak.push(path.clone());
+        }
+    }
+    let keep: BTreeSet<String> = built.iter().cloned().collect();
     let (score, pruned, tokens) = if keep.is_empty() {
         (0.0, None, BTreeMap::new())
     } else {
         let score =
             tree_gain(problem, x, &keep) - base - per * tree_torsions(problem, &keep) as f64;
-        let (p, t) = pruned_sequence(sequence, &keep)?;
+        let (p, t) = pruned_sequence(&sequence, &keep)?;
         (score, Some(p), t)
     };
     Ok(CandidateFit {
-        name: name.to_string(),
-        sequence: sequence.to_string(),
+        name,
+        sequence,
         fit,
-        supported,
+        supported: built,
+        weak,
+        density_fraction,
         root_gain,
         score,
         pruned,
@@ -209,6 +345,8 @@ fn fit_candidate(
 pub struct Inference {
     /// first-round fits, then refits of distinct pruned trees
     pub candidates: Vec<CandidateFit>,
+    /// map levels behind the density gate (None: no density map)
+    pub levels: Option<DensityLevels>,
     pub best: usize,
     /// shared scoring-ball radius (A)
     pub region_radius: f64,
@@ -249,23 +387,36 @@ pub fn glycan_from_density(
     let region_radius = options.problem.region_radius.unwrap_or(reach + 2.5);
     options.problem.region_radius = Some(region_radius);
     let mut fits: Vec<CandidateFit> = Vec::new();
-    let run = |options: &crate::workflow::WorkflowOptions, name: &str, seq: &str| {
-        let sub = WorkflowInput {
-            structure: input.structure,
-            structure_text: input.structure_text,
-            map: input.map,
-            sites: Vec::new(),
-            model: input.model,
-            options: options.clone(),
-        };
-        fit_candidate(&sub, residue, protein, name, seq)
+    let sub = |options: &crate::workflow::WorkflowOptions| WorkflowInput {
+        structure: input.structure,
+        structure_text: input.structure_text,
+        map: input.map,
+        sites: Vec::new(),
+        model: input.model,
+        options: options.clone(),
     };
+    // density levels of the site (candidate independent): from the first fit's site
+    let mut levels: Option<DensityLevels> = None;
     for (name, seq) in candidates {
-        let f = run(&options, name, seq)?;
+        let stat = fit_candidate(&sub(&options), residue, protein, name, seq)?;
         // the atom width is candidate independent: calibrate once
-        options.sigma.get_or_insert(f.fit.sigma.selected);
-        fits.push(f);
+        options.sigma.get_or_insert(stat.fit.sigma.selected);
+        if levels.is_none() {
+            let env: Vec<V3> = stat
+                .fit
+                .site
+                .environment
+                .iter()
+                .map(|a| a.position)
+                .collect();
+            levels = DensityLevels::new(input.map, &stat.fit.problem, &env);
+        }
+        fits.push(gate(&sub(&options), levels.as_ref(), stat)?);
     }
+    let run = |options: &crate::workflow::WorkflowOptions, name: &str, seq: &str| {
+        let stat = fit_candidate(&sub(options), residue, protein, name, seq)?;
+        gate(&sub(options), levels.as_ref(), stat)
+    };
     if refit {
         let mut seen: BTreeSet<String> = fits.iter().map(|f| f.sequence.clone()).collect();
         let n = fits.len();
@@ -289,6 +440,7 @@ pub fn glycan_from_density(
         })
         .unwrap_or(0);
     Ok(Inference {
+        levels,
         sigma: options.sigma.unwrap_or(f64::NAN),
         candidates: fits,
         best,

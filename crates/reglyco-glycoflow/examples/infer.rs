@@ -107,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|c| {
             serde_json::json!({"name": c.name, "score": c.score, "root_gain": c.root_gain,
-                "supported": c.supported, "pruned": c.pruned})
+                "supported": c.supported, "weak": c.weak, "pruned": c.pruned})
         })
         .collect();
     println!(
@@ -118,7 +118,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "chosen": best.name, "pruned": best.pruned, "supported": best.supported,
             "deposited_sequence": deposited.as_ref().and_then(|d| d.glycam_sequence().ok()),
             "composition": comp, "kept_rmsd": kept_rmsd, "candidates": cands,
-            "map_evidence": evidence,
+            "map_evidence": evidence, "weak": best.weak, "density_fraction": best.density_fraction,
+            "density_levels": inf.levels, "density_gate": reglyco_glycoflow::infer::DENSITY_GATE,
         })
     );
     Ok(())
