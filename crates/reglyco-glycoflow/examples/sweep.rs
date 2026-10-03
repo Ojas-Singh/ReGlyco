@@ -91,6 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "valid": result.validation.as_ref().map(|v| v.valid),
                     "final_contact_weight": fit.outcome.final_contact_weight,
                     "e_env": best.terms.e_env, "e_self": best.terms.e_self, "e_restraint": best.e_restraint,
+                    "prior_deviation": fit.outcome.prior_deviation,
                     "deposited": dep.as_ref().map(|d| serde_json::json!({
                         "loglik": d.terms.loglik, "total": d.terms.total, "e_env": d.terms.e_env,
                         "e_self": d.terms.e_self, "e_att": d.terms.e_att, "e_prior": d.terms.e_prior,

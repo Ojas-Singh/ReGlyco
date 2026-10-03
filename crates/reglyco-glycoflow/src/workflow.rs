@@ -295,6 +295,7 @@ fn site_report(f: &SiteFit, input: &WorkflowInput) -> Value {
             "stages_seconds": o.counters.stages,
             "fit_seconds": o.wall_seconds,
             "final_contact_weight": o.final_contact_weight,
+            "prior_deviation": o.prior_deviation,
             "preparation_seconds": f.preparation_seconds,
             "prior_seconds": f.prior_seconds,
             "device": input.model.device,

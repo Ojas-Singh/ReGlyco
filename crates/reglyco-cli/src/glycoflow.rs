@@ -54,7 +54,7 @@ pub(crate) struct GlycoflowArgs {
     #[arg(long = "glycoflow-basins", default_value_t = 24)]
     pub(crate) basins: usize,
     /// Weight of the GlycoFlow marginal prior in the objective.
-    #[arg(long = "glycoflow-prior-weight", default_value_t = 1.0)]
+    #[arg(long = "glycoflow-prior-weight", default_value_t = 0.25)]
     pub(crate) prior_weight: f64,
     /// Weight of the protein/environment and intra-glycan contact energies in the final
     /// objective (the search uses 10 and continues to this weight; 0 disables the stage).

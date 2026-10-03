@@ -273,7 +273,9 @@ impl Default for ProblemOptions {
         Self {
             w_env: 10.0,
             w_self: 10.0,
-            w_prior: 1.0,
+            // weak: GlycoFlow proposes and keeps density-insensitive torsions plausible; the map
+            // decides where it has evidence (Python problem.SiteProblem.w_prior)
+            w_prior: 0.25,
             amide_sd_deg: 10.0,
             n_templates: 16,
             template_seed: 0,

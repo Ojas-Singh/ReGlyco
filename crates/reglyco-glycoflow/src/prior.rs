@@ -127,3 +127,49 @@ mod tests {
         }
     }
 }
+
+/// Percentile below which a torsion counts as one GlycoFlow essentially never generates.
+pub const RARE_PERCENTILE: f64 = 1.0;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RareTorsion {
+    /// "residue path:atom-atom-atom-atom"
+    pub torsion: String,
+    pub degrees: f64,
+    /// percentile of GlycoFlow's marginal density among the densities of its own samples
+    pub percentile: f64,
+}
+
+/// How far a pose is from what GlycoFlow generates for this glycan (`prior.prior_deviation`):
+/// a real but unusual conformation where the map supports it, a suspect one where it does not.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PriorDeviation {
+    pub e_prior: f64,
+    pub rare_torsions: Vec<RareTorsion>,
+    pub n_torsions: usize,
+}
+
+impl MarginalPrior {
+    fn density(&self, k: usize, v: f64) -> f64 {
+        let t = self.n_torsions;
+        (0..self.n_samples)
+            .map(|j| (self.kappa * (v - self.samples[j * t + k]).cos()).exp())
+            .sum::<f64>()
+            / self.n_samples.max(1) as f64
+    }
+
+    /// Per torsion: percentile (0-100) of the marginal density at `tau` among the densities at the
+    /// prior's own samples.
+    pub fn percentiles(&self, tau: &[f64]) -> Vec<f64> {
+        let (s, t) = (self.n_samples, self.n_torsions);
+        (0..t)
+            .map(|k| {
+                let d = self.density(k, tau[k]);
+                let below = (0..s)
+                    .filter(|&j| self.density(k, self.samples[j * t + k]) < d)
+                    .count();
+                100.0 * below as f64 / s.max(1) as f64
+            })
+            .collect()
+    }
+}

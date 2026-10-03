@@ -17,12 +17,12 @@ use reglyco_density::site_likelihood::{
     SiteEnvironmentAtom, SiteLikelihood, SiteLikelihoodOptions,
 };
 
-use crate::cartesian::{CartesianFit, RestraintOptions, cartesian_refine_all};
+use crate::cartesian::{CartesianFit, RestraintOptions, cartesian_refine, cartesian_refine_all};
 use crate::counter::CounterSnapshot;
 use crate::error::{Result, invalid};
 use crate::model::GlycoflowModel;
 use crate::observation::{DensityObservation, Observation};
-use crate::prior::MarginalPrior;
+use crate::prior::{MarginalPrior, PriorDeviation, RARE_PERCENTILE, RareTorsion};
 use crate::problem::{Pose, ProblemOptions, SiteProblem, Terms, V3, build_glycan, max_span};
 use crate::search::{method_b, refine, sample_free};
 use crate::site::Site;
@@ -73,6 +73,20 @@ pub struct FitConfig {
     pub cartesian_lr: f64,
     pub cartesian_clash_weight: f64,
     pub restraints: RestraintOptions,
+    /// escalate the contact weight in torsion space too (re-ranking every basin under it)
+    pub torsion_escalation: bool,
+    pub cartesian_escalation: Escalation,
+}
+
+/// Contact-weight escalation of the Cartesian stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Escalation {
+    /// refine and re-rank every basin under the escalated weight
+    Rerank,
+    /// rank once at the final contact weight; only the selected basin is refined under higher
+    /// weights (and re-scored at the final weight), so contacts never dominate the ranking
+    Selected,
 }
 
 impl Default for FitConfig {
@@ -92,7 +106,7 @@ impl Default for FitConfig {
             completion_guidance: 0.3,
             alt_margin: 5.0,
             flow_steps: 8,
-            guidance_scale: 1.0,
+            guidance_scale: 2.0,
             guidance_start: 0.3,
             search_clash_weight: 10.0,
             final_clash_weight: Some(100.0),
@@ -104,6 +118,8 @@ impl Default for FitConfig {
             cartesian_lr: 0.005,
             cartesian_clash_weight: 100.0,
             restraints: RestraintOptions::default(),
+            torsion_escalation: false,
+            cartesian_escalation: Escalation::Selected,
         }
     }
 }
@@ -324,6 +340,42 @@ pub struct FitOutcome {
     pub wall_seconds: f64,
     /// contact weight of the final objective (after any escalation)
     pub final_contact_weight: f64,
+    /// how far the selected pose is from what GlycoFlow generates (None without a prior)
+    pub prior_deviation: Option<PriorDeviation>,
+}
+
+/// Prior diagnostics of a placed pose: torsions measured on the coordinates.
+pub fn prior_deviation(problem: &SiteProblem, x: &[V3]) -> Option<PriorDeviation> {
+    let prior = problem.prior.as_ref()?;
+    let quads = &problem.glycan.topology.quads;
+    let tau: Vec<f64> = quads
+        .iter()
+        .map(|q| crate::problem::dihedral(x[q[0]], x[q[1]], x[q[2]], x[q[3]]))
+        .collect();
+    let pct = prior.percentiles(&tau);
+    let names = &problem.glycan.atom_names;
+    let rare_torsions = quads
+        .iter()
+        .enumerate()
+        .filter(|(t, _)| pct[*t] < RARE_PERCENTILE)
+        .map(|(t, q)| RareTorsion {
+            torsion: format!(
+                "{}:{}",
+                problem.glycan.res_paths[q[1]],
+                q.iter()
+                    .map(|&i| names[i].as_str())
+                    .collect::<Vec<_>>()
+                    .join("-")
+            ),
+            degrees: tau[t].to_degrees(),
+            percentile: pct[t],
+        })
+        .collect();
+    Some(PriorDeviation {
+        e_prior: prior.energy(&tau, None),
+        rare_torsions,
+        n_torsions: tau.len(),
+    })
 }
 
 /// Fit one site (`pipeline.fit_site`). The problem's prior (if any) must already be set. The
@@ -376,7 +428,12 @@ pub fn fit_site(
     let mut final_contact_weight = problem.w_env;
     if let Some(w0) = config.final_clash_weight {
         let mut w = w0;
-        for round in 0..=config.max_escalations {
+        let rounds = if config.torsion_escalation {
+            config.max_escalations
+        } else {
+            0
+        };
+        for round in 0..=rounds {
             problem.w_env = w;
             problem.w_self = w;
             final_contact_weight = w;
@@ -420,30 +477,81 @@ pub fn fit_site(
             let problem: &SiteProblem = problem;
             poses.par_iter().map(|p| problem.place(p)).collect()
         };
-        let mut w = config.cartesian_clash_weight;
-        for _ in 0..=config.max_escalations {
-            problem.w_env = w;
-            problem.w_self = w;
-            final_contact_weight = w;
-            let fits = cartesian_refine_all(
-                problem,
-                &xs,
-                &templates,
-                config.cartesian_steps,
-                config.cartesian_lr,
-                &config.restraints,
-            );
-            let best = (0..fits.len())
+        let w0 = config.cartesian_clash_weight;
+        let argmin = |fits: &[CartesianFit]| {
+            (0..fits.len())
                 .min_by(|&a, &b| fits[a].total.total_cmp(&fits[b].total))
-                .unwrap_or(0);
-            let clear =
-                fits[best].terms.e_env + fits[best].terms.e_self <= config.contact_tolerance;
-            xs = fits.iter().map(|f| f.x.clone()).collect();
-            cartesian = Some(fits);
-            if clear {
-                break;
+                .unwrap_or(0)
+        };
+        let clear = |f: &CartesianFit| f.terms.e_env + f.terms.e_self <= config.contact_tolerance;
+        match config.cartesian_escalation {
+            Escalation::Rerank => {
+                let mut w = w0;
+                for _ in 0..=config.max_escalations {
+                    problem.w_env = w;
+                    problem.w_self = w;
+                    final_contact_weight = w;
+                    let fits = cartesian_refine_all(
+                        problem,
+                        &xs,
+                        &templates,
+                        config.cartesian_steps,
+                        config.cartesian_lr,
+                        &config.restraints,
+                    );
+                    let ok = clear(&fits[argmin(&fits)]);
+                    xs = fits.iter().map(|f| f.x.clone()).collect();
+                    cartesian = Some(fits);
+                    if ok {
+                        break;
+                    }
+                    w *= 10.0;
+                }
             }
-            w *= 10.0;
+            Escalation::Selected => {
+                problem.w_env = w0;
+                problem.w_self = w0;
+                final_contact_weight = w0;
+                let mut fits = cartesian_refine_all(
+                    problem,
+                    &xs,
+                    &templates,
+                    config.cartesian_steps,
+                    config.cartesian_lr,
+                    &config.restraints,
+                );
+                for attempt in 0..config.max_escalations {
+                    let b = argmin(&fits);
+                    if clear(&fits[b]) {
+                        break;
+                    }
+                    let w = w0 * 10f64.powi(attempt as i32 + 1);
+                    problem.w_env = w;
+                    problem.w_self = w;
+                    final_contact_weight = w;
+                    let up = cartesian_refine(
+                        problem,
+                        &fits[b].x,
+                        templates[b],
+                        config.cartesian_steps,
+                        config.cartesian_lr,
+                        &config.restraints,
+                    );
+                    problem.counter.add_objective_grad(config.cartesian_steps);
+                    problem.w_env = w0;
+                    problem.w_self = w0;
+                    // re-scored at the ranking weight
+                    fits[b] = cartesian_refine(
+                        problem,
+                        &up.x,
+                        templates[b],
+                        0,
+                        config.cartesian_lr,
+                        &config.restraints,
+                    );
+                }
+                cartesian = Some(fits);
+            }
         }
         problem.counter.add_stage("cartesian", t0);
     }
@@ -518,6 +626,7 @@ pub fn fit_site(
         .copied()
         .filter(|&i| energies[i] - energies[best] <= config.alt_margin)
         .collect();
+    let deviation = prior_deviation(problem, &basins[best].x);
     Ok(FitOutcome {
         basins,
         order,
@@ -529,6 +638,7 @@ pub fn fit_site(
         counters: c.snapshot(),
         wall_seconds: started.elapsed().as_secs_f64(),
         final_contact_weight,
+        prior_deviation: deviation,
     })
 }
 
