@@ -59,8 +59,11 @@ fn fixture_dir() -> PathBuf {
 }
 
 fn library_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../GlycoFlow/glycoflow/resources/residue_library.json")
+    PathBuf::from(
+        std::env::var("GLYCOFLOW_MODEL")
+            .expect("set GLYCOFLOW_MODEL (licensed GlycoFlow model directory)"),
+    )
+    .join("residue_library.json")
 }
 
 fn f(v: &Value) -> f64 {

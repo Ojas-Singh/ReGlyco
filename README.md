@@ -167,8 +167,10 @@ large proteins.
 Density fitting (`refine --objective density`) fits the glycan of known
 sequence at each `--replace-glycan` site into a CCP4/MRC map with the GlycoFlow
 flow model (crate `reglyco-glycoflow`). It needs the GlycoFlow model directory
-(`glycoflow.safetensors`, `glycoflow.json`, `residue_library.json`) through
-`--glycoflow-model` or `$GLYCOFLOW_MODEL`:
+(`glycoflow.safetensors`, `glycoflow.json`, `residue_library.json`), which is
+licensed separately from ReGlyco (GlycoFlow Model License: non-commercial academic
+research; access through the GlycoFlow Hugging Face repository after accepting the
+licence), through `--glycoflow-model` or `$GLYCOFLOW_MODEL`:
 
 ```console
 export GLYCOFLOW_MODEL=/path/to/model
@@ -381,6 +383,7 @@ The workspace crates are:
 - `reglyco-validate`, structural and attachment-metadata checks
 - `reglyco-density`, CCP4/MRC maps, map acquisition, map-agreement scoring,
   and the site likelihood used by the GlycoFlow fitter
+- `glycoflow-core`, the GlycoFlow inference engine (open; the trained model is licensed separately)
 - `reglyco-glycoflow`, GlycoFlow fitting of glycans into density maps
 - `reglyco-saxs`, the in-memory ReGlyco adapter for the sibling crabSAXS SAXS
   modeling, reweighting, and glycoform-search APIs

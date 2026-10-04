@@ -1,8 +1,9 @@
 //! Offline check of the objective and its analytic gradients on a synthetic site: a small
 //! protein-like environment, a density box built from a known glycan pose, a marginal prior from
 //! synthetic samples. Gradients with respect to torsions and both attachment angles are compared
-//! with central finite differences of the total objective. Needs only the GlycoFlow residue
-//! library of the sibling GlycoFlow checkout (no model, no map, no network).
+//! with central finite differences of the total objective. Needs only the residue library of the
+//! licensed GlycoFlow model directory (`GLYCOFLOW_MODEL`; no weights, map or network are used);
+//! run with `--ignored`.
 
 use std::path::Path;
 
@@ -17,10 +18,12 @@ use reglyco_glycoflow::site::{SequenceProvenance, Site, SymmetryInfo};
 use reglyco_glycoflow::symmetry::EnvAtom;
 
 const SEQUENCE: &str = "DManpb1-4DGlcpNAcb1-4DGlcpNAcb1-OH";
+const NEEDS_MODEL: &str =
+    "needs GLYCOFLOW_MODEL (licensed GlycoFlow model directory with residue_library.json)";
 
 fn library() -> glycoflow_core::ResidueLibrary {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../GlycoFlow/glycoflow/resources/residue_library.json");
+    let path = Path::new(&std::env::var("GLYCOFLOW_MODEL").expect(NEEDS_MODEL))
+        .join("residue_library.json");
     glycoflow_core::ResidueLibrary::from_json_slice(
         &std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
     )
@@ -137,6 +140,7 @@ fn problem(site: &Site, observed: Option<SiteBox>) -> SiteProblem {
 }
 
 #[test]
+#[ignore = "needs GLYCOFLOW_MODEL (licensed GlycoFlow model directory with residue_library.json)"]
 fn objective_gradients_match_finite_differences() {
     let site = site();
     let draft = problem(&site, None);
@@ -259,6 +263,7 @@ fn objective_gradients_match_finite_differences() {
 }
 
 #[test]
+#[ignore = "needs GLYCOFLOW_MODEL (licensed GlycoFlow model directory with residue_library.json)"]
 fn attachment_reproduces_the_requested_angles() {
     let site = site();
     let problem = problem(&site, None);

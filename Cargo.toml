@@ -51,6 +51,7 @@ opt-level = 3
 
 [workspace]
 members = [
+    "crates/glycoflow-core",
     "crates/reglyco-build",
     "crates/reglyco-cli",
     "crates/reglyco-core",

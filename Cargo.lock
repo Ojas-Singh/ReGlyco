@@ -1862,6 +1862,7 @@ dependencies = [
  "nalgebra 0.33.3",
  "rayon",
  "regex",
+ "safetensors 0.7.0",
  "serde",
  "serde_json",
 ]

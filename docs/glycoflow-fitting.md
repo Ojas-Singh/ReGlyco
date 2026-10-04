@@ -1,8 +1,8 @@
 # GlycoFlow density fitting
 
 `reglyco refine --objective density` fits the glycan at each `--replace-glycan` site with the
-GlycoFlow flow model (crate `reglyco-glycoflow`, which depends on
-`../GlycoFlow/rust/glycoflow-core`). It is ReGlyco's only density fitter; the earlier
+GlycoFlow flow model (crate `reglyco-glycoflow` on the open GlycoFlow engine
+`crates/glycoflow-core`). It is ReGlyco's only density fitter; the earlier
 GlycoShape-ensemble fitter (`--density-effort`, `--density-deep-strategy`, ...) was removed after
 tag `pre-glycoflow-density`, and `--density-search` is accepted only as `glycoflow`.
 
@@ -20,8 +20,14 @@ map or, with `--pdb-id`, downloads the PDBe EDS (or, with `--density-map-source 
 2Fo-Fc) map; `--density-sigma` and `--density-resolution` override the calibrated atom width and
 the REMARK 2 resolution.
 
-The model directory is produced by `scripts/export_rust_fixtures.py` in GlycoFlow (weights) plus
-`glycoflow/resources/residue_library.json`. Build with `--features reglyco-cli/glycoflow-cuda`
+The trained GlycoFlow model is **not** part of this repository and is not covered by its
+licence. A model directory holds `glycoflow.safetensors` (weights), `glycoflow.json` (network
+configuration) and `residue_library.json` (residue templates and pucker states); it is
+distributed under the GlycoFlow Model License (non-commercial academic research; commercial use
+needs a separate written licence) through the GlycoFlow Hugging Face repository
+(`Ojas-Singh/glycoflow`), with access granted after accepting that licence. ReGlyco reads the
+directory at run time (`--glycoflow-model` or `$GLYCOFLOW_MODEL`) and stops with an error when it
+is absent. Build with `--features reglyco-cli/glycoflow-cuda`
 (`CUDA_COMPUTE_CAP=121` on a GB10) for the GPU path; the CPU path needs no feature.
 
 What it does: observation-guided GlycoFlow generation (384 samples, 8 Heun steps), refinement of 24 distinct

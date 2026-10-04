@@ -4,13 +4,25 @@ Fits a glycan of known sequence to a protein site in a density map with the froz
 flow model. Rust port of the Python reference `glycoflow/fitting/` (GlycoFlow repository);
 used by `reglyco refine --objective density`.
 
-## Cross-repository dependency
+## Engine (open) and model (licensed)
 
-The GlycoFlow inference engine (`glycoflow-core`: GLYCAM builder, torsion kinematics, network,
-ODE sampler with a guidance hook) lives in the GlycoFlow repository and is used by path,
-`../../../GlycoFlow/rust/glycoflow-core`, with GlycoFlow checked out next to ReGlyco (like GlySys
-and crabWURCS). The dependency is one-way: GlycoFlow never depends on ReGlyco. The offline tests
-read the residue library from the same checkout (`GlycoFlow/glycoflow/resources/`).
+The GlycoFlow inference engine (`crates/glycoflow-core`: GLYCAM builder, torsion kinematics,
+network, ODE sampler with a guidance hook) is part of this workspace and open source under
+ReGlyco's licence.
+
+The trained GlycoFlow model is **not** part of this repository and is not covered by its
+licence. A model directory holds `glycoflow.safetensors` (weights), `glycoflow.json` (network
+configuration) and `residue_library.json` (residue templates and pucker states); it is
+distributed under the GlycoFlow Model License (non-commercial academic research; commercial use
+needs a separate written licence) through the GlycoFlow Hugging Face repository
+(`Ojas-Singh/glycoflow`), with access granted after accepting that licence. ReGlyco reads the
+directory at run time (`--glycoflow-model` or `$GLYCOFLOW_MODEL`) and stops with an error when it
+is absent.
+
+Tests that need the model run with `--ignored`: `tests/synthetic.rs` (residue library only,
+`GLYCOFLOW_MODEL`), `tests/parity.rs` (`GLYCOFLOW_MODEL`, `GLYCOFLOW_FIT_FIXTURES` from GlycoFlow's
+`scripts/fitting/export_fit_fixtures.py`), and `crates/glycoflow-core/tests`
+(`GLYCOFLOW_RUST_DIR`: a GlycoFlow checkout's `rust/` with fixtures and weights).
 
 `glycoflow-core` brings candle; its `gemm` crates are optimised in dev/test builds too (root
 `Cargo.toml`), because their fp16 NEON assembly does not assemble at opt-level 0 on aarch64.

@@ -7,10 +7,10 @@ license.workspace = true
 description = "GlycoFlow-guided fitting of glycans of known sequence into density maps"
 repository = "https://github.com/Ojas-Singh/ReGlyco"
 
-# Cross-repository dependency: the GlycoFlow inference engine (`glycoflow-core`) lives in the
-# GlycoFlow repository (`rust/glycoflow-core`), checked out next to ReGlyco (`../GlycoFlow`, as
-# GlySys and crabWURCS are). The dependency is one-way: GlycoFlow never depends on ReGlyco.
-# The Python reference of this crate is `glycoflow/fitting/` in the same GlycoFlow checkout.
+# The GlycoFlow inference engine (`crates/glycoflow-core`) is part of this workspace and open
+# source like the rest of ReGlyco. The trained GlycoFlow model (weights, network config, residue
+# library) is licensed separately and loaded at run time from a model directory (README.md).
+# The Python reference of this crate is `glycoflow/fitting/` in the GlycoFlow repository.
 
 [features]
 default = []
@@ -21,7 +21,7 @@ cuda = ["glycoflow-core/cuda"]
 candle-core = "0.9.2"
 crabwurcs-iupac.workspace = true
 crabwurcs-pdb.workspace = true
-glycoflow-core = { path = "../../../GlycoFlow/rust/glycoflow-core" }
+glycoflow-core = { version = "0.1.0", path = "../glycoflow-core" }
 glysys.workspace = true
 rayon.workspace = true
 reglyco-density = { version = "0.1.0", path = "../reglyco-density" }
