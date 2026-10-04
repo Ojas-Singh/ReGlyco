@@ -13,8 +13,8 @@ reglyco refine --protein model.pdb --density-map map.ccp4 \
   --replace-glycan A:79 --seed 0 -o out/
 ```
 
-Without `--glycoflow-model` or `$GLYCOFLOW_MODEL` the command stops with an error before loading
-anything. `--replace-glycan SITE` fits the deposited glycan's sequence;
+The model licence and the model are checked before anything else is loaded (below).
+`--replace-glycan SITE` fits the deposited glycan's sequence;
 `--replace-glycan SITE=<GLYCAM sequence>` fits another one. `--density-map auto` resolves a sidecar
 map or, with `--pdb-id`, downloads the PDBe EDS (or, with `--density-map-source rcsb`, the RCSB
 2Fo-Fc) map; `--density-sigma` and `--density-resolution` override the calibrated atom width and
@@ -22,12 +22,15 @@ the REMARK 2 resolution.
 
 The trained GlycoFlow model is **not** part of this repository and is not covered by its
 licence. A model directory holds `glycoflow.safetensors` (weights), `glycoflow.json` (network
-configuration) and `residue_library.json` (residue templates and pucker states); it is
-distributed under the GlycoFlow Model License (non-commercial academic research; commercial use
-needs a separate written licence) through the GlycoFlow Hugging Face repository
-(`Ojas-Singh/glycoflow`), with access granted after accepting that licence. ReGlyco reads the
-directory at run time (`--glycoflow-model` or `$GLYCOFLOW_MODEL`) and stops with an error when it
-is absent. Build with `--features reglyco-cli/glycoflow-cuda`
+configuration) and `residue_library.json` (residue templates and pucker states); it is licensed
+under the GlycoFlow Source-Available Non-Commercial License (non-commercial academic research;
+commercial use needs a separate written licence) and distributed through the gated Hugging Face
+repository `Ojas-Singh/glycoflow`, where the GlycoFlow authors approve access requests. ReGlyco
+uses it only after the licence is accepted (`--accept-glycoflow-license`, recorded once in the
+model cache `~/.cache/reglyco/glycoflow` or `$GLYCOFLOW_CACHE`; `GLYCOFLOW_ACCEPT_LICENSE=1` for one
+run). It then loads `--glycoflow-model` / `$GLYCOFLOW_MODEL`, or the cached download, or downloads
+the model with the user's Hugging Face token (`$HF_TOKEN` or `hf auth login`) at a pinned revision
+with SHA-256 checks (`crates/reglyco-cli/src/glycoflow_model.rs`). Build with `--features reglyco-cli/glycoflow-cuda`
 (`CUDA_COMPUTE_CAP=121` on a GB10) for the GPU path; the CPU path needs no feature.
 
 What it does: observation-guided GlycoFlow generation (384 samples, 8 Heun steps), refinement of 24 distinct

@@ -12,6 +12,7 @@ use reglyco_glycoflow::workflow::{
 };
 use reglyco_glycoflow::{ComputeDevice, GlycoflowModel, SymmetryMode};
 
+use super::glycoflow_model::ModelSource;
 use super::{RefineArgs, dry_options, fetch_protein, parse_site, resolve_density_map_for_refine};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -36,9 +37,12 @@ pub(crate) enum GlycoflowSymmetryArg {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct GlycoflowArgs {
     /// GlycoFlow model directory (glycoflow.safetensors, glycoflow.json, residue_library.json);
-    /// default: $GLYCOFLOW_MODEL.
+    /// default: $GLYCOFLOW_MODEL, else the model downloaded from Hugging Face with your token.
     #[arg(long = "glycoflow-model")]
     pub(crate) model: Option<PathBuf>,
+    /// Accept the GlycoFlow Source-Available Non-Commercial License of the model (recorded once).
+    #[arg(long = "accept-glycoflow-license")]
+    pub(crate) accept_license: bool,
     /// Device of the GlycoFlow network (cuda needs a build with reglyco-cli/glycoflow-cuda).
     #[arg(long = "glycoflow-device", value_enum, default_value_t = GlycoflowDeviceArg::Cpu)]
     pub(crate) device: GlycoflowDeviceArg,
@@ -81,20 +85,9 @@ pub(crate) fn run_refine_glycoflow(arguments: RefineArgs, started: Instant) -> a
             "--objective density fits the glycan at --replace-glycan SITE (or SITE=<GLYCAM sequence>)"
         );
     }
-    // Fail before any download or parsing when no model is configured.
-    let dir = GlycoflowModel::resolve_dir(g.model.as_deref()).map_err(|_| {
-        anyhow::anyhow!(
-            "--objective density needs a GlycoFlow model: pass --glycoflow-model <dir> or set \
-             $GLYCOFLOW_MODEL to a directory with glycoflow.safetensors, glycoflow.json and \
-             residue_library.json"
-        )
-    })?;
-    if !dir.is_dir() {
-        anyhow::bail!(
-            "GlycoFlow model directory {} does not exist (--glycoflow-model / $GLYCOFLOW_MODEL)",
-            dir.display()
-        );
-    }
+    // The licence and the model come first, before any other download or parsing.
+    let dir =
+        ModelSource::from_environment(g.model.as_deref(), g.accept_license)?.resolve(quiet)?;
     let sites = arguments
         .replace_glycans
         .iter()

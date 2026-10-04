@@ -166,19 +166,29 @@ large proteins.
 
 Density fitting (`refine --objective density`) fits the glycan of known
 sequence at each `--replace-glycan` site into a CCP4/MRC map with the GlycoFlow
-flow model (crate `reglyco-glycoflow`). It needs the GlycoFlow model directory
-(`glycoflow.safetensors`, `glycoflow.json`, `residue_library.json`), which is
-licensed separately from ReGlyco (GlycoFlow Model License: non-commercial academic
-research; access through the GlycoFlow Hugging Face repository after accepting the
-licence), through `--glycoflow-model` or `$GLYCOFLOW_MODEL`:
+flow model (crate `reglyco-glycoflow`). The GlycoFlow model (`glycoflow.safetensors`,
+`glycoflow.json`, `residue_library.json`) is not part of ReGlyco: it is licensed
+separately under the GlycoFlow Source-Available Non-Commercial License
+(non-commercial academic research; commercial use needs a separate written
+licence) and distributed through the gated Hugging Face repository
+[`Ojas-Singh/glycoflow`](https://huggingface.co/Ojas-Singh/glycoflow), where the
+GlycoFlow authors approve access requests. Once your request is approved:
 
 ```console
-export GLYCOFLOW_MODEL=/path/to/model
+hf auth login        # or export HF_TOKEN=<token of the approved account>
+# once: accept the model licence and download the model (prints the model directory)
+cargo run --release -- glycoflow-model --accept-glycoflow-license
 cargo run --release -- refine \
   --protein 5KZC.pdb --density-map eds-5kzc.ccp4 \
   --objective density --replace-glycan A:79 \
   --seed 0 --output example-output/5kzc-density
 ```
+
+The acceptance is recorded in the model cache (`~/.cache/reglyco/glycoflow`, or
+`$GLYCOFLOW_CACHE`); `refine` also takes `--accept-glycoflow-license`, and
+`GLYCOFLOW_ACCEPT_LICENSE=1` accepts it for one run without recording. Without a
+model directory the model is downloaded on first use (pinned revision, SHA-256
+checked); `--glycoflow-model <dir>` or `$GLYCOFLOW_MODEL` use a local copy.
 
 `--density-map auto` resolves a sidecar map next to a local model or, with
 `--pdb-id`, downloads the PDBe EDS map (`--density-map-source rcsb` for the

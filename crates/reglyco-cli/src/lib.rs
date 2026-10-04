@@ -34,6 +34,7 @@ use reglyco_report::{
 use sha2::{Digest, Sha256};
 
 mod glycoflow;
+mod glycoflow_model;
 mod saxs;
 
 #[derive(Debug, Parser)]
@@ -69,6 +70,8 @@ enum Command {
     Density(DensityArgs),
     /// Fit glycoprotein models and ensembles against an experimental SAXS curve.
     Saxs(saxs::SaxsArgs),
+    /// Accept the GlycoFlow model licence and locate or download the model (printed path).
+    GlycoflowModel(glycoflow_model::GlycoflowModelArgs),
 }
 
 /// Residue-name convention used for remote glycan structure assets.  The
@@ -437,8 +440,9 @@ struct RefineArgs {
     #[arg(long)]
     solvate: bool,
     /// Refinement objective: `steric` (ensemble search + energy relaxation) or `density`
-    /// (GlycoFlow fit of the glycan at each `--replace-glycan` site; needs
-    /// `--glycoflow-model` or $GLYCOFLOW_MODEL).
+    /// (GlycoFlow fit of the glycan at each `--replace-glycan` site; needs the licensed GlycoFlow
+    /// model: `--accept-glycoflow-license` once, then `--glycoflow-model` / $GLYCOFLOW_MODEL or a
+    /// download with your Hugging Face token).
     #[arg(long, value_enum, default_value_t = ObjectiveArg::Steric)]
     objective: ObjectiveArg,
     /// CCP4/MRC map path, or `auto` for a nearby sidecar map or (with --pdb-id) a PDBe EDS /
@@ -583,6 +587,7 @@ pub fn run_with_version(version: &'static str) -> anyhow::Result<()> {
         Command::Validate(arguments) => run_validate(arguments),
         Command::Density(arguments) => run_density(arguments),
         Command::Saxs(arguments) => saxs::run(arguments),
+        Command::GlycoflowModel(arguments) => glycoflow_model::run(arguments),
     }
 }
 
@@ -3109,14 +3114,13 @@ mod tests {
     }
 
     #[test]
-    fn density_refine_requires_a_glycoflow_model() {
-        if std::env::var_os("GLYCOFLOW_MODEL").is_some() {
-            return;
-        }
-        let error = super::run_refine(density_refine(&[]))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("--glycoflow-model"), "{error}");
+    fn density_refine_accepts_the_glycoflow_license_flag() {
+        assert!(!density_refine(&[]).glycoflow.accept_license);
+        assert!(
+            density_refine(&["--accept-glycoflow-license"])
+                .glycoflow
+                .accept_license
+        );
     }
 
     #[test]

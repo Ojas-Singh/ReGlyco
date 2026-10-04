@@ -12,12 +12,15 @@ ReGlyco's licence.
 
 The trained GlycoFlow model is **not** part of this repository and is not covered by its
 licence. A model directory holds `glycoflow.safetensors` (weights), `glycoflow.json` (network
-configuration) and `residue_library.json` (residue templates and pucker states); it is
-distributed under the GlycoFlow Model License (non-commercial academic research; commercial use
-needs a separate written licence) through the GlycoFlow Hugging Face repository
-(`Ojas-Singh/glycoflow`), with access granted after accepting that licence. ReGlyco reads the
-directory at run time (`--glycoflow-model` or `$GLYCOFLOW_MODEL`) and stops with an error when it
-is absent.
+configuration) and `residue_library.json` (residue templates and pucker states); it is licensed
+under the GlycoFlow Source-Available Non-Commercial License (non-commercial academic research;
+commercial use needs a separate written licence) and distributed through the gated Hugging Face
+repository `Ojas-Singh/glycoflow`, where the GlycoFlow authors approve access requests. ReGlyco
+uses it only after the licence is accepted (`--accept-glycoflow-license`, recorded once in the
+model cache `~/.cache/reglyco/glycoflow` or `$GLYCOFLOW_CACHE`; `GLYCOFLOW_ACCEPT_LICENSE=1` for one
+run). It then loads `--glycoflow-model` / `$GLYCOFLOW_MODEL`, or the cached download, or downloads
+the model with the user's Hugging Face token (`$HF_TOKEN` or `hf auth login`) at a pinned revision
+with SHA-256 checks (`crates/reglyco-cli/src/glycoflow_model.rs`).
 
 Tests that need the model run with `--ignored`: `tests/synthetic.rs` (residue library only,
 `GLYCOFLOW_MODEL`), `tests/parity.rs` (`GLYCOFLOW_MODEL`, `GLYCOFLOW_FIT_FIXTURES` from GlycoFlow's
