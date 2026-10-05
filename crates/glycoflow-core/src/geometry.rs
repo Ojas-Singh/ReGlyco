@@ -45,7 +45,15 @@ macro_rules! real_impl {
             const NORM_EPS: Self = 1e-8;
             #[inline]
             fn fma(self, a: Self, b: Self) -> Self {
-                self.mul_add(a, b)
+                // wasm32 has no fused multiply-add (`mul_add` is a slow software call there)
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self * a + b
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.mul_add(a, b)
+                }
             }
             #[inline]
             fn sqrt(self) -> Self {

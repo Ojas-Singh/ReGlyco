@@ -816,6 +816,21 @@ struct PairBias<'a> {
     topo_batched: bool,
 }
 
+/// `a * b + c`, fused like the CUDA kernel where the target has a fused multiply-add. wasm32 has
+/// none: there `mul_add` is a software `fmaf` call (about 20x a multiply-add, and it blocks SIMD),
+/// so the plain expression is used and vectorises.
+#[inline(always)]
+fn madd(a: f32, b: f32, c: f32) -> f32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        a * b + c
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        a.mul_add(b, c)
+    }
+}
+
 impl PairBias<'_> {
     fn run_cpu(&self, dist: &[f32], topo: &[u32], p: &[f32], b: usize, n: usize) -> Vec<f32> {
         let (r, pd, c, h) = (self.prm.r, self.prm.p, self.prm.c, self.prm.heads);
@@ -863,7 +878,7 @@ impl PairBias<'_> {
                 for k in 0..r {
                     let (x, w) = (rbf[k], &w0t[k * pd..(k + 1) * pd]);
                     for (acc, wv) in h1.iter_mut().zip(w) {
-                        *acc = x.mul_add(*wv, *acc);
+                        *acc = madd(x, *wv, *acc);
                     }
                 }
                 for o in 0..pd {
@@ -879,7 +894,7 @@ impl PairBias<'_> {
                 for k in 0..pd {
                     let (x, w) = (h1[k], &w2t[k * pd..(k + 1) * pd]);
                     for (acc, wv) in h2.iter_mut().zip(w) {
-                        *acc = x.mul_add(*wv, *acc);
+                        *acc = madd(x, *wv, *acc);
                     }
                 }
                 for o in 0..pd {
@@ -889,7 +904,7 @@ impl PairBias<'_> {
                 for k in 0..pd {
                     let (x, w) = (h2[k], &wbt[k * c..(k + 1) * c]);
                     for (acc, wv) in o3.iter_mut().zip(w) {
-                        *acc = x.mul_add(*wv, *acc);
+                        *acc = madd(x, *wv, *acc);
                     }
                 }
                 for cc in 0..c {
