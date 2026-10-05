@@ -14,6 +14,7 @@
 //!
 //! The core API takes strings and bytes only (no filesystem access), so it builds for wasm32.
 
+pub mod backend;
 pub mod builder;
 pub mod error;
 pub mod geometry;

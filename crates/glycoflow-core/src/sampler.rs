@@ -84,6 +84,8 @@ pub struct Sampler<'m> {
     pub topology: Topology,
     pub tokens: Vec<[u32; 5]>,
     prep: Prepared,
+    /// the glycan's registration with an external network backend (WebGPU), if any
+    external: Option<crate::backend::Registration>,
 }
 
 impl<'m> Sampler<'m> {
@@ -94,11 +96,13 @@ impl<'m> Sampler<'m> {
     ) -> Result<Self> {
         let graph = GraphBatch::single(&tokens, &topology, model.device())?;
         let prep = model.prepare(graph)?;
+        let external = crate::backend::register(&topology, &tokens);
         Ok(Self {
             model,
             topology,
             tokens,
             prep,
+            external,
         })
     }
 
@@ -122,6 +126,26 @@ impl<'m> Sampler<'m> {
     /// On the CPU (feature `parallel`) the batch is split into sub-batches evaluated on rayon
     /// threads, since candle's CPU elementwise kernels are single-threaded.
     pub fn velocity(&self, coords: &[P3], tau: &[f32], t: &[f32]) -> Result<Vec<f32>> {
+        if self.n_torsions() == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(r) = &self.external {
+            if let Some(v) = r.backend.velocity(r.glycan, coords, tau, t) {
+                if v.len() == tau.len() {
+                    return Ok(v);
+                }
+            }
+        }
+        self.velocity_candle(coords, tau, t)
+    }
+
+    /// Whether network evaluations go to an external backend.
+    pub fn uses_backend(&self) -> bool {
+        self.external.is_some()
+    }
+
+    /// [`Sampler::velocity`] on candle, whatever backend is installed (reference for backends).
+    pub fn velocity_candle(&self, coords: &[P3], tau: &[f32], t: &[f32]) -> Result<Vec<f32>> {
         if self.n_torsions() == 0 {
             return Ok(Vec::new());
         }
