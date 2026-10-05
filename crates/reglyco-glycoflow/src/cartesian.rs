@@ -12,6 +12,7 @@
 
 use rayon::prelude::*;
 
+use crate::observer::CartesianStep;
 use crate::problem::{SiteProblem, Terms, V3, dihedral};
 use crate::search::Adam;
 
@@ -264,17 +265,43 @@ pub fn cartesian_refine(
     lr: f64,
     options: &RestraintOptions,
 ) -> CartesianFit {
+    cartesian_refine_traced(problem, x0, template, steps, lr, options, None)
+}
+
+/// [`cartesian_refine`], reporting every iteration to the problem's observer as basin
+/// `trace.0` in pass `trace.1` (nothing is reported without a trace or an observer).
+pub fn cartesian_refine_traced(
+    problem: &SiteProblem,
+    x0: &[V3],
+    template: usize,
+    steps: usize,
+    lr: f64,
+    options: &RestraintOptions,
+    trace: Option<(usize, &str)>,
+) -> CartesianFit {
+    let observer = problem.observer.get().zip(trace);
     let r = Restraints::new(problem, template, options);
     let n = problem.n_atoms;
     let free: Vec<bool> = problem.keep[..n].to_vec();
     let mut p: Vec<f64> = x0.iter().flat_map(|v| v.iter().copied()).collect();
     let mut adam = Adam::new(p.len(), lr);
     let to_x = |p: &[f64]| -> Vec<V3> { p.chunks(3).map(|c| [c[0], c[1], c[2]]).collect() };
-    for _ in 0..steps {
+    for iteration in 0..steps {
         let x = to_x(&p);
         let mut g = vec![[0.0; 3]; n];
-        coordinate_objective(problem, &x, Some(&mut g));
-        r.energy(&x, Some(&mut g));
+        let (terms, _) = coordinate_objective(problem, &x, Some(&mut g));
+        let e_restraint = r.energy(&x, Some(&mut g));
+        if let Some((o, (basin, pass))) = observer {
+            o.cartesian_step(&CartesianStep {
+                basin,
+                pass,
+                iteration,
+                iterations: steps,
+                x: &x,
+                terms: &terms,
+                e_restraint,
+            });
+        }
         let grad: Vec<f64> = g
             .iter()
             .zip(&free)
@@ -315,7 +342,10 @@ pub fn cartesian_refine_all(
     problem.counter.add_objective_grad(xs.len() * steps);
     xs.par_iter()
         .zip(templates)
-        .map(|(x, &t)| cartesian_refine(problem, x, t, steps, lr, options))
+        .enumerate()
+        .map(|(basin, (x, &t))| {
+            cartesian_refine_traced(problem, x, t, steps, lr, options, Some((basin, "refine")))
+        })
         .collect()
 }
 

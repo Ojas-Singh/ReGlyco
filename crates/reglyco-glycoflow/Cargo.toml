@@ -29,3 +29,5 @@ reglyco-validate = { version = "0.1.0", path = "../reglyco-validate" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# std::time::Instant panics on wasm32-unknown-unknown; web-time is std on native
+web-time = "1.1"

@@ -2,7 +2,7 @@
 //! JSON report and validation. Used by `reglyco refine --objective density`.
 
 use std::path::Path;
-use std::time::Instant;
+use web_time::Instant;
 
 use glycoflow_core::sampler::Sampler;
 use glysys::{ResidueId, Structure};
@@ -43,6 +43,8 @@ pub struct WorkflowOptions {
     pub sigma: Option<f64>,
     /// map resolution; default: the model's REMARK 2 record
     pub resolution: Option<f64>,
+    /// watches every fit (progress, search trajectories); none by default
+    pub observer: crate::observer::Observer,
 }
 
 pub struct WorkflowInput<'a> {
@@ -90,7 +92,8 @@ pub fn peak_rss_mb() -> Option<f64> {
     Some(kb / 1024.0)
 }
 
-fn crystal_input(text: Option<&str>, map: &DensityMap) -> CrystalInput {
+/// Crystal information of a model (CRYST1) and its map header, for the symmetry policy.
+pub fn crystal_input(text: Option<&str>, map: &DensityMap) -> CrystalInput {
     let m = map.metadata();
     CrystalInput {
         cryst1: text.and_then(parse_cryst1),
@@ -146,11 +149,15 @@ pub fn fit_one(
         resolution,
         &options.problem,
     )?;
+    problem.observer = options.observer.clone();
     let sampler = Sampler::for_glycan(&input.model.net, &problem.glycan, &input.model.meta.vocab)?;
     let preparation_seconds = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
     let mut prior_network_evaluations = 0;
     if options.prior.enabled && problem.n_torsions > 0 {
+        if let Some(o) = options.observer.get() {
+            o.stage("prior");
+        }
         problem.prior = Some(build_prior(&problem, &sampler, &options.prior)?);
         prior_network_evaluations = options.prior.n_samples * options.prior.steps;
     }
@@ -188,7 +195,8 @@ fn deg(v: f64) -> f64 {
     v.to_degrees()
 }
 
-fn site_report(f: &SiteFit, input: &WorkflowInput) -> Value {
+/// The `sites[]` entry of `glycoflow-fit.json` for one fitted site.
+pub fn site_report(f: &SiteFit, input: &WorkflowInput) -> Value {
     let o = &f.outcome;
     let p = &f.problem;
     let best = &o.basins[o.best];

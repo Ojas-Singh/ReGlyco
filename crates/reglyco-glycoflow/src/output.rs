@@ -322,6 +322,18 @@ pub fn candidates_pdb(
     Ok(out.join("\n") + "\n")
 }
 
+/// PDB records of glycans alone (no protein): HETATM records, then LINK and CONECT records, with
+/// serials from 1. For overlays and per-frame trajectories of a pose.
+pub fn glycan_pdb(glycans: &[PlacedGlycan]) -> Result<String> {
+    let (atoms, conect, links) = glycan_records(glycans, 1)?;
+    let mut out = links;
+    out.extend(atoms);
+    out.push("TER".into());
+    out.extend(conect);
+    out.push("END".into());
+    Ok(out.join("\n") + "\n")
+}
+
 /// Residue ids of the fitted glycan (output naming).
 pub fn fitted_residue_ids(naming: &[ResidueNaming]) -> Vec<ResidueId> {
     naming

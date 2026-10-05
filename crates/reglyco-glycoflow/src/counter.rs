@@ -3,7 +3,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use web_time::Instant;
 
 #[derive(Debug, Default)]
 pub struct Counter {

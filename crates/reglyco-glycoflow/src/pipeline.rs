@@ -8,7 +8,7 @@
 //! 5. alternatives: distinct basins within `alt_margin` objective units of the best
 //!    (density-ambiguous alternatives; objective differences, not calibrated probabilities).
 
-use std::time::Instant;
+use web_time::Instant;
 
 use glycoflow_core::sampler::{Method, Sampler};
 use rayon::prelude::*;
@@ -17,7 +17,9 @@ use reglyco_density::site_likelihood::{
     SiteEnvironmentAtom, SiteLikelihood, SiteLikelihoodOptions,
 };
 
-use crate::cartesian::{CartesianFit, RestraintOptions, cartesian_refine, cartesian_refine_all};
+use crate::cartesian::{
+    CartesianFit, RestraintOptions, cartesian_refine, cartesian_refine_all, cartesian_refine_traced,
+};
 use crate::counter::CounterSnapshot;
 use crate::error::{Result, invalid};
 use crate::model::GlycoflowModel;
@@ -393,8 +395,10 @@ pub fn fit_site(
     let started = Instant::now();
     problem.w_env = config.search_clash_weight;
     problem.w_self = config.search_clash_weight;
+    let observer = problem.observer.clone();
+    let observer = observer.get();
     // search on the (smoother) search weights
-    let (mut poses, mut energies, unrefined) = {
+    let (mut poses, mut energies, unrefined, sources) = {
         let problem: &SiteProblem = problem;
         let c = &problem.counter;
         let r = method_b(
@@ -412,6 +416,9 @@ pub fn fit_site(
         let mut poses = r.poses;
         let mut energies = r.energies;
         let t0 = Instant::now();
+        if let Some(o) = observer {
+            o.stage("polish");
+        }
         polish_top(
             problem,
             &mut poses,
@@ -421,7 +428,10 @@ pub fn fit_site(
             config.polish_lr,
         );
         c.add_stage("polish", t0);
-        (poses, energies, r.unrefined)
+        if let Some(o) = observer {
+            o.basins("polish", &r.sources, &poses, &energies);
+        }
+        (poses, energies, r.unrefined, r.sources)
     };
     // final objective: re-score every basin, refine the best few under it; escalate the contact
     // weight while the selected pose still violates the contact floors
@@ -439,6 +449,9 @@ pub fn fit_site(
             final_contact_weight = w;
             let problem: &SiteProblem = problem;
             let t0 = Instant::now();
+            if let Some(o) = observer {
+                o.stage(if round == 0 { "steric polish" } else { "steric escalation" });
+            }
             energies = poses
                 .par_iter()
                 .map(|pose| problem.evaluate(pose, false).terms.total)
@@ -458,6 +471,9 @@ pub fn fit_site(
                 "steric escalation"
             };
             problem.counter.add_stage(stage, t0);
+            if let Some(o) = observer {
+                o.basins(stage, &sources, &poses, &energies);
+            }
             let best = (0..energies.len())
                 .min_by(|&a, &b| energies[a].total_cmp(&energies[b]))
                 .unwrap_or(0);
@@ -472,6 +488,9 @@ pub fn fit_site(
     let mut cartesian: Option<Vec<CartesianFit>> = None;
     if config.cartesian_steps > 0 {
         let t0 = Instant::now();
+        if let Some(o) = observer {
+            o.stage("cartesian");
+        }
         let templates: Vec<usize> = poses.iter().map(|p| p.template).collect();
         let mut xs: Vec<Vec<V3>> = {
             let problem: &SiteProblem = problem;
@@ -538,13 +557,15 @@ pub fn fit_site(
                         sd_angle: r.sd_angle / factor.sqrt(),
                         sd_volume: r.sd_volume / factor.sqrt(),
                     };
-                    let up = cartesian_refine(
+                    let pass = format!("escalation x{factor}");
+                    let up = cartesian_refine_traced(
                         problem,
                         &fits[b].x,
                         templates[b],
                         config.cartesian_steps,
                         config.cartesian_lr,
                         &scaled,
+                        Some((b, pass.as_str())),
                     );
                     problem.counter.add_objective_grad(config.cartesian_steps);
                     problem.w_env = w0;
@@ -567,6 +588,9 @@ pub fn fit_site(
     let problem: &SiteProblem = problem;
     let c = &problem.counter;
     let t0 = Instant::now();
+    if let Some(o) = observer {
+        o.stage("support+complete");
+    }
     let basins: Vec<Basin> = match cartesian {
         Some(fits) => {
             energies = fits.iter().map(|f| f.total).collect();
@@ -605,6 +629,10 @@ pub fn fit_site(
                 .collect()
         }
     };
+    if let Some(o) = observer {
+        let poses: Vec<Pose> = basins.iter().map(|b| b.pose.clone()).collect();
+        o.basins("final", &sources, &poses, &energies);
+    }
     let mut order: Vec<usize> = (0..energies.len()).collect();
     order.sort_by(|&a, &b| energies[a].total_cmp(&energies[b]));
     let best = order[0];

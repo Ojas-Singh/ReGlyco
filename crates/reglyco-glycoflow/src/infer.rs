@@ -398,6 +398,9 @@ pub fn glycan_from_density(
     // density levels of the site (candidate independent): from the first fit's site
     let mut levels: Option<DensityLevels> = None;
     for (name, seq) in candidates {
+        if let Some(o) = options.observer.get() {
+            o.stage(&format!("candidate {name}"));
+        }
         let stat = fit_candidate(&sub(&options), residue, protein, name, seq)?;
         // the atom width is candidate independent: calibrate once
         options.sigma.get_or_insert(stat.fit.sigma.selected);
@@ -414,6 +417,9 @@ pub fn glycan_from_density(
         fits.push(gate(&sub(&options), levels.as_ref(), stat)?);
     }
     let run = |options: &crate::workflow::WorkflowOptions, name: &str, seq: &str| {
+        if let Some(o) = options.observer.get() {
+            o.stage(&format!("candidate {name}"));
+        }
         let stat = fit_candidate(&sub(options), residue, protein, name, seq)?;
         gate(&sub(options), levels.as_ref(), stat)
     };
