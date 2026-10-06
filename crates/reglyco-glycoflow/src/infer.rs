@@ -47,8 +47,14 @@ pub const N_GLYCAN_CANDIDATES: [(&str, &str); 4] = [
 
 /// O-glycan candidates for Ser/Thr: the mucin GalNAc cores (sialylated core 2 holds Tn, T,
 /// sialyl-T and core 2; 2,6-sialyl-T), O-mannose (mammalian core M1 and the fungal
-/// alpha1-2 chain), O-fucose (Notch EGF), O-glucose (EGF, xylosylated) and O-GlcNAc.
-pub const O_GLYCAN_CANDIDATES: [(&str, &str); 7] = [
+/// alpha1-2 chain), O-fucose (Notch EGF), O-glucose (EGF, xylosylated) and O-GlcNAc, and each
+/// family's root sugar alone: a large candidate whose root does not settle in the density is never
+/// pruned to that root (5T5L a:102, a lone GalNAc, went to O-fucose without them).
+pub const O_GLYCAN_CANDIDATES: [(&str, &str); 11] = [
+    ("Tn (GalNAc)", "DGalpNAca1-OH"),
+    ("O-mannose", "DManpa1-OH"),
+    ("O-fucose", "LFucpa1-OH"),
+    ("O-glucose", "DGlcpb1-OH"),
     (
         "mucin core 2, sialylated",
         "DNeup5Aca2-3DGalpb1-4DGlcpNAcb1-6[DNeup5Aca2-3DGalpb1-3]DGalpNAca1-OH",
@@ -56,8 +62,8 @@ pub const O_GLYCAN_CANDIDATES: [(&str, &str); 7] = [
     ("mucin 2,6-sialyl T", "DNeup5Aca2-3DGalpb1-3[DNeup5Aca2-6]DGalpNAca1-OH"),
     ("O-mannose core M1", "DNeup5Aca2-3DGalpb1-4DGlcpNAcb1-2DManpa1-OH"),
     ("O-mannose, fungal", "DManpa1-2DManpa1-2DManpa1-OH"),
-    ("O-fucose", "DNeup5Aca2-3DGalpb1-4DGlcpNAcb1-3LFucpa1-OH"),
-    ("O-glucose", "DXylpa1-3DXylpa1-3DGlcpb1-OH"),
+    ("O-fucose, extended", "DNeup5Aca2-3DGalpb1-4DGlcpNAcb1-3LFucpa1-OH"),
+    ("O-glucose, xylosylated", "DXylpa1-3DXylpa1-3DGlcpb1-OH"),
     ("O-GlcNAc", "DGlcpNAcb1-OH"),
 ];
 

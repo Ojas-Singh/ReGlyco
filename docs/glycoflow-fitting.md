@@ -55,7 +55,7 @@ Sites: any residue in `reglyco_glycoflow::anchor::ANCHORS`.
 
 Geometry comes from the deposits of X-ray entries at 2.3 A or better. Inference (`infer::candidates_for`) uses each residue's common glycans:
 - the four N-glycans on Asn;
-- seven O-glycans on Ser/Thr (sialylated mucin core 2, 2,6-sialyl T, O-Man core M1, fungal O-Man, O-Fuc, xylosylated O-Glc, O-GlcNAc);
+- eleven O-glycans on Ser/Thr: sialylated mucin core 2, 2,6-sialyl T, O-Man core M1, fungal O-Man, extended O-Fuc, xylosylated O-Glc and O-GlcNAc, plus the root sugars GalNAc, Man, Fuc and Glc alone, since a large candidate whose root does not settle is never pruned down to that root;
 - C-mannose on Trp;
 - the glycogenin glucan on Tyr, and so on for the other residues.
 
