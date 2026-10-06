@@ -13,15 +13,18 @@
 //! * [`search`]: observation-guided generation through the sampler's guidance hook, attachment
 //!   grid search, Adam refinement, distinct basins; [`support`]: subtree support and prior
 //!   completion (pinned-torsion inpainting); [`pipeline`]: `fit_site`;
-//! * [`output`], [`evaluation`], [`workflow`]: structures, reports, validation.
+//! * [`output`], [`evaluation`], [`workflow`]: structures, reports, validation;
+//! * [`observer`]: watching a fit as it runs; [`deposition`]: chemistry checks of a deposit.
 
 pub mod cartesian;
 pub mod counter;
+pub mod deposition;
 pub mod error;
 pub mod evaluation;
 pub mod infer;
 pub mod model;
 pub mod observation;
+pub mod observer;
 pub mod output;
 pub mod pipeline;
 pub mod prior;
@@ -36,6 +39,7 @@ pub use error::{FitError, Result};
 pub use glycoflow_core;
 pub use model::{ComputeDevice, GlycoflowModel};
 pub use observation::{DensityObservation, Observation, ObservationValue};
+pub use observer::{CartesianStep, FitObserver, GuidedStep, Observer};
 pub use pipeline::{FitConfig, FitOutcome, PriorConfig, fit_site};
 pub use problem::{Pose, ProblemOptions, SiteProblem, Terms};
 pub use site::{Site, SiteOptions, SymmetryMode, load_site};

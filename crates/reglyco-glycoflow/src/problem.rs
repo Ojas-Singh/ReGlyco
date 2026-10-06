@@ -271,6 +271,11 @@ pub struct ProblemOptions {
     pub region_radius: Option<f64>,
     /// measure the density likelihood's empirical noise inflation (`null_inflation`)
     pub null_calibration: bool,
+    /// conformers per network batch in guided and prior sampling (memory: the pair biases take
+    /// about 256 N^2 bytes per conformer). None: batches of [`crate::search::GUIDED_CHUNK`] for
+    /// guided sampling and one batch for the prior. Conformers are independent, so this changes
+    /// nothing but memory and floating-point summation order.
+    pub batch: Option<usize>,
 }
 
 impl Default for ProblemOptions {
@@ -286,6 +291,7 @@ impl Default for ProblemOptions {
             template_seed: 0,
             region_radius: None,
             null_calibration: true,
+            batch: None,
         }
     }
 }
@@ -373,6 +379,9 @@ pub struct SiteProblem {
     /// scoring-ball radius
     pub radius: f64,
     pub counter: Counter,
+    /// conformers per network batch (`ProblemOptions::batch`)
+    pub batch: Option<usize>,
+    pub observer: crate::observer::Observer,
 }
 
 /// One evaluated pose.
@@ -525,6 +534,8 @@ impl SiteProblem {
             prior: None,
             radius,
             counter: Counter::default(),
+            batch: options.batch.map(|b| b.max(1)),
+            observer: crate::observer::Observer::default(),
             glycan,
         };
         if options.null_calibration {

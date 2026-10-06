@@ -1,7 +1,7 @@
 //! Search methods (`glycoflow/fitting/methods.py`): observation-guided GlycoFlow generation
 //! (method B), attachment grid search, Adam refinement, distinct basins.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use glycoflow_core::geometry::{P3, wrap};
 use glycoflow_core::rng::{SplitMix64, uniform_torsions};
@@ -9,6 +9,7 @@ use glycoflow_core::sampler::{Guidance, GuidanceContext, Method, SampleOptions, 
 use rayon::prelude::*;
 
 use crate::error::Result;
+use crate::observer::{FitObserver, GuidedStep};
 use crate::problem::{Pose, SiteProblem, V3};
 
 /// Attachment grid: psi_N in {180, 165, -165} deg x `n_phi` values of phi_N.
@@ -148,11 +149,38 @@ fn templates_for(problem: &SiteProblem, templates: &[usize]) -> Vec<P3> {
         .collect()
 }
 
-/// Conformers per guided-sampling batch (`methods.guided_sample(chunk=256)`).
+/// Conformers per guided-sampling batch (`methods.guided_sample(chunk=256)`); the default of
+/// `ProblemOptions::batch`.
 pub const GUIDED_CHUNK: usize = 256;
 
+/// Passes every step of the guided flow to an observer, then defers to the objective guidance.
+struct Recorded<'a, 'p> {
+    inner: ObjectiveGuidance<'p>,
+    observer: &'a dyn FitObserver,
+    first: usize,
+}
+
+impl Guidance for Recorded<'_, '_> {
+    fn correction(&mut self, ctx: &GuidanceContext) -> glycoflow_core::Result<Option<Vec<f32>>> {
+        let correction = self.inner.correction(ctx)?;
+        self.observer.guided_step(&GuidedStep {
+            first: self.first,
+            step: ctx.step,
+            steps: ctx.steps,
+            t: ctx.t as f64,
+            templates: &self.inner.templates,
+            tau: ctx.tau,
+            tau_hat: ctx.tau_hat,
+            psi: &self.inner.psi,
+            phi: &self.inner.phi,
+            guided: correction.is_some(),
+        });
+        Ok(correction)
+    }
+}
+
 /// Guided generation of `n` conformers (template `s % K` for conformer `s`), in batches of
-/// [`GUIDED_CHUNK`]; returns the poses.
+/// `problem.batch`; returns the poses.
 pub fn guided_sample(
     problem: &SiteProblem,
     sampler: &Sampler,
@@ -170,11 +198,12 @@ pub fn guided_sample(
         method: Method::Heun,
     };
     let mut poses = Vec::with_capacity(n);
+    let observer = problem.observer.get();
     let mut s0 = 0;
     while s0 < n {
-        let m = GUIDED_CHUNK.min(n - s0);
+        let m = problem.batch.unwrap_or(GUIDED_CHUNK).min(n - s0);
         let templates: Vec<usize> = (s0..s0 + m).map(|s| s % k).collect();
-        let mut guidance = ObjectiveGuidance {
+        let guidance = ObjectiveGuidance {
             problem,
             templates: templates.clone(),
             psi: vec![std::f64::consts::PI; m],
@@ -184,12 +213,36 @@ pub fn guided_sample(
             attach_every: 4,
             attach_step: 0.05,
         };
-        let (_, tau) = sampler.sample(
-            &templates_for(problem, &templates),
-            &tau0[s0 * nt..(s0 + m) * nt],
-            opts,
-            Some(&mut guidance),
-        )?;
+        let templates_xyz = templates_for(problem, &templates);
+        let tau_start = &tau0[s0 * nt..(s0 + m) * nt];
+        let (guidance, tau) = match observer {
+            None => {
+                let mut guidance = guidance;
+                let (_, tau) = sampler.sample(&templates_xyz, tau_start, opts, Some(&mut guidance))?;
+                (guidance, tau)
+            }
+            Some(observer) => {
+                let mut recorded = Recorded {
+                    inner: guidance,
+                    observer,
+                    first: s0,
+                };
+                let (_, tau) = sampler.sample(&templates_xyz, tau_start, opts, Some(&mut recorded))?;
+                observer.guided_step(&GuidedStep {
+                    first: s0,
+                    step: steps,
+                    steps,
+                    t: 1.0,
+                    templates: &recorded.inner.templates,
+                    tau: &tau,
+                    tau_hat: &tau,
+                    psi: &recorded.inner.psi,
+                    phi: &recorded.inner.phi,
+                    guided: false,
+                });
+                (recorded.inner, tau)
+            }
+        };
         problem.counter.add_nfe(m * opts.nfe());
         poses.extend((0..m).map(|s| {
             Pose {
@@ -203,6 +256,9 @@ pub fn guided_sample(
             }
         }));
         s0 += m;
+        if let Some(observer) = observer {
+            observer.progress("guided sample", s0, n);
+        }
     }
     Ok(poses)
 }
@@ -218,10 +274,26 @@ pub fn sample_free(
 ) -> Result<Vec<Vec<f64>>> {
     let k = problem.n_templates();
     let nt = problem.n_torsions;
-    let templates: Vec<usize> = (0..n).map(|s| s % k).collect();
     let tau0 = initial_torsions(seed, n, nt);
     let opts = SampleOptions { steps, method };
-    let (_, tau) = sampler.sample(&templates_for(problem, &templates), &tau0, opts, None)?;
+    // in batches of `problem.batch` (memory); conformers are independent
+    let mut tau = Vec::with_capacity(n * nt);
+    let mut s0 = 0;
+    while s0 < n {
+        let m = problem.batch.unwrap_or(n).min(n - s0);
+        let templates: Vec<usize> = (s0..s0 + m).map(|s| s % k).collect();
+        let (_, t) = sampler.sample(
+            &templates_for(problem, &templates),
+            &tau0[s0 * nt..(s0 + m) * nt],
+            opts,
+            None,
+        )?;
+        tau.extend(t);
+        s0 += m;
+        if let Some(observer) = problem.observer.get() {
+            observer.progress("prior", s0, n);
+        }
+    }
     Ok((0..n)
         .map(|s| {
             tau[s * nt..(s + 1) * nt]
@@ -355,6 +427,8 @@ pub struct MethodB {
     pub energies: Vec<f64>,
     /// objective of each basin before refinement
     pub unrefined: Vec<f64>,
+    /// the guided sample each basin started from
+    pub sources: Vec<usize>,
 }
 
 /// Method B (`methods.method_b`): guided generation -> attachment grid search -> distinct
@@ -373,10 +447,17 @@ pub fn method_b(
     seed: u64,
 ) -> Result<MethodB> {
     let c = &problem.counter;
+    let observer = problem.observer.get();
     let t0 = Instant::now();
+    if let Some(o) = observer {
+        o.stage("guided sample");
+    }
     let poses = guided_sample(problem, sampler, n_samples, steps, scale, start, seed)?;
     c.add_stage("guided sample", t0);
     let t0 = Instant::now();
+    if let Some(o) = observer {
+        o.stage("select");
+    }
     let conformers: Vec<(Vec<f64>, usize)> =
         poses.iter().map(|p| (p.tau.clone(), p.template)).collect();
     let grid = attach_search(problem, &conformers);
@@ -395,16 +476,30 @@ pub fn method_b(
         }
         energies.push(e_grid.min(e_guided));
     }
+    if let Some(o) = observer {
+        o.samples(&chosen, &energies);
+    }
     let x: Vec<Vec<V3>> = chosen.par_iter().map(|p| problem.place(p)).collect();
     let sel = distinct(problem, &x, &energies, n_basins, 1.5);
     c.add_stage("select", t0);
     let t0 = Instant::now();
     let starts: Vec<Pose> = sel.iter().map(|&i| chosen[i].clone()).collect();
+    let unrefined: Vec<f64> = sel.iter().map(|&i| energies[i]).collect();
+    if let Some(o) = observer {
+        o.basins("select", &sel, &starts, &unrefined);
+        o.stage("refine");
+    }
     let refined = refine(problem, &starts, refine_steps, refine_lr);
     c.add_stage("refine", t0);
+    let poses: Vec<Pose> = refined.iter().map(|(p, _)| p.clone()).collect();
+    let energies: Vec<f64> = refined.iter().map(|(_, e)| *e).collect();
+    if let Some(o) = observer {
+        o.basins("refine", &sel, &poses, &energies);
+    }
     Ok(MethodB {
-        poses: refined.iter().map(|(p, _)| p.clone()).collect(),
-        energies: refined.iter().map(|(_, e)| *e).collect(),
-        unrefined: sel.iter().map(|&i| energies[i]).collect(),
+        poses,
+        energies,
+        unrefined,
+        sources: sel,
     })
 }

@@ -247,6 +247,10 @@ pub enum SymmetryMode {
     /// Expand when the map is a full-cell crystallographic map with a Sohncke space group whose
     /// cell agrees with the model's CRYST1 record (cryo-EM maps: no expansion).
     Auto,
+    /// Expand from the model's CRYST1 record even when the map is a box: for maps cut from a
+    /// crystallographic map that keep its cell (e.g. a volume-server box around the site). The
+    /// other checks of `Auto` still apply.
+    Model,
     Off,
 }
 
@@ -292,7 +296,7 @@ pub fn resolve_symmetry(
     if mode == SymmetryMode::Off {
         return none("disabled".into());
     }
-    if !input.map_full_cell {
+    if !input.map_full_cell && mode != SymmetryMode::Model {
         return none("map does not cover a full unit cell (cryo-EM box or cropped map)".into());
     }
     let model_cell = input.cryst1.as_ref().map(|(c, _)| *c);
@@ -341,7 +345,11 @@ pub fn resolve_symmetry(
         space_group_number: Some(group.number),
         operators: group.ops.len(),
         cell: Some(cell),
-        reason: "full-cell crystallographic map".into(),
+        reason: if input.map_full_cell {
+            "full-cell crystallographic map".into()
+        } else {
+            "model CRYST1 (map box cut from a crystallographic map)".into()
+        },
     };
     (Some((cell, group)), info)
 }
