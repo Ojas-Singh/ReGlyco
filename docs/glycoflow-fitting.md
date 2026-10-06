@@ -41,6 +41,36 @@ volumes as restraints; basins are ranked afterwards, with the same contact escal
 test that marks residues without density, which are then regenerated from the GlycoFlow prior and
 labelled as prior-driven.
 
+Sites: any residue in `reglyco_glycoflow::anchor::ANCHORS`.
+
+| Residue | Link | Notes |
+|---|---|---|
+| Asn | ND2 (N-glycans) | Amide trans (psi_N near 180 deg), as before. |
+| Ser, Thr | OG / OG1 (O-glycans) | Mucin GalNAc, O-Man, O-Fuc, O-Glc, O-GlcNAc. Bond 1.42 A, angle 114 deg; psi searched over the whole circle with no energy term. |
+| Trp | CD1 (C-mannose) | C1 kept in the indole plane, cis to CB. Half the templates carry the mannose in 1C4, the chair seen in crystals, because GlycoFlow's library only has 4C1 for alpha-Man (`ring.rs`). |
+| Tyr | OH | Glycogenin. |
+| Hyp | OD1 | |
+| Hyl (LYZ) | OH | |
+| Cys | SG (S-glycans) | |
+
+Geometry comes from the deposits of X-ray entries at 2.3 A or better. Inference (`infer::candidates_for`) uses each residue's common glycans:
+- the four N-glycans on Asn;
+- eleven O-glycans on Ser/Thr: sialylated mucin core 2, 2,6-sialyl T, O-Man core M1, fungal O-Man, extended O-Fuc, xylosylated O-Glc and O-GlcNAc, plus the root sugars GalNAc, Man, Fuc and Glc alone, since a large candidate whose root does not settle is never pruned down to that root;
+- C-mannose on Trp;
+- the glycogenin glucan on Tyr, and so on for the other residues.
+
+Validation (Quick preset, deposited sequence), all with the verdict "agrees":
+
+| Site | Glycan | Core RMSD |
+|---|---|---|
+| 7R84 A:7, A:10 | C-Man (1C4) | 0.13, 0.25 A |
+| 7R84 A:16 | O-Fuc | 0.22 A |
+| 6R2W L:52 | Xyl-Xyl-O-Glc | 0.33 A |
+| 6R2W L:60 | O-Fuc | 0.16 A |
+| 5T5L a:102 | GalNAc | 0.35 A |
+| 3U2U A:195 | Tyr glucan | 0.47 A |
+| 3M5Q A:336 | O-Man | 0.72 A |
+
 Outputs: `fitted.pdb` (best fit; deposited waters overlapping the glycan removed),
 `candidates.pdb` (best fit, density-ambiguous alternatives, prior completions; REMARK 250 labels),
 `glycoflow-fit.json` (objective terms, support per subtree, alternatives, costs, recovery against

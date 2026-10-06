@@ -53,14 +53,9 @@ pub fn ccd_of(token: &str, anomer: char) -> Option<&'static str> {
         .map(|e| e.0)
 }
 
-/// Protein residues that carry glycans: (anchor atoms A, B, link) as in `site.SITE_ATOMS`.
+/// Protein residues that carry glycans: anchor atoms (A, B, link); see [`crate::anchor`].
 pub fn site_atoms(residue: &str) -> Option<[&'static str; 3]> {
-    match residue {
-        "ASN" => Some(["CB", "CG", "ND2"]),
-        "SER" => Some(["CA", "CB", "OG"]),
-        "THR" => Some(["CA", "CB", "OG1"]),
-        _ => None,
-    }
+    crate::anchor::anchor(residue).map(|a| a.atoms)
 }
 
 const WATERS: &[&str] = &[
@@ -402,12 +397,12 @@ impl Site {
         format!("{}:{}", self.residue.chain, self.residue.number)
     }
 
-    /// Environment atoms of the site residue itself (identity image, side chain to the link
-    /// atom), handled by explicit pairs instead of the clash grids.
+    /// Environment atoms of the site residue itself (identity image, side-chain atoms within
+    /// three bonds of C1), handled by explicit pairs instead of the clash grids.
     pub fn is_site_atom(&self, atom: &EnvAtom) -> bool {
         atom.chain == self.residue.chain
             && atom.residue_number == self.residue.number
-            && ["CB", "CG", "OD1", "ND2", "OG", "OG1"].contains(&atom.atom_name.as_str())
+            && crate::anchor::anchor(&self.residue_name).is_some_and(|a| a.bonds_to(&atom.atom_name).is_some())
             && atom.is_identity()
     }
 }

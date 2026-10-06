@@ -45,6 +45,50 @@ pub const N_GLYCAN_CANDIDATES: [(&str, &str); 4] = [
     ),
 ];
 
+/// O-glycan candidates for Ser/Thr: the mucin GalNAc cores (sialylated core 2 holds Tn, T,
+/// sialyl-T and core 2; 2,6-sialyl-T), O-mannose (mammalian core M1 and the fungal
+/// alpha1-2 chain), O-fucose (Notch EGF), O-glucose (EGF, xylosylated) and O-GlcNAc, and each
+/// family's root sugar alone: a large candidate whose root does not settle in the density is never
+/// pruned to that root (5T5L a:102, a lone GalNAc, went to O-fucose without them).
+pub const O_GLYCAN_CANDIDATES: [(&str, &str); 11] = [
+    ("Tn (GalNAc)", "DGalpNAca1-OH"),
+    ("O-mannose", "DManpa1-OH"),
+    ("O-fucose", "LFucpa1-OH"),
+    ("O-glucose", "DGlcpb1-OH"),
+    (
+        "mucin core 2, sialylated",
+        "DNeup5Aca2-3DGalpb1-4DGlcpNAcb1-6[DNeup5Aca2-3DGalpb1-3]DGalpNAca1-OH",
+    ),
+    ("mucin 2,6-sialyl T", "DNeup5Aca2-3DGalpb1-3[DNeup5Aca2-6]DGalpNAca1-OH"),
+    ("O-mannose core M1", "DNeup5Aca2-3DGalpb1-4DGlcpNAcb1-2DManpa1-OH"),
+    ("O-mannose, fungal", "DManpa1-2DManpa1-2DManpa1-OH"),
+    ("O-fucose, extended", "DNeup5Aca2-3DGalpb1-4DGlcpNAcb1-3LFucpa1-OH"),
+    ("O-glucose, xylosylated", "DXylpa1-3DXylpa1-3DGlcpb1-OH"),
+    ("O-GlcNAc", "DGlcpNAcb1-OH"),
+];
+
+/// Candidates for the other glycosylated residues.
+pub const C_MANNOSE_CANDIDATES: [(&str, &str); 1] = [("C-mannose", "DManpa1-OH")];
+pub const TYROSINE_CANDIDATES: [(&str, &str); 1] = [("glycogenin glucan", "DGlcpa1-4DGlcpa1-4DGlcpa1-OH")];
+pub const HYDROXYPROLINE_CANDIDATES: [(&str, &str); 1] = [("extensin arabinoside", "LArafa1-3LArafb1-2LArafb1-2LArafb1-OH")];
+pub const HYDROXYLYSINE_CANDIDATES: [(&str, &str); 1] = [("collagen glucosylgalactose", "DGlcpa1-2DGalpb1-OH")];
+pub const CYSTEINE_CANDIDATES: [(&str, &str); 2] = [("S-glucose", "DGlcpb1-OH"), ("S-GlcNAc", "DGlcpNAcb1-OH")];
+
+/// The inference candidates of a site residue (CCD name): the largest common forms of the
+/// glycans it carries; pruning by density finds the rest. Empty for residues without glycans.
+pub fn candidates_for(residue: &str) -> &'static [(&'static str, &'static str)] {
+    match residue {
+        "ASN" => &N_GLYCAN_CANDIDATES,
+        "SER" | "THR" => &O_GLYCAN_CANDIDATES,
+        "TRP" => &C_MANNOSE_CANDIDATES,
+        "TYR" => &TYROSINE_CANDIDATES,
+        "HYP" => &HYDROXYPROLINE_CANDIDATES,
+        "LYZ" => &HYDROXYLYSINE_CANDIDATES,
+        "CYS" => &CYSTEINE_CANDIDATES,
+        _ => &[],
+    }
+}
+
 fn kept_children(
     seq: &Sequence,
     k: usize,
@@ -538,8 +582,30 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs GLYCOFLOW_MODEL (residue_library.json of the licensed model)"]
+    fn every_candidate_builds() {
+        let path = std::path::Path::new(&std::env::var("GLYCOFLOW_MODEL").unwrap()).join("residue_library.json");
+        let library = glycoflow_core::ResidueLibrary::from_json_slice(&std::fs::read(path).unwrap()).unwrap();
+        for a in &crate::anchor::ANCHORS {
+            for (name, seq) in candidates_for(a.residue) {
+                let built = library.build(seq, None).unwrap_or_else(|e| panic!("{name} ({seq}): {e}"));
+                assert_eq!(built.res_paths[0], "agl", "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_anchor_has_candidates() {
+        for a in &crate::anchor::ANCHORS {
+            assert!(!candidates_for(a.residue).is_empty(), "{}", a.residue);
+        }
+        assert!(candidates_for("ALA").is_empty());
+    }
+
+    #[test]
     fn pruned_sequence_round_trips_full_trees() {
-        for (_, seq) in N_GLYCAN_CANDIDATES {
+        let all = crate::anchor::ANCHORS.iter().flat_map(|a| candidates_for(a.residue).iter());
+        for (_, seq) in all {
             let parsed = parse_glycam(seq).unwrap();
             let mut keep = BTreeSet::new();
             let mut stack = vec![(parsed.root, "r".to_string())];
@@ -549,7 +615,7 @@ mod tests {
                 }
                 keep.insert(p);
             }
-            assert_eq!(pruned_sequence(seq, &keep).unwrap().0, seq);
+            assert_eq!(pruned_sequence(seq, &keep).unwrap().0, *seq);
         }
     }
 }
