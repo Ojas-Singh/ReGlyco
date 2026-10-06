@@ -1,6 +1,26 @@
 # Fitting free and lectin-bound glycans (design)
 
-Status: proposal, 2026-10-06. Nothing here is implemented yet.
+Status: parked, 2026-10-06. Nothing here is implemented; the note is kept as the design if this is
+taken up again.
+
+Why parked: the fit adds least where ligands are. Of the PDB entries with an oligosaccharide and no
+glycosylation link (4,608; RCSB search, 2026-10-06; these include enzyme substrates and
+maltose-binding-protein fusions), 56% are X-ray structures at 2.0 A or better and 4% are cryo-EM;
+of the glycoprotein entries with an oligosaccharide (10,355), 20% and 37%. Bound glycans are small
+and ordered where they are modelled, and on eight one- to four-residue glycans at covalent sites
+the fits reproduced the deposits (0.13-0.67 A) rather than improving them. Step 1 below is the bulk
+of the engine work, and it has to exist twice (the Python reference in GlycoFlow). The cheap part
+that keeps most of the value is the deposit checks (anomers, ring puckers) on free glycans, which
+need no fit.
+
+Corrections to the note below, found while checking it against GlycoFlow:
+- `-OME` is a GlycoFlow change, not only a ReGlyco one: the residue library is GlycoFlow's, no
+  training glycan has a methyl aglycone, and a new library is a new model revision. It matters
+  little: 261 entries hold a methyl glycoside, 106 of them as the reducing end of an
+  oligosaccharide, and 1CVN is deposited without the methyl carbon, so `-OH` covers its atoms.
+- The Python reference (GlycoFlow `glycoflow/fitting`) needs the rigid-body pose, its objective and
+  the Cartesian stage for the parity test to cover this mode.
+- `CCD_TO_GLYCAM` has 16 components; ligands (and deposited arabinosides on Hyp) need more.
 
 ReGlyco's GlycoFlow fit (`docs/glycoflow-fitting.md`) places a glycan that is covalently attached to
 a protein residue. This note covers glycans with no covalent anchor: a glycan bound in a lectin's
