@@ -150,11 +150,12 @@ example: DC-SIGN–Man4 (1K9I), concanavalin A–methyl trimannoside (1CVN; it n
 galectin with LacNAc, and haemagglutinin with sialyl-LacNAc analogues. Compare against the deposit
 exactly as for N-glycans.
 
-## Also found: O-linked sites
+## O-linked and other sites
 
-Ser/Thr anchors are accepted today, but three parts are still Asn-specific:
-- the Asn amide term `e_att` is applied to them;
-- the attachment grid assumes psi near 180° (the amide);
-- `link_bonds` counts CB as 3 bonds from C1, which is the Asn value; it is 2 for Ser/Thr.
+The Asn-specific parts that used to apply to Ser/Thr are fixed:
+- the amide term;
+- psi near 180 deg;
+- the Asn bond count to CB;
+- the 123 deg link angle.
 
-These are small fixes and worth doing before O-glycan fits are trusted.
+Sites now come from one anchor table (`anchor.rs`), which covers Ser/Thr, Trp C-mannose, Tyr, Hyp, Hyl and Cys. See `docs/glycoflow-fitting.md`.

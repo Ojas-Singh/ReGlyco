@@ -16,6 +16,7 @@
 //! * [`output`], [`evaluation`], [`workflow`]: structures, reports, validation;
 //! * [`observer`]: watching a fit as it runs; [`deposition`]: chemistry checks of a deposit.
 
+pub mod anchor;
 pub mod cartesian;
 pub mod counter;
 pub mod deposition;
@@ -29,6 +30,7 @@ pub mod output;
 pub mod pipeline;
 pub mod prior;
 pub mod problem;
+pub mod ring;
 pub mod search;
 pub mod site;
 pub mod support;

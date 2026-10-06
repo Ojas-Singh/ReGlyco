@@ -223,12 +223,16 @@ pub fn density_problem(
     resolution: f64,
     options: &ProblemOptions,
 ) -> Result<SiteProblem> {
-    let glycan = build_glycan(
+    let mut glycan = build_glycan(
         &model.library,
         &site.sequence.sequence,
         options.n_templates,
         options.template_seed,
     )?;
+    // C-mannose: 1C4 in crystals, 4C1 in GlycoFlow's library; odd templates take the other chair
+    if crate::anchor::anchor(&site.residue_name).is_some_and(|a| a.both_chairs) {
+        crate::ring::flip_root_chair(&mut glycan, |t| t % 2 == 1);
+    }
     let radius = options
         .region_radius
         .unwrap_or_else(|| max_span(&glycan) + 2.5);

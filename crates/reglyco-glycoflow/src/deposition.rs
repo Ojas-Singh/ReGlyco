@@ -7,12 +7,15 @@
 //!   beta-mannose, or every anomer of a tree inverted).
 //! * amide: psi_N = CB-CG-ND2-C1 of an N-glycan; the N-glycosidic amide is trans (|psi_N| near
 //!   180 deg). Flagged below [`AMIDE_CIS_LIMIT`], which catches cis (near 0) and twisted amides.
+//! * ring plane: links that must lie in a ring plane (C-mannose on Trp: CB-CG-CD1-C1 near 0 deg)
+//!   are flagged more than [`PLANE_LIMIT`] out of it.
 
 use std::collections::BTreeMap;
 
 use glycoflow_core::ResidueLibrary;
 use serde::Serialize;
 
+use crate::anchor::LinkTorsion;
 use crate::error::Result;
 use crate::site::{DepositedGlycan, Site, glycam_of};
 
@@ -20,6 +23,9 @@ type V3 = [f64; 3];
 
 /// |psi_N| below this (degrees) is flagged.
 pub const AMIDE_CIS_LIMIT: f64 = 150.0;
+
+/// A planar link further than this from its plane (degrees) is flagged (Asn: the amide limit).
+pub const PLANE_LIMIT: f64 = 180.0 - AMIDE_CIS_LIMIT;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AnomerMismatch {
@@ -41,6 +47,10 @@ pub struct DepositionChecks {
     /// CB-CG-ND2-C1 of the deposit (degrees); N-glycans only
     pub psi_n_deg: Option<f64>,
     pub amide_not_trans: bool,
+    /// A-B-link-C1 of the deposit (degrees), any site
+    pub link_torsion_deg: Option<f64>,
+    /// a link that must be planar (C-mannose on Trp) lies out of its ring plane
+    pub link_out_of_plane: bool,
     /// any of the above
     pub flagged: bool,
 }
@@ -76,7 +86,7 @@ pub fn dihedral_deg(a: V3, b: V3, c: V3, d: V3) -> f64 {
 pub fn check(
     deposited: &DepositedGlycan,
     anchor: &[V3; 3],
-    asparagine: bool,
+    torsion: LinkTorsion,
     template: &BTreeMap<(String, String), V3>,
     template_root_link: V3,
 ) -> DepositionChecks {
@@ -128,19 +138,33 @@ pub fn check(
             });
         }
     }
-    let psi_n_deg = if asparagine {
-        dep.get(&("r".to_string(), "C1".to_string()))
-            .map(|c1| dihedral_deg(anchor[0], anchor[1], anchor[2], *c1))
-    } else {
-        None
+    let link_torsion_deg = deposited
+        .residues
+        .iter()
+        .find(|r| r.path == "r")
+        .and_then(|r| glycam_of(&r.name))
+        .and_then(|(_, _, cpos)| dep.get(&("r".to_string(), format!("C{cpos}"))))
+        .map(|c| dihedral_deg(anchor[0], anchor[1], anchor[2], *c));
+    let (psi_n_deg, amide_not_trans, link_out_of_plane) = match torsion {
+        // the Asn amide
+        LinkTorsion::Planar { centre: 180.0 } => (link_torsion_deg, link_torsion_deg.is_some_and(|p| p.abs() < AMIDE_CIS_LIMIT), false),
+        LinkTorsion::Planar { centre } => {
+            let off = link_torsion_deg.is_some_and(|p| {
+                let d = (p - centre).rem_euclid(360.0);
+                d.min(360.0 - d) > PLANE_LIMIT
+            });
+            (None, false, off)
+        }
+        LinkTorsion::Free => (None, false, false),
     };
-    let amide_not_trans = psi_n_deg.is_some_and(|p| p.abs() < AMIDE_CIS_LIMIT);
     DepositionChecks {
         checked_residues: checked,
-        flagged: !mismatch.is_empty() || amide_not_trans,
+        flagged: !mismatch.is_empty() || amide_not_trans || link_out_of_plane,
         anomer_mismatch: mismatch,
         psi_n_deg,
         amide_not_trans,
+        link_torsion_deg,
+        link_out_of_plane,
     }
 }
 
@@ -167,13 +191,8 @@ pub fn deposition_checks(site: &Site, library: &ResidueLibrary) -> Result<Option
     let Some(root_link) = root_link else {
         return Ok(None);
     };
-    Ok(Some(check(
-        deposited,
-        &site.anchor,
-        site.residue_name == "ASN",
-        &template,
-        root_link,
-    )))
+    let torsion = crate::anchor::anchor(&site.residue_name).map_or(LinkTorsion::Free, |a| a.torsion);
+    Ok(Some(check(deposited, &site.anchor, torsion, &template, root_link)))
 }
 
 #[cfg(test)]
@@ -201,6 +220,7 @@ mod tests {
     const CB: V3 = [0.0, 1.5, 0.0];
     const CG: V3 = [0.0, 0.0, 0.0];
     const ND2: V3 = [1.3, -0.6, 0.0];
+    const AMIDE: LinkTorsion = LinkTorsion::Planar { centre: 180.0 };
 
     #[test]
     fn flags_a_cis_amide_and_an_inverted_anomer() {
@@ -214,20 +234,20 @@ mod tests {
         let anchor = [CB, CG, ND2];
 
         let good = glycan(&ring(trans_c1), &[("r", "NAG", None)]);
-        let c = check(&good, &anchor, true, &template, ND2);
+        let c = check(&good, &anchor, AMIDE, &template, ND2);
         assert_eq!(c.checked_residues, 1);
         assert!(c.anomer_mismatch.is_empty());
         assert!((c.psi_n_deg.unwrap().abs() - 180.0).abs() < 1e-6);
         assert!(!c.flagged);
 
         let cis = glycan(&ring(cis_c1), &[("r", "NAG", None)]);
-        let c = check(&cis, &anchor, true, &template, ND2);
+        let c = check(&cis, &anchor, AMIDE, &template, ND2);
         assert!(c.psi_n_deg.unwrap().abs() < 1e-6 && c.amide_not_trans && c.flagged);
 
         // the mirror image of the anomeric centre (ring oxygen below the plane instead of above)
         let mirrored: Vec<(&str, &str, V3)> = ring(trans_c1).into_iter().map(|(p, n, x)| (p, n, [x[0], x[1], -x[2]])).collect();
         let inverted = glycan(&mirrored, &[("r", "NAG", None)]);
-        let c = check(&inverted, &anchor, true, &template, ND2);
+        let c = check(&inverted, &anchor, AMIDE, &template, ND2);
         assert_eq!(c.anomer_mismatch.len(), 1);
         assert_eq!((c.anomer_mismatch[0].ccd.as_str(), c.anomer_mismatch[0].label_anomer), ("NAG", 'b'));
         assert!(c.flagged);
@@ -237,7 +257,22 @@ mod tests {
     fn serine_sites_have_no_amide() {
         let template = BTreeMap::new();
         let dep = glycan(&[("r", "C1", [1.3, -2.0, 0.0])], &[("r", "NGA", None)]);
-        let c = check(&dep, &[CB, CG, ND2], false, &template, ND2);
+        let c = check(&dep, &[CB, CG, ND2], LinkTorsion::Free, &template, ND2);
         assert!(c.psi_n_deg.is_none() && !c.flagged && c.checked_residues == 0);
+        assert!((c.link_torsion_deg.unwrap().abs() - 180.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn c_mannose_must_lie_in_the_indole_plane() {
+        // (CB, CG, CD1): C1 cis to CB in the ring plane is right; trans or tilted is not
+        let trp = LinkTorsion::Planar { centre: 0.0 };
+        let template = BTreeMap::new();
+        let in_plane = glycan(&[("r", "C1", [2.6, 0.0, 0.0])], &[("r", "MAN", None)]);
+        let c = check(&in_plane, &[CB, CG, ND2], trp, &template, ND2);
+        assert!(c.link_torsion_deg.unwrap().abs() < 1e-6 && !c.link_out_of_plane && !c.flagged);
+        let tilted = glycan(&[("r", "C1", [2.0, -0.2, 1.4])], &[("r", "MAN", None)]);
+        let c = check(&tilted, &[CB, CG, ND2], trp, &template, ND2);
+        assert!(c.link_torsion_deg.unwrap().abs() > PLANE_LIMIT && c.link_out_of_plane && c.flagged);
+        assert!(c.psi_n_deg.is_none() && !c.amide_not_trans);
     }
 }

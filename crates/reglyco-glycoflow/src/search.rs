@@ -12,13 +12,14 @@ use crate::error::Result;
 use crate::observer::{FitObserver, GuidedStep};
 use crate::problem::{Pose, SiteProblem, V3};
 
-/// Attachment grid: psi_N in {180, 165, -165} deg x `n_phi` values of phi_N.
-pub fn attachment_grid(n_phi: usize) -> Vec<(f64, f64)> {
-    let mut grid = Vec::with_capacity(3 * n_phi);
-    for psi in [180.0f64, 165.0, -165.0] {
+/// Attachment grid: the link's psi values (for Asn {180, 165, -165} deg; every 30 deg for links
+/// without a planar preference) x `n_phi` values of phi.
+pub fn attachment_grid(psis: &[f64], n_phi: usize) -> Vec<(f64, f64)> {
+    let mut grid = Vec::with_capacity(psis.len() * n_phi);
+    for &psi in psis {
         for k in 0..n_phi {
             grid.push((
-                psi.to_radians(),
+                psi,
                 -std::f64::consts::PI + 2.0 * std::f64::consts::PI * k as f64 / n_phi as f64,
             ));
         }
@@ -32,7 +33,7 @@ pub fn attach_search(
     problem: &SiteProblem,
     conformers: &[(Vec<f64>, usize)],
 ) -> Vec<(f64, f64, f64)> {
-    let grid = attachment_grid(36);
+    let grid = attachment_grid(&problem.link_torsion.grid(), 36);
     problem.counter.add_objective(conformers.len() * grid.len());
     conformers
         .par_iter()
@@ -206,7 +207,7 @@ pub fn guided_sample(
         let guidance = ObjectiveGuidance {
             problem,
             templates: templates.clone(),
-            psi: vec![std::f64::consts::PI; m],
+            psi: vec![problem.link_torsion.start(); m],
             phi: vec![0.0; m],
             scale,
             start,

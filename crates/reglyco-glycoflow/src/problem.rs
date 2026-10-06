@@ -57,13 +57,10 @@ fn unit(a: V3) -> V3 {
     [a[0] / n, a[1] / n, a[2] / n]
 }
 
-/// Linkage geometry of ReGlyco's `LinkageDefinition` (`attach.LINKAGE`): (bond length A, angle
-/// at the link atom in degrees).
+/// Linkage geometry (bond length A, angle at the link atom in degrees) of a site residue; see
+/// [`crate::anchor`].
 pub fn linkage(residue: &str) -> (f64, f64) {
-    match residue {
-        "SER" | "THR" => (1.43, 123.0),
-        _ => (1.45, 123.0),
-    }
+    crate::anchor::anchor(residue).map_or((1.45, 123.0), |a| (a.bond, a.angle))
 }
 
 /// Place d with |cd| = bond, angle bcd = angle, dihedral abcd = torsion (`attach.nerf`).
@@ -374,7 +371,10 @@ pub struct SiteProblem {
     pub w_env: f64,
     pub w_self: f64,
     pub w_prior: f64,
+    /// stiffness of the link torsion psi (from `amide_sd_deg`); planar links only
     pub amide_kappa: f64,
+    /// preference of psi = A-B-link-C1 (the Asn amide, the Trp ring plane, or none)
+    pub link_torsion: crate::anchor::LinkTorsion,
     pub prior: Option<MarginalPrior>,
     /// scoring-ball radius
     pub radius: f64,
@@ -441,14 +441,8 @@ impl SiteProblem {
         let grids = ClashGrids::build(&grid_atoms, grid_box.0, grid_box.1, grid_box.2);
         let site_xyz: Vec<V3> = site_atoms.iter().map(|a| a.position).collect();
         let site_names: Vec<String> = site_atoms.iter().map(|a| a.atom_name.clone()).collect();
-        let link_bonds = |name: &str| -> Option<u32> {
-            match name {
-                "ND2" | "OG" | "OG1" => Some(1),
-                "CG" => Some(2),
-                "OD1" | "CB" => Some(3),
-                _ => None,
-            }
-        };
+        let site_anchor = crate::anchor::anchor(&site.residue_name);
+        let link_bonds = |name: &str| -> Option<u32> { site_anchor.and_then(|a| a.bonds_to(name)) };
         let topo = &glycan.topology.topo_dist;
         let mut site_pairs = Vec::new();
         for (j, name) in site_names.iter().enumerate() {
@@ -531,6 +525,7 @@ impl SiteProblem {
             w_self: options.w_self,
             w_prior: options.w_prior,
             amide_kappa: 1.0 / options.amide_sd_deg.to_radians().powi(2),
+            link_torsion: site_anchor.map_or(crate::anchor::LinkTorsion::Planar { centre: 180.0 }, |a| a.torsion),
             prior: None,
             radius,
             counter: Counter::default(),
@@ -622,8 +617,7 @@ impl SiteProblem {
             None => self.observation.evaluate(x, None, None),
         };
         let (e_env, e_self) = self.clash_terms(x, gx);
-        let e_att = self.amide_kappa * (1.0 + psi.cos());
-        let d_att = -self.amide_kappa * psi.sin();
+        let (e_att, d_att) = self.link_torsion.energy(psi, self.amide_kappa);
         let total = obs.energy + self.w_env * e_env + self.w_self * e_self + e_att;
         (
             Terms {
