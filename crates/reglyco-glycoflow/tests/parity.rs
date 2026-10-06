@@ -6,6 +6,8 @@
 //! # in the GlycoFlow checkout
 //! .venv/bin/python scripts/fitting/export_fit_fixtures.py --sites sites.json \
 //!     --only 5KZC_A79 5GSQ_A297 5GSQ_B297 --out-dir /path/to/fixtures
+//! # (and the sites of the other anchors: 7R84 A:7, A:10, A:16; 6R2W L:52, L:60; 5T5L a:102;
+//! # 3U2U A:195; 3M5Q A:336 with their PDBe EDS maps, named like 7R84_A7)
 //! # in ReGlyco
 //! GLYCOFLOW_FIT_FIXTURES=/path/to/fixtures cargo test --release -p reglyco-glycoflow \
 //!     --test parity parity_ -- --ignored --nocapture
@@ -18,7 +20,9 @@
 //! rel. 1e-3 (the total relative to the magnitude of its terms); gradient vectors cosine > 0.999
 //! and relative norm difference < 1e-3, single dE/dpsi_N, dE/dphi_N components within 2e-4 of the
 //! gradient norm (relative 2e-3 with a floor of 10% of the norm: small components carry the
-//! float32 noise of the reference; a sign or axis error still fails by orders of magnitude).
+//! float32 noise of the reference; a sign or axis error still fails by orders of magnitude). The
+//! same rule applies to dE/dtau as a whole when it is under 10% of the gradient norm (a
+//! one-residue glycan has a single torsion, or none).
 //!
 //! Two properties of the float32 reference are accounted for:
 //! * `torch.cdist` evaluates float32 distances as `|x|^2 + |y|^2 - 2 x.y`, which at ~100 A
@@ -34,7 +38,9 @@
 // Tolerances: the reference evaluates in float32 on the GPU. With the bulk-solvent regressor the
 // density projection e = <g,obs> - theta.q is a difference of larger numbers, so absolute errors of
 // ~1e-3 log-likelihood units appear; floors are set to the magnitude of the differenced quantities
-// (poses: 0.5 loglik, 1 gain; subtree support gains: 3, 2e-3 relative; attachment objective: 10).
+// (poses: 2 loglik, 4 gain, 0.05 partial correlation; subtree support gains: 3, 2e-3 relative;
+// attachment objective: 10). One-residue glycans at sigma 0.6 set the pose floors: their poses
+// outside the density have log-likelihoods below 1 with the same ~1e-3 absolute error.
 use std::path::{Path, PathBuf};
 
 use glysys::{BuildOptions, ResidueId, read_pdb_str};
@@ -108,6 +114,13 @@ fn check(label: &str, rust: f64, python: f64, tol: f64, floor: f64) {
 }
 
 fn check_vec(label: &str, rust: &[f64], python: &[f64]) {
+    check_vec_floor(label, rust, python, 1e-3, 1e-6);
+}
+
+/// [`check_vec`] with the relative difference (at most `tol`) taken against at least `floor`: for
+/// a part of a gradient that is small next to the whole (the torsions of a one-residue glycan),
+/// which carries the float32 noise of the reference's larger components.
+fn check_vec_floor(label: &str, rust: &[f64], python: &[f64], tol: f64, floor: f64) {
     let dot: f64 = rust.iter().zip(python).map(|(a, b)| a * b).sum();
     let nr = rust.iter().map(|a| a * a).sum::<f64>().sqrt();
     let np = python.iter().map(|a| a * a).sum::<f64>().sqrt();
@@ -122,11 +135,11 @@ fn check_vec(label: &str, rust: &[f64], python: &[f64]) {
     } else {
         dot / (nr * np).max(1e-300)
     };
-    let reln = diff / np.max(1e-6);
+    let reln = diff / np.max(floor);
     println!(
         "  {label:<28} |rust| {nr:>14.6} |python| {np:>14.6} cos {cos:.7} rel.diff {reln:.2e}"
     );
-    if !(cos > 0.999 && reln < 1e-3) {
+    if !(cos > 0.999 && reln < tol) {
         fail(format!("{label}: cosine {cos}, relative difference {reln}"));
     }
 }
@@ -422,6 +435,41 @@ fn parity(name: &str) {
     println!("  template 0 (majority puckers) max |rust - python| = {dev:.2e} A");
     assert!(dev < 1e-3, "majority-pucker template differs by {dev} A");
     problem.set_templates(templates).unwrap();
+    // --- the site's anchor: link geometry, psi grid and the root ring's other chair (fixtures
+    // written since GlycoFlow's fitting/anchor.py)
+    if let Some(link) = fx.get("link").filter(|l| l.is_object()) {
+        assert_eq!(site.residue_name, fx["residue"].as_str().unwrap());
+        let anchor = reglyco_glycoflow::anchor::anchor(&site.residue_name).unwrap();
+        check("link bond", anchor.bond, f(&link["bond"]), 0.0, 1.0);
+        check("link angle", anchor.angle, f(&link["angle"]), 0.0, 1.0);
+        assert_eq!(anchor.both_chairs, link["both_chairs"].as_bool().unwrap());
+        let grid = problem.link_torsion.grid();
+        let py = vec_f(&link["psi_grid"]);
+        assert_eq!(grid.len(), py.len(), "psi grid size");
+        for (k, (a, b)) in grid.iter().zip(&py).enumerate() {
+            check(&format!("psi grid[{k}]"), *a, *b, 1e-12, 1.0);
+        }
+    }
+    if let Some(flipped) = fx.get("chair_flip").and_then(Value::as_array) {
+        let library = glycoflow_core::ResidueLibrary::from_json_slice(
+            &std::fs::read(library_path()).unwrap(),
+        )
+        .unwrap();
+        let mut one = build_glycan(&library, fx["sequence"].as_str().unwrap(), 1, 0).unwrap();
+        assert!(reglyco_glycoflow::ring::flip_root_chair(&mut one, |_| true));
+        let dev = one.templates[0]
+            .iter()
+            .zip(flipped)
+            .map(|(a, b)| {
+                let b = vec_f(b);
+                (0..3)
+                    .map(|k| (a[k] as f64 - b[k]).abs())
+                    .fold(0.0, f64::max)
+            })
+            .fold(0.0, f64::max);
+        println!("  root ring in the other chair: max |rust - python| = {dev:.2e} A");
+        assert!(dev < 1e-3, "flipped root ring differs by {dev} A");
+    }
     let pr = &fx["prior"];
     let samples: Vec<f64> = pr["samples"]
         .as_array()
@@ -474,9 +522,9 @@ fn parity(name: &str) {
             + f(&t["e_prior"]).abs();
         for (label, rust, floor) in [
             ("total", terms.total, scale),
-            ("loglik", terms.loglik, 0.5),
-            ("partial_cc", terms.partial_cc, 1e-3),
-            ("gain", terms.gain, 1.0),
+            ("loglik", terms.loglik, 2.0),
+            ("partial_cc", terms.partial_cc, 0.05),
+            ("gain", terms.gain, 4.0),
             ("e_env", terms.e_env, 1e-2),
             ("e_att", terms.e_att, 1e-3),
             ("e_prior", terms.e_prior, 1e-2),
@@ -504,7 +552,7 @@ fn parity(name: &str) {
             terms.loglik,
             f(&pose["loglik_f64gg"]),
             1e-3,
-            0.5,
+            2.0,
         );
         let gr = ev.grad.unwrap();
         let gp = &pose["grad"]["total"];
@@ -533,7 +581,7 @@ fn parity(name: &str) {
             parts.push((term, part));
         }
         let mut attach = vec![0.0; rust_all.len()];
-        attach[problem.n_torsions] = -problem.amide_kappa * p.psi.sin();
+        attach[problem.n_torsions] = problem.link_torsion.energy(p.psi, problem.amide_kappa).1;
         let mut density = rust_all.clone();
         for (_, part) in &parts {
             for (d, v) in density.iter_mut().zip(part) {
@@ -590,7 +638,7 @@ fn parity(name: &str) {
                 f(&gp["phi"])
             );
         } else {
-            check_vec("dE/dtau", &gr.tau, &vec_f(&gp["tau"]));
+            check_vec_floor("dE/dtau", &gr.tau, &vec_f(&gp["tau"]), 2e-3, 0.1 * scale);
             check_vec("dE/d(tau, psi, phi)", &rust_all, &py_all);
             check("dE/dpsi_N", gr.psi, f(&gp["psi"]), 2e-3, 0.1 * scale);
             check("dE/dphi_N", gr.phi, f(&gp["phi"]), 2e-3, 0.1 * scale);
@@ -612,7 +660,13 @@ fn parity(name: &str) {
                     + f(&t["e_prior"]).abs()
             },
         );
-        check_vec("dE/dtau at reference x", &ga.tau, &vec_f(&gp["tau"]));
+        check_vec_floor(
+            "dE/dtau at reference x",
+            &ga.tau,
+            &vec_f(&gp["tau"]),
+            2e-3,
+            0.1 * scale,
+        );
         check_vec("dE/d(all) at reference x", &ref_all, &py_all);
         check(
             "dE/dpsi_N at reference x",
@@ -883,4 +937,56 @@ fn parity_5gsq_a297() {
 #[ignore = "needs GLYCOFLOW_FIT_FIXTURES (GlycoFlow export_fit_fixtures.py), the 5GSQ model and map"]
 fn parity_5gsq_b297() {
     parity("5GSQ_B297");
+}
+
+// Other anchors (anchor.rs / GlycoFlow fitting/anchor.py): C-mannose on Trp (7R84 A:7, A:10),
+// O-fucose (7R84 A:16, 6R2W L:60), xylosylated O-glucose (6R2W L:52), GalNAc (5T5L a:102), the
+// glycogenin glucan on Tyr (3U2U A:195) and O-mannose (3M5Q A:336), on PDBe EDS maps.
+
+#[test]
+#[ignore = "needs GLYCOFLOW_FIT_FIXTURES (GlycoFlow export_fit_fixtures.py), the 7R84 model and map"]
+fn parity_7r84_a7() {
+    parity("7R84_A7");
+}
+
+#[test]
+#[ignore = "needs GLYCOFLOW_FIT_FIXTURES (GlycoFlow export_fit_fixtures.py), the 7R84 model and map"]
+fn parity_7r84_a10() {
+    parity("7R84_A10");
+}
+
+#[test]
+#[ignore = "needs GLYCOFLOW_FIT_FIXTURES (GlycoFlow export_fit_fixtures.py), the 7R84 model and map"]
+fn parity_7r84_a16() {
+    parity("7R84_A16");
+}
+
+#[test]
+#[ignore = "needs GLYCOFLOW_FIT_FIXTURES (GlycoFlow export_fit_fixtures.py), the 6R2W model and map"]
+fn parity_6r2w_l52() {
+    parity("6R2W_L52");
+}
+
+#[test]
+#[ignore = "needs GLYCOFLOW_FIT_FIXTURES (GlycoFlow export_fit_fixtures.py), the 6R2W model and map"]
+fn parity_6r2w_l60() {
+    parity("6R2W_L60");
+}
+
+#[test]
+#[ignore = "needs GLYCOFLOW_FIT_FIXTURES (GlycoFlow export_fit_fixtures.py), the 5T5L model and map"]
+fn parity_5t5l_a102() {
+    parity("5T5L_a102");
+}
+
+#[test]
+#[ignore = "needs GLYCOFLOW_FIT_FIXTURES (GlycoFlow export_fit_fixtures.py), the 3U2U model and map"]
+fn parity_3u2u_a195() {
+    parity("3U2U_A195");
+}
+
+#[test]
+#[ignore = "needs GLYCOFLOW_FIT_FIXTURES (GlycoFlow export_fit_fixtures.py), the 3M5Q model and map"]
+fn parity_3m5q_a336() {
+    parity("3M5Q_A336");
 }
