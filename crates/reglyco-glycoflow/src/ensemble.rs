@@ -726,6 +726,9 @@ pub fn extend(
     let best = &outcome.basins[outcome.best];
     let free = free_torsions(problem, &built);
     let usable = compatible_templates(problem, best.pose.template, &built, PUCKER_TOLERANCE);
+    if let Some(observer) = problem.observer.get() {
+        observer.stage("ensemble");
+    }
     let n = options.members;
     let templates: Vec<usize> = (0..n).map(|m| usable[m % usable.len()]).collect();
     let poses = complete_on_templates(

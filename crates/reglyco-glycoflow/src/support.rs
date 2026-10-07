@@ -251,7 +251,8 @@ pub fn complete_from_prior(
 }
 
 /// [`complete_from_prior`] with a pucker template per completion (`templates`), returning the
-/// poses: the free torsions as generated, everything else as in `fit`.
+/// poses: the free torsions as generated, everything else as in `fit`. Sampled in batches of
+/// `problem.batch` (memory; conformers are independent, so batching changes nothing else).
 #[allow(clippy::too_many_arguments)]
 pub fn complete_on_templates(
     problem: &SiteProblem,
@@ -267,33 +268,39 @@ pub fn complete_on_templates(
     let nt = problem.n_torsions;
     let tau0 = initial_torsions(seed ^ 0xC0_4E_1E_7E, n, nt);
     let target: Vec<f32> = fit.tau.iter().map(|&v| v as f32).collect();
-    let mut delta_pin = vec![0f32; n * nt];
-    for s in 0..n {
-        for t in 0..nt {
-            delta_pin[s * nt + t] = wrap(target[t] - tau0[s * nt + t]);
-        }
-    }
-    let mut hook = CompletionGuidance {
-        problem,
-        pose: fit.clone(),
-        templates: templates.to_vec(),
-        free: free.to_vec(),
-        delta_pin,
-        scale,
-        start: 0.5,
-    };
-    let xyz: Vec<P3> = templates
-        .iter()
-        .flat_map(|&k| problem.glycan.templates[k].iter().copied())
-        .collect();
     let opts = SampleOptions {
         steps,
         method: Method::Euler,
     };
-    let (_, tau) = sampler.sample(&xyz, &tau0, opts, Some(&mut hook))?;
-    problem.counter.add_nfe(n * opts.nfe());
-    Ok((0..n)
-        .map(|s| {
+    let batch = problem.batch.unwrap_or(n).max(1);
+    let mut poses = Vec::with_capacity(n);
+    let mut first = 0;
+    while first < n {
+        let m = batch.min(n - first);
+        let start = &tau0[first * nt..(first + m) * nt];
+        let mut delta_pin = vec![0f32; m * nt];
+        for s in 0..m {
+            for t in 0..nt {
+                delta_pin[s * nt + t] = wrap(target[t] - start[s * nt + t]);
+            }
+        }
+        let chunk = &templates[first..first + m];
+        let mut hook = CompletionGuidance {
+            problem,
+            pose: fit.clone(),
+            templates: chunk.to_vec(),
+            free: free.to_vec(),
+            delta_pin,
+            scale,
+            start: 0.5,
+        };
+        let xyz: Vec<P3> = chunk
+            .iter()
+            .flat_map(|&k| problem.glycan.templates[k].iter().copied())
+            .collect();
+        let (_, tau) = sampler.sample(&xyz, start, opts, Some(&mut hook))?;
+        problem.counter.add_nfe(m * opts.nfe());
+        poses.extend((0..m).map(|s| {
             let tau: Vec<f64> = (0..nt)
                 .map(|t| {
                     if free[t] {
@@ -305,9 +312,11 @@ pub fn complete_on_templates(
                 .collect();
             Pose {
                 tau,
-                template: templates[s],
+                template: chunk[s],
                 ..fit.clone()
             }
-        })
-        .collect())
+        }));
+        first += m;
+    }
+    Ok(poses)
 }
