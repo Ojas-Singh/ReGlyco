@@ -18,7 +18,9 @@ use reglyco_density::DensityMap;
 use reglyco_glycoflow::ensemble::EnsembleOptions;
 use reglyco_glycoflow::infer::{N_GLYCAN_SUGGESTIONS, contains_tree, suggestions_for};
 use reglyco_glycoflow::site::deposited_glycan;
-use reglyco_glycoflow::workflow::{SiteRequest, extend_one, extension_models, extension_report, fit_one};
+use reglyco_glycoflow::workflow::{
+    SiteRequest, extend_one, extension_models, extension_report, fit_one,
+};
 use reglyco_glycoflow::{ComputeDevice, GlycoflowModel, WorkflowInput, WorkflowOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,7 +28,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if a.len() < 8 {
         return Err("usage: extend <model> <pdb> <map> <CHAIN:NUM> <cpu|cuda> <seed> <glycan> [members] [output dir]".into());
     }
-    let device = if a[5] == "cuda" { ComputeDevice::Cuda } else { ComputeDevice::Cpu };
+    let device = if a[5] == "cuda" {
+        ComputeDevice::Cuda
+    } else {
+        ComputeDevice::Cpu
+    };
     let model = GlycoflowModel::load(std::path::Path::new(&a[1]), device, Precision::F32)?;
     let build = BuildOptions {
         add_water: false,
@@ -45,7 +51,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut options = WorkflowOptions::default();
     options.fit.seed = a[6].parse()?;
     let deposited = deposited_glycan(&structure, &residue)?;
-    let deposited_sequence = deposited.as_ref().map(|d| d.glycam_sequence()).transpose()?;
+    let deposited_sequence = deposited
+        .as_ref()
+        .map(|d| d.glycam_sequence())
+        .transpose()?;
     let site_residue = structure
         .residues()
         .into_iter()
@@ -53,7 +62,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|r| r.name)
         .ok_or("site residue not found")?;
     // the glycan to extend to
-    let holds = |seq: &str| deposited_sequence.as_deref().is_none_or(|d| contains_tree(seq, d).unwrap_or(false));
+    let holds = |seq: &str| {
+        deposited_sequence
+            .as_deref()
+            .is_none_or(|d| contains_tree(seq, d).unwrap_or(false))
+    };
     let is_host = N_GLYCAN_SUGGESTIONS.iter().any(|(host, _)| *host == a[7]);
     let (name, sequence) = if is_host {
         suggestions_for(&site_residue, &a[7])
@@ -61,13 +74,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .find(|(_, s)| holds(s))
             .map(|(n, s)| (n.to_string(), s.to_string()))
             .ok_or("no suggestion holds the deposited glycan")?
-    } else if let Some((n, s)) = N_GLYCAN_SUGGESTIONS.iter().flat_map(|(_, o)| o.iter()).find(|(n, _)| *n == a[7]) {
+    } else if let Some((n, s)) = N_GLYCAN_SUGGESTIONS
+        .iter()
+        .flat_map(|(_, o)| o.iter())
+        .find(|(n, _)| *n == a[7])
+    {
         (n.to_string(), s.to_string())
     } else {
         (a[7].clone(), a[7].clone())
     };
     if !holds(&sequence) {
-        return Err(format!("{name} does not hold the deposited glycan ({})", deposited_sequence.unwrap_or_default()).into());
+        return Err(format!(
+            "{name} does not hold the deposited glycan ({})",
+            deposited_sequence.unwrap_or_default()
+        )
+        .into());
     }
     let mut protein = structure.clone();
     if let Some(d) = &deposited {
@@ -113,7 +134,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (k, (label, pdb)) in extension_models(&fit, &extension)?.iter().enumerate() {
             out.push_str(&format!("REMARK 250 MODEL {}: {label}\n", k + 1));
             out.push_str(&format!("MODEL     {:4}\n", k + 1));
-            out.extend(pdb.lines().filter(|l| l.starts_with("HETATM")).map(|l| format!("{l}\n")));
+            out.extend(
+                pdb.lines()
+                    .filter(|l| l.starts_with("HETATM"))
+                    .map(|l| format!("{l}\n")),
+            );
             out.push_str("ENDMDL\n");
         }
         out.push_str("END\n");

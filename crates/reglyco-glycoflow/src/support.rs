@@ -227,7 +227,16 @@ pub fn complete_from_prior(
     scale: f32,
     seed: u64,
 ) -> Result<Vec<Completion>> {
-    let poses = complete_on_templates(problem, sampler, fit, free, &vec![fit.template; n], steps, scale, seed)?;
+    let poses = complete_on_templates(
+        problem,
+        sampler,
+        fit,
+        free,
+        &vec![fit.template; n],
+        steps,
+        scale,
+        seed,
+    )?;
     Ok(poses
         .into_par_iter()
         .map(|pose| {

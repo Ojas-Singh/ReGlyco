@@ -525,7 +525,10 @@ impl SiteProblem {
             w_self: options.w_self,
             w_prior: options.w_prior,
             amide_kappa: 1.0 / options.amide_sd_deg.to_radians().powi(2),
-            link_torsion: site_anchor.map_or(crate::anchor::LinkTorsion::Planar { centre: 180.0 }, |a| a.torsion),
+            link_torsion: site_anchor
+                .map_or(crate::anchor::LinkTorsion::Planar { centre: 180.0 }, |a| {
+                    a.torsion
+                }),
             prior: None,
             radius,
             counter: Counter::default(),

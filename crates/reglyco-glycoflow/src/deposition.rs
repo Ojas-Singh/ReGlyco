@@ -62,7 +62,11 @@ fn dot(a: V3, b: V3) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 fn cross(a: V3, b: V3) -> V3 {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
 }
 
 /// Signed volume of (a, b, c) about `o`.
@@ -75,8 +79,22 @@ pub fn dihedral_deg(a: V3, b: V3, c: V3, d: V3) -> f64 {
     let (b0, b1, b2) = (sub(a, b), sub(c, b), sub(d, c));
     let n = dot(b1, b1).sqrt();
     let b1 = [b1[0] / n, b1[1] / n, b1[2] / n];
-    let v = sub(b0, [b1[0] * dot(b0, b1), b1[1] * dot(b0, b1), b1[2] * dot(b0, b1)]);
-    let w = sub(b2, [b1[0] * dot(b2, b1), b1[1] * dot(b2, b1), b1[2] * dot(b2, b1)]);
+    let v = sub(
+        b0,
+        [
+            b1[0] * dot(b0, b1),
+            b1[1] * dot(b0, b1),
+            b1[2] * dot(b0, b1),
+        ],
+    );
+    let w = sub(
+        b2,
+        [
+            b1[0] * dot(b2, b1),
+            b1[1] * dot(b2, b1),
+            b1[2] * dot(b2, b1),
+        ],
+    );
     dot(cross(b1, v), w).atan2(dot(v, w)).to_degrees()
 }
 
@@ -99,7 +117,11 @@ pub fn check(
         };
         let path = residue.path.clone();
         let ring_o = if cpos == 2 { "O6" } else { "O5" };
-        let need = [format!("C{cpos}"), ring_o.to_string(), format!("C{}", cpos + 1)];
+        let need = [
+            format!("C{cpos}"),
+            ring_o.to_string(),
+            format!("C{}", cpos + 1),
+        ];
         let (link_dep, link_tpl) = if path == "r" {
             (Some(anchor[2]), Some(template_root_link))
         } else {
@@ -114,7 +136,9 @@ pub fn check(
         let (Some(link_dep), Some(link_tpl)) = (link_dep, link_tpl) else {
             continue;
         };
-        let get = |m: &BTreeMap<(String, String), V3>, name: &str| m.get(&(path.clone(), name.to_string())).copied();
+        let get = |m: &BTreeMap<(String, String), V3>, name: &str| {
+            m.get(&(path.clone(), name.to_string())).copied()
+        };
         let (Some(d0), Some(d1), Some(d2), Some(t0), Some(t1), Some(t2)) = (
             get(dep, &need[0]),
             get(dep, &need[1]),
@@ -147,7 +171,11 @@ pub fn check(
         .map(|c| dihedral_deg(anchor[0], anchor[1], anchor[2], *c));
     let (psi_n_deg, amide_not_trans, link_out_of_plane) = match torsion {
         // the Asn amide
-        LinkTorsion::Planar { centre: 180.0 } => (link_torsion_deg, link_torsion_deg.is_some_and(|p| p.abs() < AMIDE_CIS_LIMIT), false),
+        LinkTorsion::Planar { centre: 180.0 } => (
+            link_torsion_deg,
+            link_torsion_deg.is_some_and(|p| p.abs() < AMIDE_CIS_LIMIT),
+            false,
+        ),
         LinkTorsion::Planar { centre } => {
             let off = link_torsion_deg.is_some_and(|p| {
                 let d = (p - centre).rem_euclid(360.0);
@@ -170,7 +198,10 @@ pub fn check(
 
 /// The checks for a site's deposited glycan (None without a deposit). The reference is GlycoFlow's
 /// majority-pucker template of the deposited labels' sequence.
-pub fn deposition_checks(site: &Site, library: &ResidueLibrary) -> Result<Option<DepositionChecks>> {
+pub fn deposition_checks(
+    site: &Site,
+    library: &ResidueLibrary,
+) -> Result<Option<DepositionChecks>> {
     let Some(deposited) = site.deposited.as_ref() else {
         return Ok(None);
     };
@@ -182,7 +213,12 @@ pub fn deposition_checks(site: &Site, library: &ResidueLibrary) -> Result<Option
     let built = library.build(sequence, None)?;
     let mut template = BTreeMap::new();
     let mut root_link = None;
-    for ((path, name), x) in built.res_paths.iter().zip(&built.atom_names).zip(&built.coords) {
+    for ((path, name), x) in built
+        .res_paths
+        .iter()
+        .zip(&built.atom_names)
+        .zip(&built.coords)
+    {
         if path == "agl" {
             root_link.get_or_insert(*x);
         }
@@ -191,8 +227,15 @@ pub fn deposition_checks(site: &Site, library: &ResidueLibrary) -> Result<Option
     let Some(root_link) = root_link else {
         return Ok(None);
     };
-    let torsion = crate::anchor::anchor(&site.residue_name).map_or(LinkTorsion::Free, |a| a.torsion);
-    Ok(Some(check(deposited, &site.anchor, torsion, &template, root_link)))
+    let torsion =
+        crate::anchor::anchor(&site.residue_name).map_or(LinkTorsion::Free, |a| a.torsion);
+    Ok(Some(check(
+        deposited,
+        &site.anchor,
+        torsion,
+        &template,
+        root_link,
+    )))
 }
 
 #[cfg(test)]
@@ -201,19 +244,29 @@ mod tests {
     use crate::site::DepositedResidue;
     use glysys::ResidueId;
 
-    fn glycan(atoms: &[(&str, &str, V3)], residues: &[(&str, &str, Option<u32>)]) -> DepositedGlycan {
+    fn glycan(
+        atoms: &[(&str, &str, V3)],
+        residues: &[(&str, &str, Option<u32>)],
+    ) -> DepositedGlycan {
         DepositedGlycan {
             residues: residues
                 .iter()
                 .enumerate()
                 .map(|(i, (path, name, parent))| DepositedResidue {
-                    id: ResidueId { chain: "B".into(), number: i as i32 + 1, insertion_code: None },
+                    id: ResidueId {
+                        chain: "B".into(),
+                        number: i as i32 + 1,
+                        insertion_code: None,
+                    },
                     name: name.to_string(),
                     path: path.to_string(),
                     parent_position: *parent,
                 })
                 .collect(),
-            atoms: atoms.iter().map(|(p, n, x)| ((p.to_string(), n.to_string()), *x)).collect(),
+            atoms: atoms
+                .iter()
+                .map(|(p, n, x)| ((p.to_string(), n.to_string()), *x))
+                .collect(),
         }
     }
 
@@ -228,9 +281,17 @@ mod tests {
         let trans_c1 = [1.3, -2.0, 0.0];
         // cis: C1 on the CB side (psi_N = 0)
         let cis_c1 = [2.6, 0.0, 0.0];
-        let ring = |c1: V3| vec![("r", "C1", c1), ("r", "O5", [c1[0] + 0.5, c1[1] + 1.2, 0.4]), ("r", "C2", [c1[0] + 1.2, c1[1] - 0.6, -0.5])];
-        let template: BTreeMap<(String, String), V3> =
-            ring(trans_c1).into_iter().map(|(p, n, x)| ((p.to_string(), n.to_string()), x)).collect();
+        let ring = |c1: V3| {
+            vec![
+                ("r", "C1", c1),
+                ("r", "O5", [c1[0] + 0.5, c1[1] + 1.2, 0.4]),
+                ("r", "C2", [c1[0] + 1.2, c1[1] - 0.6, -0.5]),
+            ]
+        };
+        let template: BTreeMap<(String, String), V3> = ring(trans_c1)
+            .into_iter()
+            .map(|(p, n, x)| ((p.to_string(), n.to_string()), x))
+            .collect();
         let anchor = [CB, CG, ND2];
 
         let good = glycan(&ring(trans_c1), &[("r", "NAG", None)]);
@@ -245,11 +306,20 @@ mod tests {
         assert!(c.psi_n_deg.unwrap().abs() < 1e-6 && c.amide_not_trans && c.flagged);
 
         // the mirror image of the anomeric centre (ring oxygen below the plane instead of above)
-        let mirrored: Vec<(&str, &str, V3)> = ring(trans_c1).into_iter().map(|(p, n, x)| (p, n, [x[0], x[1], -x[2]])).collect();
+        let mirrored: Vec<(&str, &str, V3)> = ring(trans_c1)
+            .into_iter()
+            .map(|(p, n, x)| (p, n, [x[0], x[1], -x[2]]))
+            .collect();
         let inverted = glycan(&mirrored, &[("r", "NAG", None)]);
         let c = check(&inverted, &anchor, AMIDE, &template, ND2);
         assert_eq!(c.anomer_mismatch.len(), 1);
-        assert_eq!((c.anomer_mismatch[0].ccd.as_str(), c.anomer_mismatch[0].label_anomer), ("NAG", 'b'));
+        assert_eq!(
+            (
+                c.anomer_mismatch[0].ccd.as_str(),
+                c.anomer_mismatch[0].label_anomer
+            ),
+            ("NAG", 'b')
+        );
         assert!(c.flagged);
     }
 
@@ -272,7 +342,9 @@ mod tests {
         assert!(c.link_torsion_deg.unwrap().abs() < 1e-6 && !c.link_out_of_plane && !c.flagged);
         let tilted = glycan(&[("r", "C1", [2.0, -0.2, 1.4])], &[("r", "MAN", None)]);
         let c = check(&tilted, &[CB, CG, ND2], trp, &template, ND2);
-        assert!(c.link_torsion_deg.unwrap().abs() > PLANE_LIMIT && c.link_out_of_plane && c.flagged);
+        assert!(
+            c.link_torsion_deg.unwrap().abs() > PLANE_LIMIT && c.link_out_of_plane && c.flagged
+        );
         assert!(c.psi_n_deg.is_none() && !c.amide_not_trans);
     }
 }

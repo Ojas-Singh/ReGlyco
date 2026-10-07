@@ -73,7 +73,14 @@ pub const ANCHORS: [Anchor; 8] = [
         bond: 1.51,
         angle: 129.0,
         torsion: LinkTorsion::Planar { centre: 0.0 },
-        near: &[("CD1", 1), ("CG", 2), ("NE1", 2), ("CB", 3), ("CD2", 3), ("CE2", 3)],
+        near: &[
+            ("CD1", 1),
+            ("CG", 2),
+            ("NE1", 2),
+            ("CB", 3),
+            ("CD2", 3),
+            ("CE2", 3),
+        ],
         linkage: "C-linked",
         both_chairs: true,
     },
@@ -129,7 +136,10 @@ pub fn anchor(residue: &str) -> Option<&'static Anchor> {
 impl Anchor {
     /// Bonds from C1 to a side-chain atom of the site residue, within three.
     pub fn bonds_to(&self, atom: &str) -> Option<u32> {
-        self.near.iter().find(|(name, _)| *name == atom).map(|(_, b)| *b)
+        self.near
+            .iter()
+            .find(|(name, _)| *name == atom)
+            .map(|(_, b)| *b)
     }
 }
 
@@ -138,7 +148,9 @@ impl LinkTorsion {
     pub fn energy(&self, psi: f64, kappa: f64) -> (f64, f64) {
         match *self {
             // the Asn amide, written as before
-            LinkTorsion::Planar { centre: 180.0 } => (kappa * (1.0 + psi.cos()), -kappa * psi.sin()),
+            LinkTorsion::Planar { centre: 180.0 } => {
+                (kappa * (1.0 + psi.cos()), -kappa * psi.sin())
+            }
             LinkTorsion::Planar { centre } => {
                 let d = psi - centre.to_radians();
                 (kappa * (1.0 - d.cos()), kappa * d.sin())
@@ -149,10 +161,22 @@ impl LinkTorsion {
 
     /// psi values (radians) of the attachment grid: the planar value and +-15 deg, or every 30 deg.
     pub fn grid(&self) -> Vec<f64> {
-        let wrap = |d: f64| if d > 180.0 { d - 360.0 } else if d <= -180.0 { d + 360.0 } else { d };
+        let wrap = |d: f64| {
+            if d > 180.0 {
+                d - 360.0
+            } else if d <= -180.0 {
+                d + 360.0
+            } else {
+                d
+            }
+        };
         match *self {
-            LinkTorsion::Planar { centre } => [centre, centre - 15.0, centre + 15.0].map(|d| wrap(d).to_radians()).to_vec(),
-            LinkTorsion::Free => (0..12).map(|k| (180.0 - 30.0 * k as f64).to_radians()).collect(),
+            LinkTorsion::Planar { centre } => [centre, centre - 15.0, centre + 15.0]
+                .map(|d| wrap(d).to_radians())
+                .to_vec(),
+            LinkTorsion::Free => (0..12)
+                .map(|k| (180.0 - 30.0 * k as f64).to_radians())
+                .collect(),
         }
     }
 
@@ -192,7 +216,8 @@ mod tests {
         // the derivative is the slope of the energy
         let h = 1e-6;
         let (_, d) = trp.torsion.energy(0.3, 10.0);
-        let fd = (trp.torsion.energy(0.3 + h, 10.0).0 - trp.torsion.energy(0.3 - h, 10.0).0) / (2.0 * h);
+        let fd =
+            (trp.torsion.energy(0.3 + h, 10.0).0 - trp.torsion.energy(0.3 - h, 10.0).0) / (2.0 * h);
         assert!((d - fd).abs() < 1e-6);
     }
 

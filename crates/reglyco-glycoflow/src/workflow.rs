@@ -477,17 +477,44 @@ pub struct Extension {
 
 /// Extend a fit (`fit_one` of a glycan larger than its density): build what the map supports and
 /// generate the ensemble beyond it.
-pub fn extend_one(input: &WorkflowInput, fit: &SiteFit, options: &crate::ensemble::EnsembleOptions) -> Result<Extension> {
+pub fn extend_one(
+    input: &WorkflowInput,
+    fit: &SiteFit,
+    options: &crate::ensemble::EnsembleOptions,
+) -> Result<Extension> {
     let problem = &fit.problem;
     let env: Vec<V3> = fit.site.environment.iter().map(|a| a.position).collect();
     let levels = crate::infer::DensityLevels::new(input.map, problem, &env);
-    let (statistical, root_gain) =
-        crate::infer::statistical_support(problem, &fit.outcome, input.options.fit.support_base, input.options.fit.support_per_torsion);
+    let (statistical, root_gain) = crate::infer::statistical_support(
+        problem,
+        &fit.outcome,
+        input.options.fit.support_base,
+        input.options.fit.support_per_torsion,
+    );
     let x = &fit.outcome.basins[fit.outcome.best].x;
-    let gate = crate::infer::density_gate(problem, x, input.map, levels.as_ref(), &statistical, root_gain);
+    let gate = crate::infer::density_gate(
+        problem,
+        x,
+        input.map,
+        levels.as_ref(),
+        &statistical,
+        root_gain,
+    );
     let sampler = Sampler::for_glycan(&input.model.net, &problem.glycan, &input.model.meta.vocab)?;
-    let ensemble = crate::ensemble::extend(problem, &sampler, &fit.outcome, &gate, Some(input.map), levels.as_ref(), options)?;
-    Ok(Extension { gate, levels, ensemble })
+    let ensemble = crate::ensemble::extend(
+        problem,
+        &sampler,
+        &fit.outcome,
+        &gate,
+        Some(input.map),
+        levels.as_ref(),
+        options,
+    )?;
+    Ok(Extension {
+        gate,
+        levels,
+        ensemble,
+    })
 }
 
 /// The `extend` entry of a site's report.
@@ -515,7 +542,10 @@ pub fn extension_models(fit: &SiteFit, e: &Extension) -> Result<Vec<(String, Str
         }])
     };
     let best = &fit.outcome.basins[fit.outcome.best];
-    let mut out = vec![(format!("fit; built: {}", e.gate.built.join(" ")), placed(&best.x)?)];
+    let mut out = vec![(
+        format!("fit; built: {}", e.gate.built.join(" ")),
+        placed(&best.x)?,
+    )];
     if let Some(ens) = &e.ensemble {
         for c in &ens.clusters {
             out.push((

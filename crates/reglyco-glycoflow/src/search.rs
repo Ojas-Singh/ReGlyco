@@ -219,7 +219,8 @@ pub fn guided_sample(
         let (guidance, tau) = match observer {
             None => {
                 let mut guidance = guidance;
-                let (_, tau) = sampler.sample(&templates_xyz, tau_start, opts, Some(&mut guidance))?;
+                let (_, tau) =
+                    sampler.sample(&templates_xyz, tau_start, opts, Some(&mut guidance))?;
                 (guidance, tau)
             }
             Some(observer) => {
@@ -228,7 +229,8 @@ pub fn guided_sample(
                     observer,
                     first: s0,
                 };
-                let (_, tau) = sampler.sample(&templates_xyz, tau_start, opts, Some(&mut recorded))?;
+                let (_, tau) =
+                    sampler.sample(&templates_xyz, tau_start, opts, Some(&mut recorded))?;
                 observer.guided_step(&GuidedStep {
                     first: s0,
                     step: steps,

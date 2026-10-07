@@ -140,7 +140,11 @@ fn dot(a: V3, b: V3) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 fn cross(a: V3, b: V3) -> V3 {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
 }
 fn wrap(a: f64) -> f64 {
     let two_pi = 2.0 * std::f64::consts::PI;
@@ -162,7 +166,10 @@ pub fn ring_signature(x: &[[f32; 3]], idx: &[usize]) -> Vec<f64> {
         for b in a + 1..n {
             for c in b + 1..n {
                 for d in c + 1..n {
-                    out.push(dot(sub(r[b], r[a]), cross(sub(r[c], r[a]), sub(r[d], r[a]))));
+                    out.push(dot(
+                        sub(r[b], r[a]),
+                        cross(sub(r[c], r[a]), sub(r[d], r[a])),
+                    ));
                 }
             }
         }
@@ -173,9 +180,21 @@ pub fn ring_signature(x: &[[f32; 3]], idx: &[usize]) -> Vec<f64> {
 /// Pucker templates whose rings are in the pucker state of `template`'s on every built residue,
 /// so that the built residues keep their shape in every member. When the fit uses a rare pucker
 /// of a built residue, few templates (or only its own) qualify.
-pub fn compatible_templates(problem: &SiteProblem, template: usize, built: &BTreeSet<String>, tol: f64) -> Vec<usize> {
+pub fn compatible_templates(
+    problem: &SiteProblem,
+    template: usize,
+    built: &BTreeSet<String>,
+    tol: f64,
+) -> Vec<usize> {
     let g = &problem.glycan;
-    templates_in_state(&g.templates, &g.res_paths, &g.topology.ring_atoms, template, built, tol)
+    templates_in_state(
+        &g.templates,
+        &g.res_paths,
+        &g.topology.ring_atoms,
+        template,
+        built,
+        tol,
+    )
 }
 
 /// [`compatible_templates`] on bare arrays: template conformers, residue path and ring flag of
@@ -190,13 +209,20 @@ pub fn templates_in_state(
 ) -> Vec<usize> {
     let rings: Vec<Vec<usize>> = built
         .iter()
-        .map(|p| (0..paths.len()).filter(|&i| &paths[i] == p && ring_atoms[i]).collect::<Vec<_>>())
+        .map(|p| {
+            (0..paths.len())
+                .filter(|&i| &paths[i] == p && ring_atoms[i])
+                .collect::<Vec<_>>()
+        })
         .filter(|idx| idx.len() >= 4)
         .collect();
     (0..templates.len())
         .filter(|&k| {
             rings.iter().all(|idx| {
-                let (a, b) = (ring_signature(&templates[k], idx), ring_signature(&templates[template], idx));
+                let (a, b) = (
+                    ring_signature(&templates[k], idx),
+                    ring_signature(&templates[template], idx),
+                );
                 a.iter().zip(&b).all(|(u, v)| (u - v).abs() <= tol)
             })
         })
@@ -205,8 +231,19 @@ pub fn templates_in_state(
 
 /// Torsions that move only atoms beyond the built residues.
 pub fn free_torsions(problem: &SiteProblem, built: &BTreeSet<String>) -> Vec<bool> {
-    let beyond: Vec<bool> = problem.glycan.res_paths.iter().map(|p| p != "agl" && !built.contains(p)).collect();
-    problem.glycan.topology.distal.iter().map(|d| !d.is_empty() && d.iter().all(|&i| beyond[i])).collect()
+    let beyond: Vec<bool> = problem
+        .glycan
+        .res_paths
+        .iter()
+        .map(|p| p != "agl" && !built.contains(p))
+        .collect();
+    problem
+        .glycan
+        .topology
+        .distal
+        .iter()
+        .map(|d| !d.is_empty() && d.iter().all(|&i| beyond[i]))
+        .collect()
 }
 
 /// The contacts some atoms of the glycan take part in (with the environment, and with any atom of
@@ -220,8 +257,18 @@ pub struct RegionContacts<'p> {
 
 impl<'p> RegionContacts<'p> {
     pub fn new(problem: &'p SiteProblem, atoms: Vec<bool>) -> Self {
-        let self_pairs = problem.self_pairs.iter().copied().filter(|&(i, j, _)| atoms[i] || atoms[j]).collect();
-        let site_pairs = problem.site_pairs.iter().copied().filter(|&(i, _, _)| atoms[i]).collect();
+        let self_pairs = problem
+            .self_pairs
+            .iter()
+            .copied()
+            .filter(|&(i, j, _)| atoms[i] || atoms[j])
+            .collect();
+        let site_pairs = problem
+            .site_pairs
+            .iter()
+            .copied()
+            .filter(|&(i, _, _)| atoms[i])
+            .collect();
         Self {
             problem,
             atoms,
@@ -270,14 +317,29 @@ impl<'p> RegionContacts<'p> {
 
 /// Move a member off its contacts in torsion space: Adam on the free torsions under the region's
 /// contacts (a member without contacts has no gradient and stays as sampled), best iterate.
-pub fn relax(problem: &SiteProblem, contacts: &RegionContacts, pose: &Pose, free: &[bool], steps: usize, lr: f64) -> Pose {
+pub fn relax(
+    problem: &SiteProblem,
+    contacts: &RegionContacts,
+    pose: &Pose,
+    free: &[bool],
+    steps: usize,
+    lr: f64,
+) -> Pose {
     let nt = pose.tau.len();
     let topo = &problem.glycan.topology;
     let mut delta = vec![0.0; nt];
     let mut adam = Adam::new(nt, lr);
     let mut best = (f64::INFINITY, pose.tau.clone());
     for _ in 0..=steps {
-        let tau: Vec<f64> = (0..nt).map(|t| if free[t] { wrap(pose.tau[t] + delta[t]) } else { pose.tau[t] }).collect();
+        let tau: Vec<f64> = (0..nt)
+            .map(|t| {
+                if free[t] {
+                    wrap(pose.tau[t] + delta[t])
+                } else {
+                    pose.tau[t]
+                }
+            })
+            .collect();
         let x = problem.place(&Pose {
             tau: tau.clone(),
             ..pose.clone()
@@ -319,7 +381,13 @@ pub fn clear_contacts(
     let mut best = (f64::INFINITY, x0.to_vec());
     for _ in 0..=steps {
         let x: Vec<V3> = (0..n)
-            .map(|i| if contacts.atoms[i] { [0, 1, 2].map(|k| x0[i][k] + delta[3 * i + k]) } else { x0[i] })
+            .map(|i| {
+                if contacts.atoms[i] {
+                    [0, 1, 2].map(|k| x0[i][k] + delta[3 * i + k])
+                } else {
+                    x0[i]
+                }
+            })
             .collect();
         let mut gc = vec![[0.0; 3]; n];
         let e = contacts.energy(&x, Some(&mut gc));
@@ -349,7 +417,10 @@ fn largest_eigenvector(mut a: [[f64; 4]; 4]) -> [f64; 4] {
         row[i] = 1.0;
     }
     for _ in 0..64 {
-        let off: f64 = (0..4).flat_map(|i| (i + 1..4).map(move |j| (i, j))).map(|(i, j)| a[i][j] * a[i][j]).sum();
+        let off: f64 = (0..4)
+            .flat_map(|i| (i + 1..4).map(move |j| (i, j)))
+            .map(|(i, j)| a[i][j] * a[i][j])
+            .sum();
         if off < 1e-24 {
             break;
         }
@@ -378,7 +449,9 @@ fn largest_eigenvector(mut a: [[f64; 4]; 4]) -> [f64; 4] {
             }
         }
     }
-    let k = (0..4).max_by(|&i, &j| a[i][i].total_cmp(&a[j][j])).unwrap_or(0);
+    let k = (0..4)
+        .max_by(|&i, &j| a[i][i].total_cmp(&a[j][j]))
+        .unwrap_or(0);
     [v[0][k], v[1][k], v[2][k], v[3][k]]
 }
 
@@ -398,16 +471,48 @@ pub fn superpose(p: &[V3], q: &[V3]) -> ([[f64; 3]; 3], V3) {
         }
     }
     let m = [
-        [s[0][0] + s[1][1] + s[2][2], s[1][2] - s[2][1], s[2][0] - s[0][2], s[0][1] - s[1][0]],
-        [s[1][2] - s[2][1], s[0][0] - s[1][1] - s[2][2], s[0][1] + s[1][0], s[2][0] + s[0][2]],
-        [s[2][0] - s[0][2], s[0][1] + s[1][0], -s[0][0] + s[1][1] - s[2][2], s[1][2] + s[2][1]],
-        [s[0][1] - s[1][0], s[2][0] + s[0][2], s[1][2] + s[2][1], -s[0][0] - s[1][1] + s[2][2]],
+        [
+            s[0][0] + s[1][1] + s[2][2],
+            s[1][2] - s[2][1],
+            s[2][0] - s[0][2],
+            s[0][1] - s[1][0],
+        ],
+        [
+            s[1][2] - s[2][1],
+            s[0][0] - s[1][1] - s[2][2],
+            s[0][1] + s[1][0],
+            s[2][0] + s[0][2],
+        ],
+        [
+            s[2][0] - s[0][2],
+            s[0][1] + s[1][0],
+            -s[0][0] + s[1][1] - s[2][2],
+            s[1][2] + s[2][1],
+        ],
+        [
+            s[0][1] - s[1][0],
+            s[2][0] + s[0][2],
+            s[1][2] + s[2][1],
+            -s[0][0] - s[1][1] + s[2][2],
+        ],
     ];
     let [w, x, y, z] = largest_eigenvector(m);
     let r = [
-        [w * w + x * x - y * y - z * z, 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)],
-        [2.0 * (x * y + w * z), w * w - x * x + y * y - z * z, 2.0 * (y * z - w * x)],
-        [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), w * w - x * x - y * y + z * z],
+        [
+            w * w + x * x - y * y - z * z,
+            2.0 * (x * y - w * z),
+            2.0 * (x * z + w * y),
+        ],
+        [
+            2.0 * (x * y + w * z),
+            w * w - x * x + y * y - z * z,
+            2.0 * (y * z - w * x),
+        ],
+        [
+            2.0 * (x * z - w * y),
+            2.0 * (y * z + w * x),
+            w * w - x * x - y * y + z * z,
+        ],
     ];
     let rp = [0, 1, 2].map(|i| dot(r[i], pc));
     (r, sub(qc, rp))
@@ -424,7 +529,12 @@ pub fn graft(paths: &[String], member: &[V3], x_built: &[V3], built: &BTreeSet<S
     }
     let roots: BTreeSet<&String> = paths
         .iter()
-        .filter(|p| *p != "agl" && !built.contains(*p) && p.rsplit_once('/').is_some_and(|(parent, _)| built.contains(parent)))
+        .filter(|p| {
+            *p != "agl"
+                && !built.contains(*p)
+                && p.rsplit_once('/')
+                    .is_some_and(|(parent, _)| built.contains(parent))
+        })
         .collect();
     for root in roots {
         let parent = root.rsplit_once('/').map(|(p, _)| p).unwrap_or_default();
@@ -446,7 +556,12 @@ pub fn graft(paths: &[String], member: &[V3], x_built: &[V3], built: &BTreeSet<S
 /// of one or `max_clusters` are reached; then members go to their nearest medoid and each medoid
 /// moves to the most central member of its cluster, until nothing changes. Returns the clusters,
 /// largest first, and the largest member-to-medoid distance.
-pub fn cluster(x: &[Vec<V3>], idx: &[usize], cutoff: f64, max_clusters: usize) -> (Vec<Cluster>, f64) {
+pub fn cluster(
+    x: &[Vec<V3>],
+    idx: &[usize],
+    cutoff: f64,
+    max_clusters: usize,
+) -> (Vec<Cluster>, f64) {
     let m = x.len();
     if m == 0 {
         return (Vec::new(), 0.0);
@@ -454,7 +569,10 @@ pub fn cluster(x: &[Vec<V3>], idx: &[usize], cutoff: f64, max_clusters: usize) -
     let mut d = vec![0.0; m * m];
     for a in 0..m {
         for b in a + 1..m {
-            let s: f64 = idx.iter().map(|&i| dot(sub(x[a][i], x[b][i]), sub(x[a][i], x[b][i]))).sum();
+            let s: f64 = idx
+                .iter()
+                .map(|&i| dot(sub(x[a][i], x[b][i]), sub(x[a][i], x[b][i])))
+                .sum();
             let r = (s / idx.len().max(1) as f64).sqrt();
             d[a * m + b] = r;
             d[b * m + a] = r;
@@ -478,7 +596,10 @@ pub fn cluster(x: &[Vec<V3>], idx: &[usize], cutoff: f64, max_clusters: usize) -
         }
         best.map_or(0, |(j, _)| j)
     };
-    let mut medoids = vec![first(&mut (0..m).map(|j| (j, (0..m).map(|k| d[j * m + k]).sum::<f64>())), false)];
+    let mut medoids = vec![first(
+        &mut (0..m).map(|j| (j, (0..m).map(|k| d[j * m + k]).sum::<f64>())),
+        false,
+    )];
     while medoids.len() < max_clusters.min(m) {
         let far = first(&mut (0..m).map(|j| (j, nearest(&medoids, j).1)), true);
         if nearest(&medoids, far).1 <= cutoff {
@@ -491,7 +612,12 @@ pub fn cluster(x: &[Vec<V3>], idx: &[usize], cutoff: f64, max_clusters: usize) -
         let moved: Vec<usize> = (0..medoids.len())
             .map(|k| {
                 let group: Vec<usize> = (0..m).filter(|&j| assign[j] == k).collect();
-                let c = first(&mut group.iter().map(|&j| (j, group.iter().map(|&l| d[j * m + l]).sum::<f64>())), false);
+                let c = first(
+                    &mut group
+                        .iter()
+                        .map(|&j| (j, group.iter().map(|&l| d[j * m + l]).sum::<f64>())),
+                    false,
+                );
                 if group.is_empty() { medoids[k] } else { c }
             })
             .collect();
@@ -551,7 +677,10 @@ pub fn rmsf(x: &[Vec<V3>], idx: &[usize]) -> f64 {
     let mut s = 0.0;
     for &i in idx {
         let mean = [0, 1, 2].map(|k| x.iter().map(|c| c[i][k]).sum::<f64>() / m);
-        s += x.iter().map(|c| dot(sub(c[i], mean), sub(c[i], mean))).sum::<f64>();
+        s += x
+            .iter()
+            .map(|c| dot(sub(c[i], mean), sub(c[i], mean)))
+            .sum::<f64>();
     }
     (s / (m * idx.len().max(1) as f64)).sqrt()
 }
@@ -583,7 +712,11 @@ pub fn extend(
 ) -> Result<Option<Ensemble>> {
     let paths = &problem.glycan.res_paths;
     let built: BTreeSet<String> = gate.built.iter().cloned().collect();
-    let mut region: Vec<String> = paths.iter().filter(|p| *p != "agl" && !built.contains(*p)).cloned().collect();
+    let mut region: Vec<String> = paths
+        .iter()
+        .filter(|p| *p != "agl" && !built.contains(*p))
+        .cloned()
+        .collect();
     region.sort();
     region.dedup();
     region.sort_by(|a, b| (a.matches('/').count(), a).cmp(&(b.matches('/').count(), b)));
@@ -595,19 +728,41 @@ pub fn extend(
     let usable = compatible_templates(problem, best.pose.template, &built, PUCKER_TOLERANCE);
     let n = options.members;
     let templates: Vec<usize> = (0..n).map(|m| usable[m % usable.len()]).collect();
-    let poses = complete_on_templates(problem, sampler, &best.pose, &free, &templates, options.steps, options.guidance, options.seed)?;
-    let beyond: Vec<bool> = paths.iter().map(|p| p != "agl" && !built.contains(p)).collect();
+    let poses = complete_on_templates(
+        problem,
+        sampler,
+        &best.pose,
+        &free,
+        &templates,
+        options.steps,
+        options.guidance,
+        options.seed,
+    )?;
+    let beyond: Vec<bool> = paths
+        .iter()
+        .map(|p| p != "agl" && !built.contains(p))
+        .collect();
     let contacts = RegionContacts::new(problem, beyond.clone());
     let finished: Vec<(Vec<V3>, f64, usize)> = poses
         .par_iter()
         .map(|pose| {
             let pose = relax(problem, &contacts, pose, &free, options.relax_steps, 0.01);
             let grafted = graft(paths, &problem.place(&pose), &best.x, &built);
-            let (x, e) = clear_contacts(problem, &contacts, &grafted, pose.template, options.clear_steps, 0.005, 100.0);
+            let (x, e) = clear_contacts(
+                problem,
+                &contacts,
+                &grafted,
+                pose.template,
+                options.clear_steps,
+                0.005,
+                100.0,
+            );
             (x, e, pose.template)
         })
         .collect();
-    problem.counter.add_objective_grad(n * (options.relax_steps + options.clear_steps));
+    problem
+        .counter
+        .add_objective_grad(n * (options.relax_steps + options.clear_steps));
     let (mut members, mut kept_templates) = (Vec::new(), Vec::new());
     for (x, e, template) in finished {
         if e <= options.contact_tolerance {
@@ -615,7 +770,9 @@ pub fn extend(
             kept_templates.push(template);
         }
     }
-    let scored: Vec<usize> = (0..problem.n_atoms).filter(|&i| beyond[i] && problem.keep[i]).collect();
+    let scored: Vec<usize> = (0..problem.n_atoms)
+        .filter(|&i| beyond[i] && problem.keep[i])
+        .collect();
     let (clusters, cluster_rmsd) = cluster(&members, &scored, options.cluster_rmsd, MAX_CLUSTERS);
     let sigma = problem.observation.density().map_or(1.0, |l| l.sigma);
     let mut residues = Vec::new();
@@ -625,18 +782,31 @@ pub fn extend(
             while !built.contains(anchor) {
                 anchor = anchor.rsplit_once('/').map_or("r", |(parent, _)| parent);
             }
-            let idx: Vec<usize> = (0..problem.n_atoms).filter(|&i| &paths[i] == p && problem.keep[i]).collect();
-            let z: Vec<f64> = idx.iter().map(|&i| crate::observation::glycan_z(&problem.glycan.elements[i]).unwrap_or(0.0)).collect();
+            let idx: Vec<usize> = (0..problem.n_atoms)
+                .filter(|&i| &paths[i] == p && problem.keep[i])
+                .collect();
+            let z: Vec<f64> = idx
+                .iter()
+                .map(|&i| crate::observation::glycan_z(&problem.glycan.elements[i]).unwrap_or(0.0))
+                .collect();
             let order = order_parameter(&members, &idx, &z, sigma);
             let (mut predicted, mut observed, mut read) = (None, None, None);
-            if let (Some(map), Some(levels), Some(reference)) = (map, levels, gate.density_fraction.get(anchor)) {
+            if let (Some(map), Some(levels), Some(reference)) =
+                (map, levels, gate.density_fraction.get(anchor))
+            {
                 let seen: Vec<f64> = members
                     .iter()
-                    .filter_map(|x| levels.fraction(map, &idx.iter().map(|&i| x[i]).collect::<Vec<_>>()))
+                    .filter_map(|x| {
+                        levels.fraction(map, &idx.iter().map(|&i| x[i]).collect::<Vec<_>>())
+                    })
                     .collect();
                 if !seen.is_empty() {
-                    let (pr, ob) = (order * reference, seen.iter().sum::<f64>() / seen.len() as f64);
-                    (predicted, observed, read) = (Some(pr), Some(ob), Some(reading(order, pr, ob)));
+                    let (pr, ob) = (
+                        order * reference,
+                        seen.iter().sum::<f64>() / seen.len() as f64,
+                    );
+                    (predicted, observed, read) =
+                        (Some(pr), Some(ob), Some(reading(order, pr, ob)));
                 }
             }
             residues.push(ResidueFlexibility {
@@ -678,10 +848,15 @@ mod tests {
             ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
         }
         fn normal(&mut self) -> f64 {
-            (-2.0 * self.uniform().max(1e-300).ln()).sqrt() * (2.0 * std::f64::consts::PI * self.uniform()).cos()
+            (-2.0 * self.uniform().max(1e-300).ln()).sqrt()
+                * (2.0 * std::f64::consts::PI * self.uniform()).cos()
         }
         fn point(&mut self, scale: f64) -> V3 {
-            [self.normal() * scale, self.normal() * scale, self.normal() * scale]
+            [
+                self.normal() * scale,
+                self.normal() * scale,
+                self.normal() * scale,
+            ]
         }
     }
 
@@ -692,12 +867,16 @@ mod tests {
         let z = [6.0, 6.0, 8.0, 6.0, 7.0, 8.0];
         let idx: Vec<usize> = (0..6).collect();
         assert!((order_parameter(&vec![one.clone(); 20], &idx, &z, 1.0) - 1.0).abs() < 1e-12);
-        let apart: Vec<V3> = one.iter().map(|p| [p[0] + 100.0, p[1] + 100.0, p[2] + 100.0]).collect();
+        let apart: Vec<V3> = one
+            .iter()
+            .map(|p| [p[0] + 100.0, p[1] + 100.0, p[2] + 100.0])
+            .collect();
         assert!((order_parameter(&[one, apart], &idx, &z, 1.0) - 0.5).abs() < 1e-9);
         // Gaussian disorder of variance u^2 per axis: 1/M + (1 - 1/M) (s^2 / (s^2 + u^2))^1.5
         let (m, s, u) = (600usize, 1.2f64, 0.9f64);
         let x: Vec<Vec<V3>> = (0..m).map(|_| vec![rng.point(u)]).collect();
-        let expected = 1.0 / m as f64 + (1.0 - 1.0 / m as f64) * (s * s / (s * s + u * u)).powf(1.5);
+        let expected =
+            1.0 / m as f64 + (1.0 - 1.0 / m as f64) * (s * s / (s * s + u * u)).powf(1.5);
         assert!((order_parameter(&x, &[0], &[6.0], s) - expected).abs() < 0.02);
     }
 
@@ -705,17 +884,32 @@ mod tests {
     fn clusters_have_populations() {
         let mut rng = Rng(2);
         let a: Vec<V3> = (0..8).map(|_| rng.point(1.0)).collect();
-        let b: Vec<V3> = (0..8).map(|_| rng.point(1.0)).map(|p| [p[0] + 6.0, p[1] + 6.0, p[2] + 6.0]).collect();
-        let jitter = |base: &[V3], rng: &mut Rng| -> Vec<V3> { base.iter().map(|p| { let d = rng.point(0.1); [p[0] + d[0], p[1] + d[1], p[2] + d[2]] }).collect() };
+        let b: Vec<V3> = (0..8)
+            .map(|_| rng.point(1.0))
+            .map(|p| [p[0] + 6.0, p[1] + 6.0, p[2] + 6.0])
+            .collect();
+        let jitter = |base: &[V3], rng: &mut Rng| -> Vec<V3> {
+            base.iter()
+                .map(|p| {
+                    let d = rng.point(0.1);
+                    [p[0] + d[0], p[1] + d[1], p[2] + d[2]]
+                })
+                .collect()
+        };
         let mut x: Vec<Vec<V3>> = (0..30).map(|_| jitter(&a, &mut rng)).collect();
         x.extend((0..10).map(|_| jitter(&b, &mut rng)));
         let idx: Vec<usize> = (0..8).collect();
         let (c, radius) = cluster(&x, &idx, 1.5, MAX_CLUSTERS);
-        assert_eq!(c.iter().map(|k| k.members.len()).collect::<Vec<_>>(), vec![30, 10]);
+        assert_eq!(
+            c.iter().map(|k| k.members.len()).collect::<Vec<_>>(),
+            vec![30, 10]
+        );
         assert!((c[0].population - 0.75).abs() < 1e-12 && radius < 1.5);
         assert!(c[0].medoid < 30 && c[1].medoid >= 30);
         // conformers spread without structure: at most eight representatives, and the radius they cover
-        let wide: Vec<Vec<V3>> = (0..60).map(|_| (0..8).map(|_| rng.point(3.0)).collect()).collect();
+        let wide: Vec<Vec<V3>> = (0..60)
+            .map(|_| (0..8).map(|_| rng.point(3.0)).collect())
+            .collect();
         let (c, radius) = cluster(&wide, &idx, 1.5, MAX_CLUSTERS);
         assert!(c.len() == 8 && radius > 1.5);
         assert!((c.iter().map(|k| k.population).sum::<f64>() - 1.0).abs() < 1e-12);
@@ -727,11 +921,23 @@ mod tests {
 
     #[test]
     fn graft_keeps_the_built_model_and_moves_subtrees_rigidly() {
-        let paths: Vec<String> = ["agl"].into_iter().chain(["r"; 4]).chain(["r/4"; 4]).chain(["r/4/4"; 3]).map(String::from).collect();
+        let paths: Vec<String> = ["agl"]
+            .into_iter()
+            .chain(["r"; 4])
+            .chain(["r/4"; 4])
+            .chain(["r/4/4"; 3])
+            .map(String::from)
+            .collect();
         let mut rng = Rng(3);
         let member: Vec<V3> = (0..12).map(|_| rng.point(2.0)).collect();
         let (s, c) = 0.7f64.sin_cos();
-        let moved = |p: V3| [c * p[0] - s * p[1] + 3.0, s * p[0] + c * p[1] - 1.0, p[2] + 2.0];
+        let moved = |p: V3| {
+            [
+                c * p[0] - s * p[1] + 3.0,
+                s * p[0] + c * p[1] - 1.0,
+                p[2] + 2.0,
+            ]
+        };
         let built_model: Vec<V3> = member.iter().map(|p| moved(*p)).collect();
         let built: BTreeSet<String> = ["r".to_string(), "r/4".to_string()].into();
         let out = graft(&paths, &member, &built_model, &built);
@@ -764,16 +970,27 @@ mod tests {
     #[test]
     #[ignore = "needs GLYCOFLOW_MODEL (residue_library.json of the licensed model)"]
     fn ring_signatures_tell_the_chairs_apart() {
-        let path = std::path::Path::new(&std::env::var("GLYCOFLOW_MODEL").unwrap()).join("residue_library.json");
-        let library = glycoflow_core::ResidueLibrary::from_json_slice(&std::fs::read(path).unwrap()).unwrap();
-        let mut g = crate::problem::build_glycan(&library, "DManpa1-3DManpb1-4DGlcpNAcb1-OH", 3, 0).unwrap();
+        let path = std::path::Path::new(&std::env::var("GLYCOFLOW_MODEL").unwrap())
+            .join("residue_library.json");
+        let library =
+            glycoflow_core::ResidueLibrary::from_json_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut g = crate::problem::build_glycan(&library, "DManpa1-3DManpb1-4DGlcpNAcb1-OH", 3, 0)
+            .unwrap();
         g.templates[1] = g.templates[0].clone();
         g.templates[2] = g.templates[0].clone();
         assert!(crate::ring::flip_root_chair(&mut g, |k| k == 2));
-        let root: Vec<usize> = (0..g.res_paths.len()).filter(|&i| g.res_paths[i] == "r" && g.topology.ring_atoms[i]).collect();
+        let root: Vec<usize> = (0..g.res_paths.len())
+            .filter(|&i| g.res_paths[i] == "r" && g.topology.ring_atoms[i])
+            .collect();
         let d = |a: usize, b: usize| {
-            let (u, v) = (ring_signature(&g.templates[a], &root), ring_signature(&g.templates[b], &root));
-            u.iter().zip(&v).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max)
+            let (u, v) = (
+                ring_signature(&g.templates[a], &root),
+                ring_signature(&g.templates[b], &root),
+            );
+            u.iter()
+                .zip(&v)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0, f64::max)
         };
         assert!(d(0, 1) < 1e-9 && d(0, 2) > PUCKER_TOLERANCE);
     }
