@@ -77,12 +77,13 @@ anyhow = "1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 nalgebra = { version = "0.35", default-features = false, features = ["std"] }
-# Keep the local development checkout version-aligned with ReGlyco. These can
-# return to registry requirements after crabWURCS 0.3 is published.
-crabwurcs-iupac = { path = "../crabWURCS/crabwurcs-iupac", version = "0.3.1" }
-crabwurcs-core = { path = "../crabWURCS/crabwurcs-core", version = "0.3.1" }
-crabwurcs-pdb = { path = "../crabWURCS/crabwurcs-pdb", version = "0.3.1" }
-crabwurcs-snfg = { path = "../crabWURCS/crabwurcs-snfg", version = "0.3.1" }
+# crabWURCS comes from its tagged repository, the same source GlySys uses, so
+# the workspace holds one copy and needs no sibling checkout. crates.io 0.3.1
+# is the same code; `cargo publish` substitutes it.
+crabwurcs-iupac = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.1", version = "0.3.1" }
+crabwurcs-core = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.1", version = "0.3.1" }
+crabwurcs-pdb = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.1", version = "0.3.1" }
+crabwurcs-snfg = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.1", version = "0.3.1" }
 contour = "0.13.1"
 flate2 = "1"
 glysys = { version = "0.1.0", path = "../GlySys" }

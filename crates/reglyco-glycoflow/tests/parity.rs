@@ -41,7 +41,7 @@
 // (poses: 2 loglik, 4 gain, 0.05 partial correlation; subtree support gains: 3, 2e-3 relative;
 // attachment objective: 10). One-residue glycans at sigma 0.6 set the pose floors: their poses
 // outside the density have log-likelihoods below 1 with the same ~1e-3 absolute error.
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use glysys::{BuildOptions, ResidueId, read_pdb_str};
 use reglyco_density::DensityMap;
