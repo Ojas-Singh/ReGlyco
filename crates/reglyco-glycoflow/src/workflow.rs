@@ -21,7 +21,7 @@ use crate::pipeline::{
     FitConfig, FitOutcome, PriorConfig, SigmaCalibration, build_prior, calibrate_sigma,
     density_problem, fit_site,
 };
-use crate::problem::{ProblemOptions, SiteProblem};
+use crate::problem::{ProblemOptions, SiteProblem, V3};
 use crate::site::{CrystalInput, Site, SiteOptions, deposited_glycan, load_site};
 use crate::symmetry::{UnitCell, parse_cryst1, parse_resolution};
 
@@ -463,4 +463,66 @@ pub fn write_outputs(result: &WorkflowResult, dir: &Path) -> Result<()> {
         serde_json::to_string_pretty(&validation)? + "\n",
     )?;
     Ok(())
+}
+
+/// The extend mode at a fitted site: what the fit builds ([`crate::infer::Gate`]: support test and
+/// density gate) and the ensemble beyond it ([`crate::ensemble`]).
+pub struct Extension {
+    pub gate: crate::infer::Gate,
+    /// map levels of the site (None: no usable levels, every supported residue is built)
+    pub levels: Option<crate::infer::DensityLevels>,
+    /// None when nothing is built or the whole glycan is built
+    pub ensemble: Option<crate::ensemble::Ensemble>,
+}
+
+/// Extend a fit (`fit_one` of a glycan larger than its density): build what the map supports and
+/// generate the ensemble beyond it.
+pub fn extend_one(input: &WorkflowInput, fit: &SiteFit, options: &crate::ensemble::EnsembleOptions) -> Result<Extension> {
+    let problem = &fit.problem;
+    let env: Vec<V3> = fit.site.environment.iter().map(|a| a.position).collect();
+    let levels = crate::infer::DensityLevels::new(input.map, problem, &env);
+    let (statistical, root_gain) =
+        crate::infer::statistical_support(problem, &fit.outcome, input.options.fit.support_base, input.options.fit.support_per_torsion);
+    let x = &fit.outcome.basins[fit.outcome.best].x;
+    let gate = crate::infer::density_gate(problem, x, input.map, levels.as_ref(), &statistical, root_gain);
+    let sampler = Sampler::for_glycan(&input.model.net, &problem.glycan, &input.model.meta.vocab)?;
+    let ensemble = crate::ensemble::extend(problem, &sampler, &fit.outcome, &gate, Some(input.map), levels.as_ref(), options)?;
+    Ok(Extension { gate, levels, ensemble })
+}
+
+/// The `extend` entry of a site's report.
+pub fn extension_report(e: &Extension) -> Value {
+    json!({
+        "built": e.gate.built,
+        "weak": e.gate.weak,
+        "density_fraction": e.gate.density_fraction,
+        "root_gain": e.gate.root_gain,
+        "density_gate": crate::infer::DENSITY_GATE,
+        "ensemble": e.ensemble,
+        "note": "the ensemble is GlycoFlow's account of the residues beyond the built ones (not fitted to density, not evidence for them)",
+    })
+}
+
+/// Glycan-only models of an extension: the fit, then the medoid of every cluster of the ensemble
+/// (largest first), each as (label, PDB text of `output::glycan_pdb`).
+pub fn extension_models(fit: &SiteFit, e: &Extension) -> Result<Vec<(String, String)>> {
+    let placed = |x: &[V3]| {
+        crate::output::glycan_pdb(&[PlacedGlycan {
+            problem: &fit.problem,
+            site: &fit.site,
+            naming: &fit.naming,
+            x,
+        }])
+    };
+    let best = &fit.outcome.basins[fit.outcome.best];
+    let mut out = vec![(format!("fit; built: {}", e.gate.built.join(" ")), placed(&best.x)?)];
+    if let Some(ens) = &e.ensemble {
+        for c in &ens.clusters {
+            out.push((
+                format!("ensemble beyond the built residues, cluster population {:.2} (not fitted to density)", c.population),
+                placed(&ens.members[c.medoid])?,
+            ));
+        }
+    }
+    Ok(out)
 }

@@ -145,6 +145,8 @@ pub fn unsupported_torsions(problem: &SiteProblem, support: &[SubtreeSupport]) -
 struct CompletionGuidance<'p> {
     problem: &'p SiteProblem,
     pose: Pose,
+    /// pucker template of every sample
+    templates: Vec<usize>,
     free: Vec<bool>,
     /// straight-path velocity of the pinned torsions [B*T]
     delta_pin: Vec<f32>,
@@ -177,6 +179,7 @@ impl Guidance for CompletionGuidance<'_> {
                         problem,
                         &Pose {
                             tau: ahead,
+                            template: self.templates[s],
                             ..self.pose.clone()
                         },
                     )
@@ -224,6 +227,34 @@ pub fn complete_from_prior(
     scale: f32,
     seed: u64,
 ) -> Result<Vec<Completion>> {
+    let poses = complete_on_templates(problem, sampler, fit, free, &vec![fit.template; n], steps, scale, seed)?;
+    Ok(poses
+        .into_par_iter()
+        .map(|pose| {
+            let ev = problem.evaluate(&pose, false);
+            Completion {
+                pose,
+                x: ev.x,
+                terms: ev.terms,
+            }
+        })
+        .collect())
+}
+
+/// [`complete_from_prior`] with a pucker template per completion (`templates`), returning the
+/// poses: the free torsions as generated, everything else as in `fit`.
+#[allow(clippy::too_many_arguments)]
+pub fn complete_on_templates(
+    problem: &SiteProblem,
+    sampler: &Sampler,
+    fit: &Pose,
+    free: &[bool],
+    templates: &[usize],
+    steps: usize,
+    scale: f32,
+    seed: u64,
+) -> Result<Vec<Pose>> {
+    let n = templates.len();
     let nt = problem.n_torsions;
     let tau0 = initial_torsions(seed ^ 0xC0_4E_1E_7E, n, nt);
     let target: Vec<f32> = fit.tau.iter().map(|&v| v as f32).collect();
@@ -236,22 +267,23 @@ pub fn complete_from_prior(
     let mut hook = CompletionGuidance {
         problem,
         pose: fit.clone(),
+        templates: templates.to_vec(),
         free: free.to_vec(),
         delta_pin,
         scale,
         start: 0.5,
     };
-    let templates: Vec<P3> = (0..n)
-        .flat_map(|_| problem.glycan.templates[fit.template].iter().copied())
+    let xyz: Vec<P3> = templates
+        .iter()
+        .flat_map(|&k| problem.glycan.templates[k].iter().copied())
         .collect();
     let opts = SampleOptions {
         steps,
         method: Method::Euler,
     };
-    let (_, tau) = sampler.sample(&templates, &tau0, opts, Some(&mut hook))?;
+    let (_, tau) = sampler.sample(&xyz, &tau0, opts, Some(&mut hook))?;
     problem.counter.add_nfe(n * opts.nfe());
     Ok((0..n)
-        .into_par_iter()
         .map(|s| {
             let tau: Vec<f64> = (0..nt)
                 .map(|t| {
@@ -262,12 +294,10 @@ pub fn complete_from_prior(
                     }
                 })
                 .collect();
-            let pose = Pose { tau, ..fit.clone() };
-            let ev = problem.evaluate(&pose, false);
-            Completion {
-                pose,
-                x: ev.x,
-                terms: ev.terms,
+            Pose {
+                tau,
+                template: templates[s],
+                ..fit.clone()
             }
         })
         .collect())
