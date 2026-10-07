@@ -76,6 +76,10 @@ impl Observer {
 
 impl std::fmt::Debug for Observer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_some() { "Observer(set)" } else { "Observer(none)" })
+        f.write_str(if self.0.is_some() {
+            "Observer(set)"
+        } else {
+            "Observer(none)"
+        })
     }
 }

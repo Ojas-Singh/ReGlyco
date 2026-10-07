@@ -79,6 +79,32 @@ the deposited glycan when present - evaluation only) and `validation.json`.
 Report bundles: the GlycoFlow fit does not write `report.json`/`report.pdf`; `glycoflow-fit.json`
 is its report.
 
+## Extend mode: an ensemble past the density
+
+A deposit is usually shorter than the glycan that was on the protein. Fitting a larger glycan
+(`workflow::fit_one` with a sequence that holds the deposited one; `infer::suggestions_for` lists
+the usual glycans of an expression system, `infer::contains_tree` checks that a glycan holds the
+deposit) and then calling `workflow::extend_one` gives two things:
+
+- **Built residues** (`infer::Gate`): those that pass the support test and whose density is at least
+  0.3 of the way from solvent to protein, with a built parent. This is the model; only this is
+  evidence.
+- **An ensemble for the rest** (`ensemble.rs`): GlycoFlow completions conditioned on the built
+  residues and on the protein around them (128 by default), each moved off its contacts and kept
+  only if clear; up to eight representative conformers with populations; and per residue its spread,
+  its order parameter (the density an ensemble this wide leaves, relative to an ordered residue), the
+  density level that flexibility alone predicts and the level the map has there. The reading says
+  whether flexibility accounts for the weak density, or whether the residue is denser or fainter than
+  the ensemble predicts (fainter: absent in part, or more mobile than modelled).
+
+The ensemble is not fitted to density and is not evidence for a residue. Example
+(`examples/extend.rs`): 9DIX D:701, cryo-EM at 3.5 A, deposited with two GlcNAc and fitted as a
+sialylated biantennary glycan: seven residues built, 89 of 128 members kept, spread 0.7 A at the
+first residue beyond the built part to 7 A at the sialic acid, fit 15 s and ensemble 3 s on a GB10.
+
+When the fit uses a rare ring pucker for a built residue, only the pucker templates that share it
+are used for the members (often just the fit's own).
+
 Options: `--glycoflow-samples` (default 384), `--glycoflow-steps` (default 8; 768 x 32 gave the
 same core/supported recovery on 6 sites x 3 seeds at 8x the network cost), `--glycoflow-basins`, `--glycoflow-prior-weight`,
 `--glycoflow-no-prior`, `--glycoflow-clash-weight` (final contact weight, default 100),

@@ -24,7 +24,11 @@ fn dot(a: V, b: V) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 fn cross(a: V, b: V) -> V {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
 }
 fn unit(a: V) -> V {
     scale(a, 1.0 / dot(a, a).sqrt())
@@ -39,8 +43,18 @@ fn frame(axis: V, toward: V) -> [V; 3] {
 
 /// Ring atoms of an aldopyranose root (O5, C1..C5), if the root is one.
 fn root_ring(glycan: &Glycan) -> Option<[usize; 6]> {
-    let find = |name: &str| (0..glycan.atom_names.len()).find(|&i| glycan.res_paths[i] == "r" && glycan.atom_names[i] == name);
-    Some([find("O5")?, find("C1")?, find("C2")?, find("C3")?, find("C4")?, find("C5")?])
+    let find = |name: &str| {
+        (0..glycan.atom_names.len())
+            .find(|&i| glycan.res_paths[i] == "r" && glycan.atom_names[i] == name)
+    };
+    Some([
+        find("O5")?,
+        find("C1")?,
+        find("C2")?,
+        find("C3")?,
+        find("C4")?,
+        find("C5")?,
+    ])
 }
 
 /// Flip the root ring of template `x` (see the module docs); None when the root is not an
@@ -57,7 +71,10 @@ fn flip(glycan: &Glycan, ring: &[usize; 6], x: &[[f32; 3]]) -> Option<Vec<[f32; 
     let c = scale(ring.iter().fold([0.0; 3], |s, &i| add(s, p[i])), 1.0 / 6.0);
     let mut normal = [0.0; 3];
     for k in 0..6 {
-        normal = add(normal, cross(sub(p[ring[k]], c), sub(p[ring[(k + 1) % 6]], c)));
+        normal = add(
+            normal,
+            cross(sub(p[ring[k]], c), sub(p[ring[(k + 1) % 6]], c)),
+        );
     }
     let normal = unit(normal);
     let mirror_point = |q: V| sub(q, scale(normal, 2.0 * dot(sub(q, c), normal)));
@@ -76,7 +93,13 @@ fn flip(glycan: &Glycan, ring: &[usize; 6], x: &[[f32; 3]]) -> Option<Vec<[f32; 
         let xi = exo[0];
         // the implicit hydrogen: the fourth tetrahedral direction
         let h = unit(scale(
-            add(add(unit(sub(p[ring_nb[0]], p[ci])), unit(sub(p[ring_nb[1]], p[ci]))), unit(sub(p[xi], p[ci]))),
+            add(
+                add(
+                    unit(sub(p[ring_nb[0]], p[ci])),
+                    unit(sub(p[ring_nb[1]], p[ci])),
+                ),
+                unit(sub(p[xi], p[ci])),
+            ),
             -1.0,
         ));
         let bond = dot(sub(p[xi], p[ci]), sub(p[xi], p[ci])).sqrt();
@@ -95,11 +118,19 @@ fn flip(glycan: &Glycan, ring: &[usize; 6], x: &[[f32; 3]]) -> Option<Vec<[f32; 
             seen[j] = true;
             let d = sub(p[j], p[xi]);
             let local = [dot(d, old[0]), dot(d, old[1]), dot(d, old[2])];
-            out[j] = add(out[xi], add(add(scale(new[0], local[0]), scale(new[1], local[1])), scale(new[2], local[2])));
+            out[j] = add(
+                out[xi],
+                add(
+                    add(scale(new[0], local[0]), scale(new[1], local[1])),
+                    scale(new[2], local[2]),
+                ),
+            );
             stack.extend(adj[j].iter().copied());
         }
     }
-    Some(center_f32(&out.iter().map(|q| q.map(|v| v as f32)).collect::<Vec<_>>()))
+    Some(center_f32(
+        &out.iter().map(|q| q.map(|v| v as f32)).collect::<Vec<_>>(),
+    ))
 }
 
 /// Put the root ring of the templates `which` selects into the other chair. Returns whether the
@@ -112,9 +143,20 @@ pub fn flip_root_chair(glycan: &mut Glycan, which: impl Fn(usize) -> bool) -> bo
         .templates
         .iter()
         .enumerate()
-        .map(|(t, x)| if which(t) { flip(glycan, &ring, x) } else { None })
+        .map(|(t, x)| {
+            if which(t) {
+                flip(glycan, &ring, x)
+            } else {
+                None
+            }
+        })
         .collect();
-    if glycan.templates.len() > 1 && flipped.iter().enumerate().any(|(t, f)| which(t) && f.is_none()) {
+    if glycan.templates.len() > 1
+        && flipped
+            .iter()
+            .enumerate()
+            .any(|(t, f)| which(t) && f.is_none())
+    {
         return false;
     }
     for (t, f) in flipped.into_iter().enumerate() {
@@ -135,7 +177,10 @@ pub fn chair_theta(ring: &[V; 6]) -> f64 {
     let r2 = (0..6).fold([0.0; 3], |s, j| add(s, scale(r[j], angle(j, 1.0).cos())));
     let nrm = unit(cross(r1, r2));
     let z: Vec<f64> = r.iter().map(|q| dot(*q, nrm)).collect();
-    let q3: f64 = (0..6).map(|j| z[j] * if j % 2 == 0 { 1.0 } else { -1.0 }).sum::<f64>() / 6f64.sqrt();
+    let q3: f64 = (0..6)
+        .map(|j| z[j] * if j % 2 == 0 { 1.0 } else { -1.0 })
+        .sum::<f64>()
+        / 6f64.sqrt();
     let q2c = (2.0 / 6.0f64).sqrt() * (0..6).map(|j| z[j] * angle(j, 2.0).cos()).sum::<f64>();
     let q2s = -(2.0 / 6.0f64).sqrt() * (0..6).map(|j| z[j] * angle(j, 2.0).sin()).sum::<f64>();
     q2c.hypot(q2s).atan2(q3).to_degrees()
@@ -152,8 +197,10 @@ mod tests {
     #[test]
     #[ignore = "needs GLYCOFLOW_MODEL (residue_library.json of the licensed model)"]
     fn flips_the_chair_and_keeps_every_configuration() {
-        let path = std::path::Path::new(&std::env::var("GLYCOFLOW_MODEL").unwrap()).join("residue_library.json");
-        let library = glycoflow_core::ResidueLibrary::from_json_slice(&std::fs::read(path).unwrap()).unwrap();
+        let path = std::path::Path::new(&std::env::var("GLYCOFLOW_MODEL").unwrap())
+            .join("residue_library.json");
+        let library =
+            glycoflow_core::ResidueLibrary::from_json_slice(&std::fs::read(path).unwrap()).unwrap();
         for seq in ["DManpa1-OH", "DGlcpNAcb1-OH", "DGalpb1-4DGlcpNAcb1-OH"] {
             let mut g = crate::problem::build_glycan(&library, seq, 2, 0).unwrap();
             let before = g.templates[1].clone();
@@ -161,13 +208,31 @@ mod tests {
             let ring = root_ring(&g).unwrap();
             let pos = |x: &Vec<[f32; 3]>, i: usize| x[i].map(f64::from);
             let theta = |x: &Vec<[f32; 3]>| chair_theta(&ring.map(|i| pos(x, i)));
-            assert!(theta(&before) < 30.0, "{seq}: starts 4C1 ({})", theta(&before));
-            assert!(theta(&g.templates[1]) > 150.0, "{seq}: ends 1C4 ({})", theta(&g.templates[1]));
-            assert_eq!(g.templates[0], crate::problem::build_glycan(&library, seq, 1, 0).unwrap().templates[0]);
+            assert!(
+                theta(&before) < 30.0,
+                "{seq}: starts 4C1 ({})",
+                theta(&before)
+            );
+            assert!(
+                theta(&g.templates[1]) > 150.0,
+                "{seq}: ends 1C4 ({})",
+                theta(&g.templates[1])
+            );
+            assert_eq!(
+                g.templates[0],
+                crate::problem::build_glycan(&library, seq, 1, 0)
+                    .unwrap()
+                    .templates[0]
+            );
             // every bond length kept, every stereocentre kept
             for &[a, b] in &g.bonds {
-                let d = |x: &Vec<[f32; 3]>| dot(sub(pos(x, a), pos(x, b)), sub(pos(x, a), pos(x, b))).sqrt();
-                assert!((d(&before) - d(&g.templates[1])).abs() < 1e-3, "{seq}: bond {a}-{b}");
+                let d = |x: &Vec<[f32; 3]>| {
+                    dot(sub(pos(x, a), pos(x, b)), sub(pos(x, a), pos(x, b))).sqrt()
+                };
+                assert!(
+                    (d(&before) - d(&g.templates[1])).abs() < 1e-3,
+                    "{seq}: bond {a}-{b}"
+                );
             }
             let n = g.atom_names.len();
             let mut adj = vec![Vec::new(); n];
@@ -176,8 +241,21 @@ mod tests {
                 adj[b].push(a);
             }
             for i in (0..n).filter(|&i| g.elements[i] == "C" && adj[i].len() == 3) {
-                let v = |x: &Vec<[f32; 3]>| signed_volume(pos(x, i), pos(x, adj[i][0]), pos(x, adj[i][1]), pos(x, adj[i][2]));
-                assert_eq!(v(&before).signum(), v(&g.templates[1]).signum(), "{seq}: {} {}", g.res_paths[i], g.atom_names[i]);
+                let v = |x: &Vec<[f32; 3]>| {
+                    signed_volume(
+                        pos(x, i),
+                        pos(x, adj[i][0]),
+                        pos(x, adj[i][1]),
+                        pos(x, adj[i][2]),
+                    )
+                };
+                assert_eq!(
+                    v(&before).signum(),
+                    v(&g.templates[1]).signum(),
+                    "{seq}: {} {}",
+                    g.res_paths[i],
+                    g.atom_names[i]
+                );
             }
         }
     }

@@ -454,7 +454,11 @@ pub fn fit_site(
             let problem: &SiteProblem = problem;
             let t0 = Instant::now();
             if let Some(o) = observer {
-                o.stage(if round == 0 { "steric polish" } else { "steric escalation" });
+                o.stage(if round == 0 {
+                    "steric polish"
+                } else {
+                    "steric escalation"
+                });
             }
             energies = poses
                 .par_iter()

@@ -21,8 +21,9 @@ use glysys::{ResidueId, Structure};
 use crate::error::Result;
 use reglyco_density::DensityMap;
 
+use crate::pipeline::FitOutcome;
 use crate::problem::{SiteProblem, V3, build_glycan, decoy_poses, max_span};
-use crate::site::{DepositedGlycan, glycam_of};
+use crate::site::{DepositedGlycan, glycam_of, sequence_paths};
 use crate::workflow::{SiteFit, SiteRequest, WorkflowInput, fit_one};
 
 /// Default N-glycan candidates (the largest common forms; pruning finds the rest).
@@ -59,20 +60,35 @@ pub const O_GLYCAN_CANDIDATES: [(&str, &str); 11] = [
         "mucin core 2, sialylated",
         "DNeup5Aca2-3DGalpb1-4DGlcpNAcb1-6[DNeup5Aca2-3DGalpb1-3]DGalpNAca1-OH",
     ),
-    ("mucin 2,6-sialyl T", "DNeup5Aca2-3DGalpb1-3[DNeup5Aca2-6]DGalpNAca1-OH"),
-    ("O-mannose core M1", "DNeup5Aca2-3DGalpb1-4DGlcpNAcb1-2DManpa1-OH"),
+    (
+        "mucin 2,6-sialyl T",
+        "DNeup5Aca2-3DGalpb1-3[DNeup5Aca2-6]DGalpNAca1-OH",
+    ),
+    (
+        "O-mannose core M1",
+        "DNeup5Aca2-3DGalpb1-4DGlcpNAcb1-2DManpa1-OH",
+    ),
     ("O-mannose, fungal", "DManpa1-2DManpa1-2DManpa1-OH"),
-    ("O-fucose, extended", "DNeup5Aca2-3DGalpb1-4DGlcpNAcb1-3LFucpa1-OH"),
+    (
+        "O-fucose, extended",
+        "DNeup5Aca2-3DGalpb1-4DGlcpNAcb1-3LFucpa1-OH",
+    ),
     ("O-glucose, xylosylated", "DXylpa1-3DXylpa1-3DGlcpb1-OH"),
     ("O-GlcNAc", "DGlcpNAcb1-OH"),
 ];
 
 /// Candidates for the other glycosylated residues.
 pub const C_MANNOSE_CANDIDATES: [(&str, &str); 1] = [("C-mannose", "DManpa1-OH")];
-pub const TYROSINE_CANDIDATES: [(&str, &str); 1] = [("glycogenin glucan", "DGlcpa1-4DGlcpa1-4DGlcpa1-OH")];
-pub const HYDROXYPROLINE_CANDIDATES: [(&str, &str); 1] = [("extensin arabinoside", "LArafa1-3LArafb1-2LArafb1-2LArafb1-OH")];
-pub const HYDROXYLYSINE_CANDIDATES: [(&str, &str); 1] = [("collagen glucosylgalactose", "DGlcpa1-2DGalpb1-OH")];
-pub const CYSTEINE_CANDIDATES: [(&str, &str); 2] = [("S-glucose", "DGlcpb1-OH"), ("S-GlcNAc", "DGlcpNAcb1-OH")];
+pub const TYROSINE_CANDIDATES: [(&str, &str); 1] =
+    [("glycogenin glucan", "DGlcpa1-4DGlcpa1-4DGlcpa1-OH")];
+pub const HYDROXYPROLINE_CANDIDATES: [(&str, &str); 1] = [(
+    "extensin arabinoside",
+    "LArafa1-3LArafb1-2LArafb1-2LArafb1-OH",
+)];
+pub const HYDROXYLYSINE_CANDIDATES: [(&str, &str); 1] =
+    [("collagen glucosylgalactose", "DGlcpa1-2DGalpb1-OH")];
+pub const CYSTEINE_CANDIDATES: [(&str, &str); 2] =
+    [("S-glucose", "DGlcpb1-OH"), ("S-GlcNAc", "DGlcpNAcb1-OH")];
 
 /// The inference candidates of a site residue (CCD name): the largest common forms of the
 /// glycans it carries; pruning by density finds the rest. Empty for residues without glycans.
@@ -87,6 +103,189 @@ pub fn candidates_for(residue: &str) -> &'static [(&'static str, &'static str)] 
         "CYS" => &CYSTEINE_CANDIDATES,
         _ => &[],
     }
+}
+
+const CORE: &str = "DManpa1-6[DManpa1-3]DManpb1-4DGlcpNAcb1-4DGlcpNAcb1-OH";
+const CORE_FUC: &str = "DManpa1-6[DManpa1-3]DManpb1-4DGlcpNAcb1-4[LFucpa1-6]DGlcpNAcb1-OH";
+const MAN5: &str = "DManpa1-6[DManpa1-3]DManpa1-6[DManpa1-3]DManpb1-4DGlcpNAcb1-4DGlcpNAcb1-OH";
+const MAN9: &str = "DManpa1-2DManpa1-6[DManpa1-2DManpa1-3]DManpa1-6[DManpa1-2DManpa1-2DManpa1-3]DManpb1-4DGlcpNAcb1-4DGlcpNAcb1-OH";
+const COMPLEX_FUC: &str = "DGalpb1-4DGlcpNAcb1-2DManpa1-6[DGalpb1-4DGlcpNAcb1-2DManpa1-3]DManpb1-4DGlcpNAcb1-4[LFucpa1-6]DGlcpNAcb1-OH";
+const COMPLEX_SIA_FUC: &str = "DNeup5Aca2-6DGalpb1-4DGlcpNAcb1-2DManpa1-6[DNeup5Aca2-6DGalpb1-4DGlcpNAcb1-2DManpa1-3]DManpb1-4DGlcpNAcb1-4[LFucpa1-6]DGlcpNAcb1-OH";
+const HYBRID: &str = "DManpa1-6[DManpa1-3]DManpa1-6[DGalpb1-4DGlcpNAcb1-2DManpa1-3]DManpb1-4DGlcpNAcb1-4DGlcpNAcb1-OH";
+
+/// What to extend an N-glycan to, by the expression system of the protein
+/// (`infer.N_GLYCAN_SUGGESTIONS`): the first is the usual product; a fit page offers the list and
+/// the user picks.
+pub const N_GLYCAN_SUGGESTIONS: [(&str, &[(&str, &str)]); 5] = [
+    (
+        "mammalian",
+        &[
+            ("complex biantennary, core Fuc", COMPLEX_FUC),
+            ("complex biantennary, sialylated, core Fuc", COMPLEX_SIA_FUC),
+            ("Man5 (GnTI-deficient cells)", MAN5),
+            ("high-mannose (Man9)", MAN9),
+            ("hybrid", HYBRID),
+            ("core (Man3GlcNAc2), core Fuc", CORE_FUC),
+        ],
+    ),
+    (
+        "insect",
+        &[
+            ("paucimannose, core Fuc a1-6", CORE_FUC),
+            (
+                "paucimannose, core Fuc a1-3 and a1-6",
+                "DManpa1-6[DManpa1-3]DManpb1-4DGlcpNAcb1-4[LFucpa1-3][LFucpa1-6]DGlcpNAcb1-OH",
+            ),
+            ("paucimannose (Man3GlcNAc2)", CORE),
+            ("Man5", MAN5),
+            ("high-mannose (Man9)", MAN9),
+        ],
+    ),
+    (
+        "yeast or fungus",
+        &[
+            ("high-mannose (Man9)", MAN9),
+            ("Man5", MAN5),
+            ("core (Man3GlcNAc2)", CORE),
+        ],
+    ),
+    (
+        "plant",
+        &[
+            (
+                "paucimannose with Xyl and Fuc a1-3",
+                "DManpa1-6[DXylpb1-2][DManpa1-3]DManpb1-4DGlcpNAcb1-4[LFucpa1-3]DGlcpNAcb1-OH",
+            ),
+            (
+                "complex with Xyl and Fuc a1-3",
+                "DGlcpNAcb1-2DManpa1-6[DXylpb1-2][DGlcpNAcb1-2DManpa1-3]DManpb1-4DGlcpNAcb1-4[LFucpa1-3]DGlcpNAcb1-OH",
+            ),
+            ("core (Man3GlcNAc2)", CORE),
+        ],
+    ),
+    (
+        // expression system not known
+        "",
+        &[
+            ("core (Man3GlcNAc2)", CORE),
+            ("core (Man3GlcNAc2), core Fuc", CORE_FUC),
+            ("high-mannose (Man9)", MAN9),
+            ("complex biantennary, core Fuc", COMPLEX_FUC),
+        ],
+    ),
+];
+
+/// Expression hosts by what they do to an N-glycan (lower-case prefixes of the organism name).
+const HOSTS: [(&str, &[&str]); 5] = [
+    (
+        "mammalian",
+        &[
+            "homo sapiens",
+            "cricetulus",
+            "mus musculus",
+            "chlorocebus",
+            "mesocricetus",
+            "rattus",
+            "oryctolagus",
+            "bos taurus",
+            "sus scrofa",
+            "macaca",
+            "canis",
+        ],
+    ),
+    (
+        "insect",
+        &[
+            "spodoptera",
+            "trichoplusia",
+            "drosophila",
+            "bombyx",
+            "mamestra",
+            "aedes",
+            "unidentified baculovirus",
+            "autographa",
+            "baculovirus",
+        ],
+    ),
+    (
+        "yeast or fungus",
+        &[
+            "komagataella",
+            "pichia",
+            "saccharomyces",
+            "aspergillus",
+            "trichoderma",
+            "ogataea",
+            "kluyveromyces",
+            "schizosaccharomyces",
+            "yarrowia",
+            "neurospora",
+            "thermothelomyces",
+            "myceliophthora",
+        ],
+    ),
+    (
+        "plant",
+        &[
+            "nicotiana",
+            "arabidopsis",
+            "oryza",
+            "zea mays",
+            "hordeum",
+            "solanum",
+            "glycine max",
+        ],
+    ),
+    (
+        "no N-glycosylation (bacteria, cell-free)",
+        &[
+            "escherichia",
+            "bacillus",
+            "cell-free",
+            "lactococcus",
+            "pseudomonas",
+            "corynebacterium",
+            "synthetic",
+            "brevibacillus",
+            "vibrio",
+        ],
+    ),
+];
+
+/// The expression system of a protein from the names of its host organisms ("" when none is
+/// recognised): "mammalian", "insect", "yeast or fungus", "plant", or
+/// "no N-glycosylation (bacteria, cell-free)".
+pub fn host_class(names: &[&str]) -> &'static str {
+    for name in names {
+        let low = name.to_lowercase();
+        for (label, keys) in HOSTS {
+            if keys.iter().any(|k| low.starts_with(k)) {
+                return label;
+            }
+        }
+    }
+    ""
+}
+
+/// Glycans to offer for extending the glycan of a site residue (CCD name): for Asn by expression
+/// system ([`host_class`]), otherwise the residue's inference candidates.
+pub fn suggestions_for(residue: &str, host_class: &str) -> &'static [(&'static str, &'static str)] {
+    if residue != "ASN" {
+        return candidates_for(residue);
+    }
+    N_GLYCAN_SUGGESTIONS
+        .iter()
+        .find(|(host, _)| *host == host_class)
+        .map_or(N_GLYCAN_SUGGESTIONS[4].1, |(_, options)| options)
+}
+
+/// Whether the glycan `sequence` holds every residue of `deposited` at the same position, so that
+/// fitting it extends the deposit instead of contradicting it.
+pub fn contains_tree(sequence: &str, deposited: &str) -> Result<bool> {
+    let (big, small) = (sequence_paths(sequence)?, sequence_paths(deposited)?);
+    Ok(small
+        .iter()
+        .all(|(path, token)| big.get(path) == Some(token)))
 }
 
 fn kept_children(
@@ -295,15 +494,32 @@ fn fit_candidate(
         input.options.fit.support_base,
         input.options.fit.support_per_torsion,
     );
-    let problem = &fit.problem;
-    let x = &fit.outcome.basins[fit.outcome.best].x;
+    let (statistical, root_gain) = statistical_support(&fit.problem, &fit.outcome, base, per);
+    Ok(StatFit {
+        name: name.to_string(),
+        sequence: sequence.to_string(),
+        fit,
+        root_gain,
+        statistical,
+    })
+}
+
+/// The residues of a fitted pose that pass the support test (the root against no glycan), root
+/// first, and the root's gain.
+pub fn statistical_support(
+    problem: &SiteProblem,
+    outcome: &FitOutcome,
+    base: f64,
+    per: f64,
+) -> (Vec<String>, f64) {
+    let x = &outcome.basins[outcome.best].x;
     let root: BTreeSet<String> = ["r".to_string()].into();
     let root_gain = tree_gain(problem, x, &root);
     let root_ok = root_gain > base + per * tree_torsions(problem, &root) as f64;
     let statistical: Vec<String> = if root_ok {
         std::iter::once("r".to_string())
             .chain(
-                fit.outcome
+                outcome
                     .support
                     .iter()
                     .filter(|s| s.supported)
@@ -313,13 +529,54 @@ fn fit_candidate(
     } else {
         Vec::new()
     };
-    Ok(StatFit {
-        name: name.to_string(),
-        sequence: sequence.to_string(),
-        fit,
+    (statistical, root_gain)
+}
+
+/// What a fit builds (`infer.gate`): of the residues that pass the support test, those whose
+/// density is at least [`DENSITY_GATE`] of the way from solvent to protein and whose parent is
+/// built; the others are `weak`. Without levels every supported residue is built.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Gate {
+    pub built: Vec<String>,
+    pub weak: Vec<String>,
+    /// density fraction of every residue that passes the support test
+    pub density_fraction: BTreeMap<String, f64>,
+    pub root_gain: f64,
+}
+
+/// Apply the density gate to `statistical` (in depth order: parents before children).
+pub fn density_gate(
+    problem: &SiteProblem,
+    x: &[V3],
+    map: &DensityMap,
+    levels: Option<&DensityLevels>,
+    statistical: &[String],
+    root_gain: f64,
+) -> Gate {
+    let mut gate = Gate {
         root_gain,
-        statistical,
-    })
+        ..Gate::default()
+    };
+    for path in statistical {
+        let pts: Vec<V3> = (0..problem.n_atoms)
+            .filter(|&i| problem.keep[i] && &problem.glycan.res_paths[i] == path)
+            .map(|i| x[i])
+            .collect();
+        let frac = levels.and_then(|l| l.fraction(map, &pts));
+        if let Some(f) = frac {
+            gate.density_fraction.insert(path.clone(), f);
+        }
+        let parent_built = path == "r"
+            || path
+                .rsplit_once('/')
+                .is_some_and(|(parent, _)| gate.built.iter().any(|b| b == parent));
+        if parent_built && frac.is_none_or(|f| f >= DENSITY_GATE) {
+            gate.built.push(path.clone());
+        } else {
+            gate.weak.push(path.clone());
+        }
+    }
+    gate
 }
 
 /// Apply the density gate (in depth order: parents before children) and score the built tree.
@@ -341,28 +598,12 @@ fn gate(
     } = stat;
     let problem = &fit.problem;
     let x = &fit.outcome.basins[fit.outcome.best].x;
-    let mut density_fraction = BTreeMap::new();
-    let mut built: Vec<String> = Vec::new();
-    let mut weak: Vec<String> = Vec::new();
-    for path in &statistical {
-        let pts: Vec<V3> = (0..problem.n_atoms)
-            .filter(|&i| problem.keep[i] && &problem.glycan.res_paths[i] == path)
-            .map(|i| x[i])
-            .collect();
-        let frac = levels.and_then(|l| l.fraction(input.map, &pts));
-        if let Some(f) = frac {
-            density_fraction.insert(path.clone(), f);
-        }
-        let parent_built = path == "r"
-            || path
-                .rsplit_once('/')
-                .is_some_and(|(parent, _)| built.iter().any(|b| b == parent));
-        if parent_built && frac.is_none_or(|f| f >= DENSITY_GATE) {
-            built.push(path.clone());
-        } else {
-            weak.push(path.clone());
-        }
-    }
+    let Gate {
+        built,
+        weak,
+        density_fraction,
+        ..
+    } = density_gate(problem, x, input.map, levels, &statistical, root_gain);
     let keep: BTreeSet<String> = built.iter().cloned().collect();
     let (score, pruned, tokens) = if keep.is_empty() {
         (0.0, None, BTreeMap::new())
@@ -584,13 +825,59 @@ mod tests {
     #[test]
     #[ignore = "needs GLYCOFLOW_MODEL (residue_library.json of the licensed model)"]
     fn every_candidate_builds() {
-        let path = std::path::Path::new(&std::env::var("GLYCOFLOW_MODEL").unwrap()).join("residue_library.json");
-        let library = glycoflow_core::ResidueLibrary::from_json_slice(&std::fs::read(path).unwrap()).unwrap();
+        let path = std::path::Path::new(&std::env::var("GLYCOFLOW_MODEL").unwrap())
+            .join("residue_library.json");
+        let library =
+            glycoflow_core::ResidueLibrary::from_json_slice(&std::fs::read(path).unwrap()).unwrap();
         for a in &crate::anchor::ANCHORS {
             for (name, seq) in candidates_for(a.residue) {
-                let built = library.build(seq, None).unwrap_or_else(|e| panic!("{name} ({seq}): {e}"));
+                let built = library
+                    .build(seq, None)
+                    .unwrap_or_else(|e| panic!("{name} ({seq}): {e}"));
                 assert_eq!(built.res_paths[0], "agl", "{name}");
             }
+        }
+    }
+
+    #[test]
+    fn suggestions_extend_the_deposit() {
+        for (host, options) in N_GLYCAN_SUGGESTIONS {
+            for (name, seq) in options {
+                assert!(
+                    contains_tree(seq, "DGlcpNAcb1-4DGlcpNAcb1-OH").unwrap(),
+                    "{host}: {name}"
+                );
+            }
+        }
+        assert!(
+            suggestions_for("ASN", "insect")[0]
+                .0
+                .starts_with("paucimannose")
+        );
+        assert_eq!(
+            suggestions_for("ASN", "something else"),
+            N_GLYCAN_SUGGESTIONS[4].1
+        );
+        assert_eq!(suggestions_for("TRP", "mammalian")[0].0, "C-mannose");
+        let fucosylated = "LFucpa1-6[DGlcpNAcb1-4]DGlcpNAcb1-OH";
+        assert!(!contains_tree(MAN9, fucosylated).unwrap()); // no core fucose in Man9
+        assert!(contains_tree(COMPLEX_FUC, fucosylated).unwrap());
+        // an alpha-mannose where the core has beta
+        assert!(!contains_tree(MAN9, "DManpa1-4DGlcpNAcb1-4DGlcpNAcb1-OH").unwrap());
+        assert_eq!(host_class(&["Spodoptera frugiperda"]), "insect");
+        assert_eq!(host_class(&["Homo sapiens"]), "mammalian");
+        assert_eq!(host_class(&["Komagataella pastoris"]), "yeast or fungus");
+        assert_eq!(
+            host_class(&["Escherichia coli BL21(DE3)"]),
+            "no N-glycosylation (bacteria, cell-free)"
+        );
+        assert_eq!(host_class(&[]), "");
+        // the candidates of sequence-free inference are among the suggestions
+        for (name, seq) in N_GLYCAN_CANDIDATES {
+            assert!(
+                N_GLYCAN_SUGGESTIONS[0].1.iter().any(|(_, s)| *s == seq),
+                "{name}"
+            );
         }
     }
 
@@ -604,7 +891,9 @@ mod tests {
 
     #[test]
     fn pruned_sequence_round_trips_full_trees() {
-        let all = crate::anchor::ANCHORS.iter().flat_map(|a| candidates_for(a.residue).iter());
+        let all = crate::anchor::ANCHORS
+            .iter()
+            .flat_map(|a| candidates_for(a.residue).iter());
         for (_, seq) in all {
             let parsed = parse_glycam(seq).unwrap();
             let mut keep = BTreeSet::new();

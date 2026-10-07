@@ -14,12 +14,14 @@
 //!   grid search, Adam refinement, distinct basins; [`support`]: subtree support and prior
 //!   completion (pinned-torsion inpainting); [`pipeline`]: `fit_site`;
 //! * [`output`], [`evaluation`], [`workflow`]: structures, reports, validation;
-//! * [`observer`]: watching a fit as it runs; [`deposition`]: chemistry checks of a deposit.
+//! * [`observer`]: watching a fit as it runs; [`deposition`]: chemistry checks of a deposit;
+//! * [`ensemble`]: the extend mode, an ensemble of conformers past the density.
 
 pub mod anchor;
 pub mod cartesian;
 pub mod counter;
 pub mod deposition;
+pub mod ensemble;
 pub mod error;
 pub mod evaluation;
 pub mod infer;

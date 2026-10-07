@@ -402,7 +402,8 @@ impl Site {
     pub fn is_site_atom(&self, atom: &EnvAtom) -> bool {
         atom.chain == self.residue.chain
             && atom.residue_number == self.residue.number
-            && crate::anchor::anchor(&self.residue_name).is_some_and(|a| a.bonds_to(&atom.atom_name).is_some())
+            && crate::anchor::anchor(&self.residue_name)
+                .is_some_and(|a| a.bonds_to(&atom.atom_name).is_some())
             && atom.is_identity()
     }
 }
