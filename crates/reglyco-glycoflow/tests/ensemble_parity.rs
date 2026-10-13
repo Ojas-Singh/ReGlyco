@@ -8,7 +8,8 @@
 //!     --test ensemble_parity -- --ignored --nocapture
 //! ```
 //!
-//! Compared: the pucker templates that agree with a template on the built residues, members
+//! Compared: the torsions the ensemble samples (those whose rotation moves no atom of a built
+//! residue), the pucker templates that agree with a template on the built residues, members
 //! grafted onto a built model, their clusters, and the spread and order parameter of every residue
 //! beyond the built ones. The sampling itself uses different random numbers in the two engines.
 
@@ -16,7 +17,7 @@ use std::collections::BTreeSet;
 
 use reglyco_glycoflow::ensemble::{
     CLUSTER_RMSD, MAX_CLUSTERS, PUCKER_TOLERANCE, cluster, graft, order_parameter, rmsf,
-    templates_in_state,
+    templates_in_state, torsions_beyond,
 };
 use serde_json::Value;
 
@@ -61,6 +62,45 @@ fn ensemble_parity() {
         .iter()
         .map(|p| p.as_str().unwrap().to_string())
         .collect();
+
+    // the torsions the ensemble samples, on the reference's torsions and distal sides
+    let quads: Vec<[usize; 4]> = fx["torsion_quads"]
+        .as_array()
+        .expect("no torsion_quads: export the fixture again (GlycoFlow export_ensemble_fixture.py)")
+        .iter()
+        .map(|q| [0, 1, 2, 3].map(|k| q[k].as_u64().unwrap() as usize))
+        .collect();
+    let distal: Vec<Vec<usize>> = fx["torsion_distal"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(indices)
+        .collect();
+    let theirs: Vec<bool> = fx["free_torsions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b.as_bool().unwrap())
+        .collect();
+    let free = torsions_beyond(&quads, &distal, &paths, &built);
+    println!(
+        "free torsions: rust {} python {} of {}",
+        free.iter().filter(|f| **f).count(),
+        theirs.iter().filter(|f| **f).count(),
+        quads.len()
+    );
+    assert_eq!(free, theirs);
+    // among them psi of every linkage that leaves the built part: the bond from a built residue's
+    // ring carbon to its linking oxygen, with nothing built on its distal side but that oxygen
+    let leaving = (0..quads.len())
+        .filter(|&t| {
+            built.contains(&paths[quads[t][2]])
+                && distal[t]
+                    .iter()
+                    .all(|&i| i == quads[t][2] || !built.contains(&paths[i]))
+        })
+        .collect::<Vec<_>>();
+    assert!(!leaving.is_empty() && leaving.iter().all(|&t| free[t]));
 
     // pucker templates in the built residues' states
     let ring: Vec<bool> = fx["ring_atoms"]

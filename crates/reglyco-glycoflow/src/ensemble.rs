@@ -42,7 +42,7 @@ use crate::infer::{DensityLevels, Gate};
 use crate::pipeline::FitOutcome;
 use crate::problem::{Pose, SiteProblem, V3};
 use crate::search::Adam;
-use crate::support::complete_on_templates;
+use crate::support::{complete_on_templates, torsions_moving_only};
 
 /// A, in place, over the atoms beyond the built residues (as `search::distinct`).
 pub const CLUSTER_RMSD: f64 = 1.5;
@@ -229,21 +229,27 @@ pub fn templates_in_state(
         .collect()
 }
 
-/// Torsions that move only atoms beyond the built residues.
+/// Torsions whose rotation moves no atom of a built residue: every torsion beyond the built
+/// residues, and phi and psi of the linkages that leave them (not omega of a 1-6 linkage, which
+/// moves O6 of the built residue). These are the torsions the ensemble samples.
 pub fn free_torsions(problem: &SiteProblem, built: &BTreeSet<String>) -> Vec<bool> {
-    let beyond: Vec<bool> = problem
-        .glycan
-        .res_paths
+    let g = &problem.glycan;
+    torsions_beyond(&g.topology.quads, &g.topology.distal, &g.res_paths, built)
+}
+
+/// [`free_torsions`] on bare arrays: the torsions (a, b, c, d), the atoms on the distal side of
+/// every b-c bond (c included) and the residue path of every atom.
+pub fn torsions_beyond(
+    quads: &[[usize; 4]],
+    distal: &[Vec<usize>],
+    paths: &[String],
+    built: &BTreeSet<String>,
+) -> Vec<bool> {
+    let beyond: Vec<bool> = paths
         .iter()
         .map(|p| p != "agl" && !built.contains(p))
         .collect();
-    problem
-        .glycan
-        .topology
-        .distal
-        .iter()
-        .map(|d| !d.is_empty() && d.iter().all(|&i| beyond[i]))
-        .collect()
+    torsions_moving_only(quads, distal, &beyond)
 }
 
 /// The contacts some atoms of the glycan take part in (with the environment, and with any atom of
@@ -960,6 +966,164 @@ mod tests {
             let expect = moved(bent[i]);
             assert!((0..3).all(|k| (out[i][k] - expect[k]).abs() < 1e-9));
         }
+    }
+
+    /// Heavy atoms of GlcNAc (r) - beta-Man (r/4) carrying an alpha1-3 Man (r/4/3) and an
+    /// alpha1-6 Man (r/4/6), named and bonded as the reference builds
+    /// `DManpa1-6[DManpa1-3]DManpb1-4DGlcpNAcb1-OH` (atom 0 is the aglycone oxygen): atom names,
+    /// residue paths and the topology.
+    fn branched_mannose() -> (Vec<String>, Vec<String>, glycoflow_core::Topology) {
+        const RING: [(&str, &str); 6] = [
+            ("C1", "C2"),
+            ("C2", "C3"),
+            ("C3", "C4"),
+            ("C4", "C5"),
+            ("C5", "O5"),
+            ("O5", "C1"),
+        ];
+        const HEXOSE: [(&str, &str); 5] = [
+            ("C2", "O2"),
+            ("C3", "O3"),
+            ("C4", "O4"),
+            ("C5", "C6"),
+            ("C6", "O6"),
+        ];
+        const GLCNAC: [(&str, &str); 8] = [
+            ("C2", "N2"),
+            ("N2", "C2N"),
+            ("C2N", "O2N"),
+            ("C2N", "CME"),
+            ("C3", "O3"),
+            ("C4", "O4"),
+            ("C5", "C6"),
+            ("C6", "O6"),
+        ];
+        let mut atoms: Vec<(String, String)> = vec![("agl".into(), "O1".into())];
+        let mut bonds: Vec<[usize; 2]> = Vec::new();
+        let mut bond = |a: (&str, &str), b: (&str, &str)| {
+            let mut index = |(path, name): (&str, &str)| {
+                let atom = (path.to_string(), name.to_string());
+                atoms.iter().position(|q| *q == atom).unwrap_or_else(|| {
+                    atoms.push(atom);
+                    atoms.len() - 1
+                })
+            };
+            let pair = [index(a), index(b)];
+            bonds.push(pair);
+        };
+        bond(("agl", "O1"), ("r", "C1"));
+        for (path, exocyclic) in [
+            ("r", &GLCNAC[..]),
+            ("r/4", &HEXOSE[..]),
+            ("r/4/3", &HEXOSE[..]),
+            ("r/4/6", &HEXOSE[..]),
+        ] {
+            for (a, b) in RING.iter().chain(exocyclic) {
+                bond((path, a), (path, b));
+            }
+        }
+        bond(("r", "O4"), ("r/4", "C1"));
+        bond(("r/4", "O3"), ("r/4/3", "C1"));
+        bond(("r/4", "O6"), ("r/4/6", "C1"));
+        let (paths, names): (Vec<String>, Vec<String>) = atoms.into_iter().unzip();
+        let elements: Vec<String> = names.iter().map(|n| n[..1].to_string()).collect();
+        let topology = glycoflow_core::Topology::new(&names, &elements, &bonds).unwrap();
+        (names, paths, topology)
+    }
+
+    #[test]
+    fn free_torsions_are_those_that_move_no_built_atom() {
+        let (names, paths, topo) = branched_mannose();
+        let bond = |q: &[usize; 4]| {
+            format!(
+                "{}:{}-{}:{}",
+                paths[q[1]], names[q[1]], paths[q[2]], names[q[2]]
+            )
+        };
+        let labels = |free: &[bool], want: bool| -> BTreeSet<String> {
+            topo.quads
+                .iter()
+                .zip(free)
+                .filter(|(_, f)| **f == want)
+                .map(|(q, _)| bond(q))
+                .collect()
+        };
+        let set = |v: &[&str]| -> BTreeSet<String> { v.iter().map(|s| s.to_string()).collect() };
+        assert_eq!(topo.quads.len(), 12);
+        // the distal side of every torsion holds the atom on its axis, which a rotation leaves in place
+        for (q, d) in topo.quads.iter().zip(&topo.distal) {
+            assert!(d.contains(&q[2]) && !d.contains(&q[1]), "{}", bond(q));
+        }
+
+        let built = set(&["r", "r/4"]);
+        let free = torsions_beyond(&topo.quads, &topo.distal, &paths, &built);
+        assert_eq!(
+            labels(&free, true),
+            set(&[
+                // psi and phi of the 1-3 linkage out of the built part
+                "r/4:C3-r/4:O3",
+                "r/4:O3-r/4/3:C1",
+                // psi and phi of the 1-6 linkage out of the built part
+                "r/4:C6-r/4:O6",
+                "r/4:O6-r/4/6:C1",
+                // inside the residues beyond
+                "r/4/3:C5-r/4/3:C6",
+                "r/4/6:C5-r/4/6:C6",
+            ])
+        );
+        let pinned = labels(&free, false);
+        // omega of the 1-6 linkage moves O6 of the built mannose
+        assert!(pinned.contains("r/4:C5-r/4:C6"));
+        // the linkage between two built residues
+        assert!(pinned.contains("r:C4-r:O4") && pinned.contains("r:O4-r/4:C1"));
+        // inside a built residue
+        for inside in ["r:C2-r:N2", "r:N2-r:C2N", "r:C5-r:C6"] {
+            assert!(pinned.contains(inside), "{inside}");
+        }
+
+        // the definition, on coordinates: turning a free torsion leaves every built atom where it
+        // is, turning any other moves one
+        let mut rng = Rng(4);
+        let x: Vec<V3> = (0..names.len()).map(|_| rng.point(3.0)).collect();
+        for k in 0..topo.quads.len() {
+            let mut delta = vec![0.0; topo.quads.len()];
+            delta[k] = 1.0;
+            let mut y = x.clone();
+            glycoflow_core::geometry::rotate_torsions(&mut y, &topo.quads, &topo.distal, &delta);
+            let shift = |keep: &dyn Fn(usize) -> bool| {
+                (0..x.len())
+                    .filter(|&i| keep(i))
+                    .map(|i| dot(sub(x[i], y[i]), sub(x[i], y[i])).sqrt())
+                    .fold(0.0, f64::max)
+            };
+            let is_built = |i: usize| paths[i] == "agl" || built.contains(&paths[i]);
+            assert_eq!(shift(&is_built) < 1e-9, free[k], "{}", bond(&topo.quads[k]));
+            assert!(!free[k] || shift(&|i| !is_built(i)) > 0.1);
+        }
+
+        // only the first GlcNAc built: the whole linkage to the mannose is free, omega of its
+        // 1-6 arm too
+        let free = torsions_beyond(&topo.quads, &topo.distal, &paths, &set(&["r"]));
+        assert_eq!(
+            labels(&free, false),
+            set(&["r:C2-r:N2", "r:N2-r:C2N", "r:C5-r:C6"])
+        );
+        // everything built: nothing is free
+        let all = set(&["r", "r/4", "r/4/3", "r/4/6"]);
+        assert!(
+            torsions_beyond(&topo.quads, &topo.distal, &paths, &all)
+                .iter()
+                .all(|f| !f)
+        );
+        // a torsion that moves nothing (no distal side, or only its axis atom) is never free
+        assert_eq!(
+            torsions_moving_only(
+                &[[0, 1, 2, 3], [0, 1, 2, 3]],
+                &[vec![], vec![2]],
+                &[true; 4]
+            ),
+            vec![false, false]
+        );
     }
 
     #[test]
