@@ -97,10 +97,21 @@ deposit) and then calling `workflow::extend_one` gives two things:
   whether flexibility accounts for the weak density, or whether the residue is denser or fainter than
   the ensemble predicts (fainter: absent in part, or more mobile than modelled).
 
+The torsions the ensemble samples are those whose rotation moves no atom of a built residue
+(`ensemble::free_torsions`): every torsion beyond the built residues, and phi and psi of the
+linkages that leave them. Omega of a 1-6 linkage out of a built residue turns about C5-C6 and moves
+that residue's O6, so it keeps its fitted value. (Until `reglyco-glycoflow` of October 2026 the test
+counted the atom on the rotation axis as moved; psi of every such linkage, whose axis ends at the
+built residue's linking oxygen, then stayed at the fitted value, and the first residue beyond the
+built part was held almost in place: order parameter 0.9 to 1.0.)
+
 The ensemble is not fitted to density and is not evidence for a residue. Example
-(`examples/extend.rs`): 9DIX D:701, cryo-EM at 3.5 A, deposited with two GlcNAc and fitted as a
-sialylated biantennary glycan: seven residues built, 89 of 128 members kept, spread 0.7 A at the
-first residue beyond the built part to 7 A at the sialic acid, fit 15 s and ensemble 3 s on a GB10.
+(`examples/extend.rs`, CPU, seed 0): 9DIX D:701, cryo-EM at 3.5 A, deposited with two GlcNAc and
+fitted as a sialylated biantennary glycan: seven residues built, 102 of 128 members kept, spread
+1.2 A (order parameter 0.91) at the mannose next to the built part to 7.7 A (0.16) at the sialic
+acid of its arm. The same fit with the earlier test: 23 members kept, 0.5 A (0.99) to 6.7 A (0.30).
+With CUDA on a GB10 the fit takes about 15 s and the ensemble about 3 s (measured before this
+change).
 
 When the fit uses a rare ring pucker for a built residue, only the pucker templates that share it
 are used for the members (often just the fit's own).

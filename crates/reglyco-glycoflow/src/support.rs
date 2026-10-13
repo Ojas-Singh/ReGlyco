@@ -84,6 +84,9 @@ pub fn subtree_support(
                 .map(|(s, k)| *k && !s)
                 .collect();
             let without = obs.evaluate(x, Some(&active), None).log_likelihood;
+            // torsions whose distal side lies in the subtree: the count the noise allowance
+            // was calibrated with. psi of the link to the subtree's root is not among them (its
+            // distal side starts at the parent's linking oxygen), unlike in `torsions_moving_only`
             let n_torsions = distal
                 .iter()
                 .filter(|d| !d.is_empty() && d.iter().all(|&i| sel[i]))
@@ -116,7 +119,31 @@ pub fn subtree_support(
     out
 }
 
-/// Torsions that move only atoms of unsupported subtrees.
+/// Torsions whose rotation moves atoms of `atoms` only (`support.torsions_moving_only`).
+///
+/// A rotation about the bond b-c of a quad (a, b, c, d) moves the distal side of the bond except
+/// c itself, which lies on the axis. So c is left out of the test: psi of a glycosidic linkage
+/// turns about C_x-O_x of the parent and moves the child only, although its distal side starts at
+/// the parent's linking oxygen. omega of a 1-6 linkage turns about C5-C6 and moves the parent's
+/// O6. A torsion that moves nothing is never selected.
+pub fn torsions_moving_only(
+    quads: &[[usize; 4]],
+    distal: &[Vec<usize>],
+    atoms: &[bool],
+) -> Vec<bool> {
+    quads
+        .iter()
+        .zip(distal)
+        .map(|(q, d)| {
+            let mut moved = d.iter().filter(|&&i| i != q[2]).peekable();
+            moved.peek().is_some() && moved.all(|&i| atoms[i])
+        })
+        .collect()
+}
+
+/// Torsions whose rotation moves only atoms of unsupported subtrees: every torsion inside them,
+/// and phi and psi of the linkage from a supported residue to an unsupported one (not omega of a
+/// 1-6 linkage, which moves O6 of the supported residue).
 pub fn unsupported_torsions(problem: &SiteProblem, support: &[SubtreeSupport]) -> Vec<bool> {
     let bad: Vec<bool> = problem
         .glycan
@@ -131,13 +158,8 @@ pub fn unsupported_torsions(problem: &SiteProblem, support: &[SubtreeSupport]) -
                     .is_some_and(|s| !s.supported)
         })
         .collect();
-    problem
-        .glycan
-        .topology
-        .distal
-        .iter()
-        .map(|d| !d.is_empty() && d.iter().all(|&i| bad[i]))
-        .collect()
+    let topology = &problem.glycan.topology;
+    torsions_moving_only(&topology.quads, &topology.distal, &bad)
 }
 
 /// Inpainting hook: pinned torsions get their straight-path velocity, free torsions get clash
