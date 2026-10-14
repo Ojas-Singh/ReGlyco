@@ -417,6 +417,7 @@ pub fn clear_contacts(
 }
 
 /// Eigenvector of the largest eigenvalue of a symmetric 4x4 matrix (cyclic Jacobi).
+#[allow(clippy::needless_range_loop)] // Jacobi rotations on explicit indices
 fn largest_eigenvector(mut a: [[f64; 4]; 4]) -> [f64; 4] {
     let mut v = [[0.0; 4]; 4];
     for (i, row) in v.iter_mut().enumerate() {

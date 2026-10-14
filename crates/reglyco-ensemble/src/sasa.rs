@@ -108,7 +108,13 @@ impl SasaAnalysis {
                 let bfactor = match value {
                     PdbValue::Shielding => result.shielding_percent,
                     PdbValue::RealSasa => result.real_sasa_nm2,
-                    PdbValue::Hotspot => result.hotspot.then_some(100.0).unwrap_or(0.0),
+                    PdbValue::Hotspot => {
+                        if result.hotspot {
+                            100.0
+                        } else {
+                            0.0
+                        }
+                    }
                 };
                 output.push_str(&format_protein_atom(atom, result.occupancy, bfactor));
             }
@@ -319,11 +325,13 @@ where
         .map(|(index, residue)| {
             let mean_bare_sasa = bare_sasa_sum[index] / frame_count_f64;
             let mean_glyco_sasa = glyco_sasa_sum[index] / frame_count_f64;
-            let shielding_percent = (mean_bare_sasa > 0.0)
-                .then_some((mean_bare_sasa - mean_glyco_sasa) / mean_bare_sasa * 100.0)
-                .unwrap_or(0.0);
+            let shielding_percent = if mean_bare_sasa > 0.0 {
+                (mean_bare_sasa - mean_glyco_sasa) / mean_bare_sasa * 100.0
+            } else {
+                0.0
+            };
             let real_sasa_nm2 = mean_glyco_sasa * 0.01;
-            let occupancy = (mean_bare_sasa > 0.0).then_some(1.0).unwrap_or(0.0);
+            let occupancy = if mean_bare_sasa > 0.0 { 1.0 } else { 0.0 };
             let hotspot = occupancy > 0.5
                 && shielding_percent <= COOKBOOK_HOTSPOT_SHIELDING_PERCENT
                 && real_sasa_nm2 > 1.0e-6;

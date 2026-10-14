@@ -1214,10 +1214,9 @@ fn required_glycan_atom(structure: &Structure, residue: &ResidueId, name: &str) 
             residue_name.as_str(),
             "SIA" | "NEU" | "NAN" | "NGC" | "KDN" | "KDO"
         )
+        && let Some(atom) = structure.find_atom(residue, "C2")
     {
-        if let Some(atom) = structure.find_atom(residue, "C2") {
-            return Ok(atom);
-        }
+        return Ok(atom);
     }
     if name.eq_ignore_ascii_case("O5") {
         let fallback = if matches!(
@@ -1240,10 +1239,10 @@ fn required_glycan_atom(structure: &Structure, residue: &ResidueId, name: &str) 
         } else {
             ""
         };
-        if !fallback.is_empty() {
-            if let Some(atom) = structure.find_atom(residue, fallback) {
-                return Ok(atom);
-            }
+        if !fallback.is_empty()
+            && let Some(atom) = structure.find_atom(residue, fallback)
+        {
+            return Ok(atom);
         }
     }
     Err(ReGlycoError::MissingGlycanAtom(name.into()))
@@ -1268,8 +1267,6 @@ fn glycan_attachment_atom_name(structure: &Structure, residue: &ResidueId) -> &'
         // the keto-acid/sialic family.  `required_glycan_atom` still performs
         // the final component-specific existence check.
         "C2"
-    } else if structure.find_atom(residue, "C1").is_some() {
-        "C1"
     } else {
         "C1"
     }

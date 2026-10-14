@@ -237,7 +237,7 @@ impl PreparedAttachmentContext {
             };
 
             let mut poses = Vec::with_capacity(rotamer_updates.len());
-            for (_rotamer_slot, updates) in rotamer_updates.iter().enumerate() {
+            for updates in rotamer_updates.iter() {
                 let mut coordinates = protein_coordinates.clone();
                 for &(index, position) in updates {
                     coordinates[index] = position;
@@ -733,93 +733,6 @@ impl PreparedAttachmentContext {
     }
 }
 
-#[cfg(test)]
-mod bounds_tests {
-    use super::*;
-
-    fn point(value: [f64; 3]) -> Vec3 {
-        Vec3 {
-            x: value[0],
-            y: value[1],
-            z: value[2],
-        }
-    }
-
-    fn candidate(points: &[[f64; 3]], attachment_atom: usize) -> PreparedSitePose {
-        let coordinates = points.iter().copied().map(point).collect::<Vec<_>>();
-        PreparedSitePose {
-            bounds: pose_bounds(&coordinates),
-            grid: Arc::new(SpatialGrid::build(&coordinates, 0..coordinates.len())),
-            coordinates: Arc::new(coordinates),
-            attachment_atom,
-        }
-    }
-
-    #[test]
-    fn pair_bounds_preserve_clash_decisions_and_skip_only_the_own_attachment_atom() {
-        let context = PreparedAttachmentContext {
-            protein_coordinates: Vec::new(),
-            protein_indices: Vec::new(),
-            static_grid: SpatialGrid::build(&[], std::iter::empty()),
-            sites: Vec::new(),
-        };
-        let first = candidate(&[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], 0);
-        let far = candidate(&[[30.0, 0.0, 0.0], [20.0, 0.0, 0.0]], 0);
-        let near = candidate(&[[30.0, 0.0, 0.0], [10.5, 0.0, 0.0]], 0);
-        assert!(context.site_poses_compatible(&first, &far, 1.7));
-        assert!(!context.site_poses_compatible(&first, &near, 1.7));
-        // The other glycan's attachment atom is not bonded to this glycan,
-        // so it is tested (here it lies 0.5 A from a tested atom).
-        let other_attachment = candidate(&[[10.5, 0.0, 0.0], [30.0, 0.0, 0.0]], 0);
-        assert!(!context.site_poses_compatible(&first, &other_attachment, 1.7));
-        // Only the own attachment atom (index 0 of `first`) is skipped.
-        assert!(context.site_poses_compatible(
-            &first,
-            &candidate(&[[0.5, 0.0, 0.0], [30.0, 0.0, 0.0]], 1),
-            1.7
-        ));
-    }
-
-    #[test]
-    fn protein_test_skips_the_attachment_atom_by_identity_not_by_position() {
-        let protein = vec![point([0.0, 0.0, 0.0])];
-        let grid = SpatialGrid::build(&protein, 0..1);
-        // A protein atom 1.0 A from the second glycan atom: a clash whether
-        // the attachment atom is first or last in the pose.
-        let pose = [
-            point([5.0, 0.0, 0.0]),
-            point([1.0, 0.0, 0.0]),
-            point([9.0, 0.0, 0.0]),
-        ];
-        assert!(protein_score(&pose, 0, &protein, &grid, 1.7) > 2.0);
-        assert!(protein_score(&pose, 2, &protein, &grid, 1.7) > 2.0);
-        // Nothing but the attachment atom near the protein: no clash.
-        assert_eq!(protein_score(&pose, 1, &protein, &grid, 1.7), 1.0);
-    }
-
-    #[test]
-    fn turned_side_chain_is_tested_against_other_residues_only() {
-        // Indices 0 and 1: the glycosylated residue; 2: another residue.
-        let protein = vec![
-            point([0.0, 0.0, 0.0]),
-            point([1.0, 0.0, 0.0]),
-            point([5.0, 0.0, 0.0]),
-        ];
-        let grid = SpatialGrid::build(&protein, 0..3);
-        let own = vec![0, 1];
-        // Moved atom 1.2 A from its own residue's atom: not a clash.
-        assert_eq!(
-            sidechain_score(&[(1, point([1.2, 0.0, 0.0]))], &own, &protein, &grid, 1.7),
-            1.0
-        );
-        // Moved atom 1.0 A from another residue's atom: a clash.
-        let mut moved = protein.clone();
-        moved[1] = point([4.0, 0.0, 0.0]);
-        let moved_grid = SpatialGrid::build(&moved, 0..3);
-        assert!(sidechain_score(&[(1, moved[1])], &own, &moved, &moved_grid, 1.7) > 2.0);
-    }
-}
-
 /// Steric score of the moved atoms of a turned side chain against every
 /// protein atom outside the glycosylated residue (`own`, sorted indices), in
 /// the frame that already carries the move. Same contact rule and score as
@@ -992,16 +905,15 @@ fn pair_score(
         if first_index == first_attachment_atom {
             continue;
         }
-        if let Some((low, high)) = second_bounds {
-            if first_position.x + threshold <= low[0]
+        if let Some((low, high)) = second_bounds
+            && (first_position.x + threshold <= low[0]
                 || first_position.x - threshold >= high[0]
                 || first_position.y + threshold <= low[1]
                 || first_position.y - threshold >= high[1]
                 || first_position.z + threshold <= low[2]
-                || first_position.z - threshold >= high[2]
-            {
-                continue;
-            }
+                || first_position.z - threshold >= high[2])
+        {
+            continue;
         }
         candidates.clear();
         grid.append_candidates(*first_position, cell_radius, &mut candidates);
@@ -1097,6 +1009,93 @@ fn dihedral_degrees(first: Vec3, second: Vec3, third: Vec3, fourth: Vec3) -> f64
     let v = subtract(b0, scale(b1, dot(b0, b1)));
     let w = subtract(b2, scale(b1, dot(b2, b1)));
     dot(cross(b1, v), w).atan2(dot(v, w)).to_degrees()
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    fn point(value: [f64; 3]) -> Vec3 {
+        Vec3 {
+            x: value[0],
+            y: value[1],
+            z: value[2],
+        }
+    }
+
+    fn candidate(points: &[[f64; 3]], attachment_atom: usize) -> PreparedSitePose {
+        let coordinates = points.iter().copied().map(point).collect::<Vec<_>>();
+        PreparedSitePose {
+            bounds: pose_bounds(&coordinates),
+            grid: Arc::new(SpatialGrid::build(&coordinates, 0..coordinates.len())),
+            coordinates: Arc::new(coordinates),
+            attachment_atom,
+        }
+    }
+
+    #[test]
+    fn pair_bounds_preserve_clash_decisions_and_skip_only_the_own_attachment_atom() {
+        let context = PreparedAttachmentContext {
+            protein_coordinates: Vec::new(),
+            protein_indices: Vec::new(),
+            static_grid: SpatialGrid::build(&[], std::iter::empty()),
+            sites: Vec::new(),
+        };
+        let first = candidate(&[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], 0);
+        let far = candidate(&[[30.0, 0.0, 0.0], [20.0, 0.0, 0.0]], 0);
+        let near = candidate(&[[30.0, 0.0, 0.0], [10.5, 0.0, 0.0]], 0);
+        assert!(context.site_poses_compatible(&first, &far, 1.7));
+        assert!(!context.site_poses_compatible(&first, &near, 1.7));
+        // The other glycan's attachment atom is not bonded to this glycan,
+        // so it is tested (here it lies 0.5 A from a tested atom).
+        let other_attachment = candidate(&[[10.5, 0.0, 0.0], [30.0, 0.0, 0.0]], 0);
+        assert!(!context.site_poses_compatible(&first, &other_attachment, 1.7));
+        // Only the own attachment atom (index 0 of `first`) is skipped.
+        assert!(context.site_poses_compatible(
+            &first,
+            &candidate(&[[0.5, 0.0, 0.0], [30.0, 0.0, 0.0]], 1),
+            1.7
+        ));
+    }
+
+    #[test]
+    fn protein_test_skips_the_attachment_atom_by_identity_not_by_position() {
+        let protein = vec![point([0.0, 0.0, 0.0])];
+        let grid = SpatialGrid::build(&protein, 0..1);
+        // A protein atom 1.0 A from the second glycan atom: a clash whether
+        // the attachment atom is first or last in the pose.
+        let pose = [
+            point([5.0, 0.0, 0.0]),
+            point([1.0, 0.0, 0.0]),
+            point([9.0, 0.0, 0.0]),
+        ];
+        assert!(protein_score(&pose, 0, &protein, &grid, 1.7) > 2.0);
+        assert!(protein_score(&pose, 2, &protein, &grid, 1.7) > 2.0);
+        // Nothing but the attachment atom near the protein: no clash.
+        assert_eq!(protein_score(&pose, 1, &protein, &grid, 1.7), 1.0);
+    }
+
+    #[test]
+    fn turned_side_chain_is_tested_against_other_residues_only() {
+        // Indices 0 and 1: the glycosylated residue; 2: another residue.
+        let protein = vec![
+            point([0.0, 0.0, 0.0]),
+            point([1.0, 0.0, 0.0]),
+            point([5.0, 0.0, 0.0]),
+        ];
+        let grid = SpatialGrid::build(&protein, 0..3);
+        let own = vec![0, 1];
+        // Moved atom 1.2 A from its own residue's atom: not a clash.
+        assert_eq!(
+            sidechain_score(&[(1, point([1.2, 0.0, 0.0]))], &own, &protein, &grid, 1.7),
+            1.0
+        );
+        // Moved atom 1.0 A from another residue's atom: a clash.
+        let mut moved = protein.clone();
+        moved[1] = point([4.0, 0.0, 0.0]);
+        let moved_grid = SpatialGrid::build(&moved, 0..3);
+        assert!(sidechain_score(&[(1, moved[1])], &own, &moved, &moved_grid, 1.7) > 2.0);
+    }
 }
 
 #[cfg(feature = "webgpu")]

@@ -275,6 +275,7 @@ pub struct SiteLikelihood {
 }
 
 /// Inverse of the leading `n x n` block (n = 2 or 3) of a symmetric matrix.
+#[allow(clippy::needless_range_loop)] // matrix indices, as in the algebra
 fn inverse_n(m: &[[f64; 3]; 3], n: usize) -> Option<[[f64; 3]; 3]> {
     let mut out = [[0.0; 3]; 3];
     if n == 2 {

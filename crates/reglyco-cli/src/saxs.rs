@@ -283,6 +283,7 @@ fn run_ensemble(arguments: SaxsEnsembleArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::field_reassign_with_default)] // options are set field by field from the arguments
 fn run_reweight(arguments: SaxsReweightArgs) -> Result<()> {
     let started = Instant::now();
     let common = arguments.common;
@@ -458,10 +459,11 @@ fn run_occupancy(arguments: SaxsOccupancyArgs) -> Result<()> {
 }
 
 fn read_experimental(common: &SaxsCommonArgs) -> Result<ExperimentalCurve> {
-    Ok(ExperimentalCurve::from_dat_file(&common.data)
-        .with_context(|| format!("could not read SAXS data {}", common.data.display()))?)
+    ExperimentalCurve::from_dat_file(&common.data)
+        .with_context(|| format!("could not read SAXS data {}", common.data.display()))
 }
 
+#[allow(clippy::field_reassign_with_default)] // options are set field by field from the arguments
 fn fit_options(common: &SaxsCommonArgs) -> Result<FitOptions> {
     if common.q_sampling_stride == 0 {
         anyhow::bail!("--q-sampling-stride must be positive");
@@ -902,12 +904,12 @@ fn occupancy_analysis(path: &Path, analysis: &crabsaxs::CombinationAnalysis) -> 
 
 fn write_weights_csv(path: &Path, names: &[String], weights: &[f64], priors: &[f64]) -> Result<()> {
     let mut text = String::from("name,prior_weight,posterior_weight\n");
-    for index in 0..weights.len() {
+    for (index, weight) in weights.iter().enumerate() {
         text.push_str(&format!(
             "{},{:.12},{:.12}\n",
             names.get(index).map(String::as_str).unwrap_or("conformer"),
             priors.get(index).copied().unwrap_or(0.0),
-            weights[index]
+            weight
         ));
     }
     fs::write(path, text)?;

@@ -241,10 +241,10 @@ fn decode_volume(bytes: &[u8]) -> Result<RcsbVolume> {
     let cell_lengths = get_triplet("spacegroup_cell_size")?;
     let cell_angles = get_triplet("spacegroup_cell_angles")?;
     let scalar = |name: &str| -> Result<f64> {
-        Ok(get(name)?
+        get(name)?
             .into_iter()
             .next()
-            .ok_or_else(|| DensityError::Map(format!("RCSB metadata `{name}` is empty")))?)
+            .ok_or_else(|| DensityError::Map(format!("RCSB metadata `{name}` is empty")))
     };
     let axis_order = to_triplet_usize(&axis_order, "axis_order")?;
     if axis_order.iter().any(|axis| *axis > 2) || unique_count(axis_order) != 3 {
@@ -263,7 +263,7 @@ fn decode_volume(bytes: &[u8]) -> Result<RcsbVolume> {
         ));
     }
     let sample_count = to_triplet_usize(&sample_count, "sample_count")?;
-    if sample_count.iter().any(|value| *value == 0) {
+    if sample_count.contains(&0) {
         return Err(DensityError::Geometry(
             "RCSB sample_count must be positive".into(),
         ));

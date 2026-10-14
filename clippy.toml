@@ -1,0 +1,4 @@
+# Engine entry points take many explicit inputs and return structured tuples;
+# these limits match the code rather than forcing parameter structs on it.
+too-many-arguments-threshold = 12
+type-complexity-threshold = 600

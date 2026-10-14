@@ -209,7 +209,7 @@ impl<'m> Sampler<'m> {
     ) -> Result<(Vec<P3>, Vec<f32>)> {
         let n = self.n_atoms();
         let nt = self.n_torsions();
-        if !templates.len().is_multiple_of(n) {
+        if templates.len() % n != 0 {
             return Err(Error::Invalid(
                 "templates length is not a multiple of the atom count".into(),
             ));
