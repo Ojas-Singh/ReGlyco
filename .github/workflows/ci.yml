@@ -4,11 +4,27 @@ on:
   push:
   pull_request:
 
+# The workspace depends on its sibling repositories by path (`../GlySys`,
+# `../crabSAXS`), so every job checks out ReGlyco next to them, at the tip of
+# their default branches, as a development checkout has them.
 jobs:
   rust:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ReGlyco
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: ReGlyco
+      - uses: actions/checkout@v4
+        with:
+          repository: Ojas-Singh/GlySys
+          path: GlySys
+      - uses: actions/checkout@v4
+        with:
+          repository: Ojas-Singh/crabSAXS
+          path: crabSAXS
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.97"
@@ -20,8 +36,21 @@ jobs:
 
   browser-profiles:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ReGlyco
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: ReGlyco
+      - uses: actions/checkout@v4
+        with:
+          repository: Ojas-Singh/GlySys
+          path: GlySys
+      - uses: actions/checkout@v4
+        with:
+          repository: Ojas-Singh/crabSAXS
+          path: crabSAXS
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.97"

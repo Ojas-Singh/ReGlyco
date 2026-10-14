@@ -227,7 +227,7 @@ impl DensityMap {
         if mode.is_complex() {
             return Err(DensityError::ComplexMap);
         }
-        let header = reader.header().clone();
+        let header = *reader.header();
         let dimensions = [header.nx, header.ny, header.nz];
         if dimensions.iter().any(|value| *value <= 0) {
             return Err(DensityError::Geometry(
@@ -1202,15 +1202,15 @@ impl DensityScorer {
                     if full_periodic_axis[axis] {
                         return true;
                     }
-                    let wrapped = if start_fractional[axis] <= end_fractional[axis] {
+
+                    if start_fractional[axis] <= end_fractional[axis] {
                         fractional[axis] >= start_fractional[axis]
                             && fractional[axis] <= end_fractional[axis]
                     } else {
                         // Box crosses the periodic boundary.
                         fractional[axis] >= start_fractional[axis]
                             || fractional[axis] <= end_fractional[axis]
-                    };
-                    wrapped
+                    }
                 })
             })
             .collect::<Vec<_>>();
@@ -1679,6 +1679,8 @@ impl DensityScorer {
     /// topology is reconstructed from the atom-bond graph and the attachment
     /// bond; residue ordering in a PDB/mmCIF record is never used as a proxy
     /// for parent/child relationships.
+    // Residual support uses max/min rather than clamp: a NaN residual counts as 0.
+    #[allow(clippy::manual_clamp)]
     fn residue_support(
         &self,
         structure: &Structure,

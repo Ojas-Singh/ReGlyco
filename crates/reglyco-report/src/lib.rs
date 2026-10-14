@@ -224,18 +224,14 @@ pub struct ValidationAnalysis {
 /// tails are advisory; only attachment VMM gates are hard workflow criteria.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TorsionAssessment {
     Core,
     Allowed,
     Tail,
     Outlier,
+    #[default]
     NoReference,
-}
-
-impl Default for TorsionAssessment {
-    fn default() -> Self {
-        Self::NoReference
-    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -2129,7 +2125,7 @@ fn draw_contour_bands<DB: DrawingBackend>(
                 })
                 .collect::<Vec<_>>();
             if points.len() >= 3 {
-                root.draw(&Polygon::new(points, color.clone()))
+                root.draw(&Polygon::new(points, color))
                     .map_err(|error| ReportError::Plot(error.to_string()))?;
             }
         }
@@ -2158,7 +2154,7 @@ fn filled_contour_kde_plot(path: PathBuf, torsions: &[ProteinLinkageTorsion]) ->
     const OUTER_TOP: i32 = 42;
     const OUTER_BOTTOM: i32 = 54;
     const GRID: usize = 101;
-    let columns = site_data.len().min(2).max(1);
+    let columns = site_data.len().clamp(1, 2);
     let rows = site_data.len().div_ceil(columns);
     let width = (OUTER_LEFT + columns as i32 * PANEL + 18) as u32;
     let height = (OUTER_TOP + rows as i32 * PANEL + OUTER_BOTTOM) as u32;
@@ -4018,20 +4014,20 @@ fn typst_source(report: &WorkflowReport) -> String {
             }
             source.push_str(")\n");
         }
-        if saxs.model_fits.is_empty() {
-            if let Some(features) = &saxs.fit_features {
-                source.push_str("#report-table(columns: (auto, auto, auto, auto, auto, auto, auto, auto), align: (left, right, right, right, right, right, right, right), [*Fit*], [*χ²*], [*Reduced χ²*], [*Rg (Å)*], [*Dmax (Å)*], [*Kratky*], [*P(r) RMS*],");
-                source.push_str(&format!(
-                    "[Selected fit], [{:.4}], [{:.4}], [{}], [{}], [{}], [{}],",
-                    features.chi2,
-                    features.reduced_chi2,
-                    typst_optional(features.rg_model),
-                    typst_optional(features.dmax_model),
-                    typst_optional(features.kratky_deviation),
-                    typst_optional(features.pr_rms),
-                ));
-                source.push_str(")\n");
-            }
+        if saxs.model_fits.is_empty()
+            && let Some(features) = &saxs.fit_features
+        {
+            source.push_str("#report-table(columns: (auto, auto, auto, auto, auto, auto, auto, auto), align: (left, right, right, right, right, right, right, right), [*Fit*], [*χ²*], [*Reduced χ²*], [*Rg (Å)*], [*Dmax (Å)*], [*Kratky*], [*P(r) RMS*],");
+            source.push_str(&format!(
+                "[Selected fit], [{:.4}], [{:.4}], [{}], [{}], [{}], [{}],",
+                features.chi2,
+                features.reduced_chi2,
+                typst_optional(features.rg_model),
+                typst_optional(features.dmax_model),
+                typst_optional(features.kratky_deviation),
+                typst_optional(features.pr_rms),
+            ));
+            source.push_str(")\n");
         }
         if !saxs.weights.is_empty() {
             source.push_str("#report-table(columns: (auto, auto, auto), align: (left, right, right), [*Conformer*], [*Prior*], [*Posterior weight*],");

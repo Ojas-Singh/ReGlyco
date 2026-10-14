@@ -1443,8 +1443,7 @@ fn glycan_terminal_sugar(metadata: &Value) -> Option<String> {
         .get("archetype")
         .and_then(|archetype| archetype.get("iupac"))
         .and_then(Value::as_str)?;
-    let tail = iupac
-        .trim_end_matches(|character| character == ')' || character == ']' || character == ' ');
+    let tail = iupac.trim_end_matches([')', ']', ' ']);
     [
         "Neu5Ac", "Neu5Gc", "GlcNAc", "GalNAc", "Araf", "Fuc", "Man", "Glc", "Gal", "Xyl",
     ]
@@ -1627,6 +1626,10 @@ fn progress_relax(event: RelaxProgress) -> ProgressEvent {
 /// finding keys.  This keeps inherited depositional issues separate from
 /// chemistry introduced by a build/minimize/optimize stage and makes the
 /// distinction reproducible in report.json and the browser report.
+///
+/// Not wired into a workflow yet; it and the helpers only it calls are kept
+/// for that (allowed as dead code below).
+#[allow(dead_code)]
 fn validation_summary_with_baseline(
     request: &ReGlycoRunRequestV1,
     input: &str,
@@ -1731,6 +1734,7 @@ fn validation_summary_with_baseline(
     }
 }
 
+#[allow(dead_code)] // used only by validation_summary_with_baseline
 fn validation_summary_from_native(native: reglyco_validate::ValidationReport) -> ValidationSummary {
     ValidationSummary {
         valid: native.valid,
@@ -1748,6 +1752,7 @@ fn validation_summary_from_native(native: reglyco_validate::ValidationReport) ->
 /// malformed source asset before assembly; this pass retains non-fatal source
 /// findings (for example an advisory bond geometry) in the report and marks
 /// their provenance for offline inspection.
+#[allow(dead_code)] // used only by validation_summary_with_baseline
 fn append_asset_validation(
     validation: &mut ValidationSummary,
     analysis: &mut Value,
@@ -1807,10 +1812,10 @@ fn append_asset_validation(
             validation.findings.push(converted);
         }
     }
-    if let Some(object) = analysis.as_object_mut() {
-        if !asset_reports.is_empty() {
-            object.insert("assetValidation".into(), Value::Array(asset_reports));
-        }
+    if let Some(object) = analysis.as_object_mut()
+        && !asset_reports.is_empty()
+    {
+        object.insert("assetValidation".into(), Value::Array(asset_reports));
     }
 }
 
@@ -1818,6 +1823,7 @@ fn append_asset_validation(
 /// workflows. Generic energy/interaction paths still expose measured
 /// torsions as diagnostics without turning a non-strict result into a failed
 /// workflow.
+#[allow(dead_code)] // used only by validation_summary_with_baseline
 fn append_attachment_gate_findings(
     validation: &mut ValidationSummary,
     analysis: &Value,
@@ -1951,6 +1957,7 @@ fn append_attachment_gate_findings(
 /// validation contract.  These findings are deliberately marked as
 /// introduced: the candidate was generated during this run and is not an
 /// inherited input or source-asset issue.
+#[allow(dead_code)] // used only by validation_summary_with_baseline
 fn append_strict_diagnostic_findings(
     validation: &mut ValidationSummary,
     diagnostics: &StrictSearchDiagnostics,
@@ -2121,6 +2128,7 @@ fn append_strict_diagnostic_findings(
     }
 }
 
+#[allow(dead_code)] // used only by validation_summary_with_baseline
 fn parse_site_key(value: &str) -> Option<SiteKey> {
     let (chain, residue) = value.split_once(':')?;
     let mut digits = residue.trim();
@@ -2140,6 +2148,7 @@ fn parse_site_key(value: &str) -> Option<SiteKey> {
     })
 }
 
+#[allow(dead_code)] // used only by validation_summary_with_baseline
 fn finding_key(finding: &NativeFinding) -> String {
     let residue = finding
         .site
@@ -2158,6 +2167,7 @@ fn finding_key(finding: &NativeFinding) -> String {
     )
 }
 
+#[allow(dead_code)] // used only by validation_summary_with_baseline
 fn severity_rank(severity: Severity) -> u8 {
     match severity {
         Severity::Error => 0,
@@ -2166,6 +2176,7 @@ fn severity_rank(severity: Severity) -> u8 {
     }
 }
 
+#[allow(dead_code)] // used only by validation_summary_with_baseline
 fn convert_finding(finding: NativeFinding) -> ValidationFinding {
     let residue_for_site = finding.site.clone().or_else(|| finding.residue.clone());
     let glycan = finding
@@ -2365,12 +2376,11 @@ pub fn analyze_torsions(
         // omit private GlycoShape reference grids. Rebuild the small VMM
         // description from newly fetched, in-memory source assets; this does
         // not run search or alter the accepted coordinates.
-        if let Some(model) = pdb_models(output_pdb).next() {
-            if let Ok(structure) = read_pdb_str(&model, &build_options(request)) {
-                if let Ok(sites) = search_sites(request, assets, &structure) {
-                    append_attachment_reference_data_from_observations(&mut analysis, &sites);
-                }
-            }
+        if let Some(model) = pdb_models(output_pdb).next()
+            && let Ok(structure) = read_pdb_str(&model, &build_options(request))
+            && let Ok(sites) = search_sites(request, assets, &structure)
+        {
+            append_attachment_reference_data_from_observations(&mut analysis, &sites);
         }
     }
     let torsion_references = analysis
@@ -2390,7 +2400,7 @@ pub fn analyze_torsions(
         .and_then(Value::as_array)
         .is_some_and(|values| !values.is_empty());
     if !has_attachment_observations {
-        append_attachment_analysis(&mut analysis, &stage);
+        append_attachment_analysis(&mut analysis, stage);
     }
     let mut observations = Vec::new();
     let options = build_options(request);
@@ -2831,27 +2841,26 @@ pub async fn execute_with_control(
                 "Build",
                 None,
             );
-            if request.options.post_relax {
-                if let Some(system) = built.system {
-                    match relax_with_progress(&protein, &system, &relax_options(request), |event| {
-                        control.progress(progress_relax(event))
-                    }) {
-                        Ok(relaxed) => {
-                            extra_artifacts.push(text_artifact(
-                                "pre-relax.pdb",
-                                "chemical/x-pdb",
-                                ArtifactRole::Structure,
-                                protein.to_pdb_string(),
-                            ));
-                            protein = relaxed.structure;
-                            analysis["relaxation"] = serde_json::to_value(relaxed.diagnostics)?;
-                            append_attachment_analysis(&mut analysis, "Minimize");
-                        }
-                        Err(error) => {
-                            status = WorkflowStatus::Partial;
-                            warnings
-                                .push(format!("Build succeeded but relaxation failed: {error}"));
-                        }
+            if request.options.post_relax
+                && let Some(system) = built.system
+            {
+                match relax_with_progress(&protein, &system, &relax_options(request), |event| {
+                    control.progress(progress_relax(event))
+                }) {
+                    Ok(relaxed) => {
+                        extra_artifacts.push(text_artifact(
+                            "pre-relax.pdb",
+                            "chemical/x-pdb",
+                            ArtifactRole::Structure,
+                            protein.to_pdb_string(),
+                        ));
+                        protein = relaxed.structure;
+                        analysis["relaxation"] = serde_json::to_value(relaxed.diagnostics)?;
+                        append_attachment_analysis(&mut analysis, "Minimize");
+                    }
+                    Err(error) => {
+                        status = WorkflowStatus::Partial;
+                        warnings.push(format!("Build succeeded but relaxation failed: {error}"));
                     }
                 }
             }
@@ -2956,7 +2965,6 @@ pub async fn execute_with_control(
                 },
             )
             .await;
-            drop(control_cell);
             let (mut frames, diagnostics) = match sampling_result {
                 Ok(result) => result,
                 Err(EnsembleError::StrictVmmFailure { diagnostics }) => {
@@ -3516,10 +3524,10 @@ pub async fn execute_with_control(
         }
     }
 
-    if !replacements.is_empty() {
-        if let Some(object) = analysis.as_object_mut() {
-            object.insert("replacements".into(), serde_json::to_value(&replacements)?);
-        }
+    if !replacements.is_empty()
+        && let Some(object) = analysis.as_object_mut()
+    {
+        object.insert("replacements".into(), serde_json::to_value(&replacements)?);
     }
     finish_workflow(
         request,
@@ -3592,23 +3600,21 @@ fn finish_workflow(
         .or_else(|| analysis.get("vmmPolish"))
         .filter(|value| value.get("applied").and_then(Value::as_bool) == Some(true))
         .cloned()
+        && let Some(object) = method.as_object_mut()
     {
-        if let Some(object) = method.as_object_mut() {
-            object.insert("attachmentVmmPolish".into(), polish);
-        }
+        object.insert("attachmentVmmPolish".into(), polish);
     }
     if replacement_metadata
         .as_array()
         .is_some_and(|items| !items.is_empty())
+        && let Some(object) = method.as_object_mut()
     {
-        if let Some(object) = method.as_object_mut() {
-            object.insert("replacements".into(), replacement_metadata.clone());
-        }
+        object.insert("replacements".into(), replacement_metadata.clone());
     }
-    if let Some(search_budget) = analysis.get("searchBudget").cloned() {
-        if let Some(object) = method.as_object_mut() {
-            object.insert("searchBudget".into(), search_budget);
-        }
+    if let Some(search_budget) = analysis.get("searchBudget").cloned()
+        && let Some(object) = method.as_object_mut()
+    {
+        object.insert("searchBudget".into(), search_budget);
     }
     if let Some(object) = analysis.as_object_mut() {
         object.insert("method".into(), method.clone());
@@ -3844,10 +3850,9 @@ fn finish_strict_failure(
     if replacement_metadata
         .as_array()
         .is_some_and(|items| !items.is_empty())
+        && let Some(object) = method.as_object_mut()
     {
-        if let Some(object) = method.as_object_mut() {
-            object.insert("replacements".into(), replacement_metadata.clone());
-        }
+        object.insert("replacements".into(), replacement_metadata.clone());
     }
     if let Some(search_budget) = analysis.get("searchBudget").cloned() {
         if let Some(object) = method.as_object_mut() {
@@ -6076,9 +6081,7 @@ fn glycosidic_torsion_observations(
             .or_else(|| {
                 // φ = O5′–C1′–Ox–Cx (O4′ of a furanose, O6′–C2′ of a sialic
                 // acid) in both versions.
-                if fallback_convention.is_none() {
-                    return None;
-                }
+                fallback_convention?;
                 donor_ring.zip(acceptor_carbon).map(|(ring, carbon)| {
                     glycoshape_dihedral_degrees(ring, donor.position, acceptor.position, carbon)
                 })
@@ -6373,17 +6376,17 @@ fn torsion_reference_for_observation<'a>(
             .filter_map(residue_occurrence_token)
             .take(2)
             .collect::<Vec<_>>();
-        if residue_tokens.len() == 2 {
-            if let Some(reference) = references.iter().find(|reference| {
+        if residue_tokens.len() == 2
+            && let Some(reference) = references.iter().find(|reference| {
                 reference_matches_pdb_branch(reference, &branch_path)
                     && reference_matches_residue_occurrence(
                         reference,
                         &residue_tokens[0],
                         &residue_tokens[1],
                     )
-            }) {
-                return Some(reference);
-            }
+            })
+        {
+            return Some(reference);
         }
         if let Some(reference) = torsion_reference_for_pdb_branch(references, &branch_path) {
             return Some(reference);
@@ -7817,8 +7820,12 @@ END
                     "omega": omega_atoms.map(acceptor_atom),
                 }
             }));
-            let observations =
-                glycosidic_torsion_observations(&structure, "result", None, &[reference.clone()]);
+            let observations = glycosidic_torsion_observations(
+                &structure,
+                "result",
+                None,
+                std::slice::from_ref(&reference),
+            );
             let defined = reference_defined_torsion(
                 &AtomLookup::new(&structure),
                 &reference,
@@ -7849,8 +7856,12 @@ END
             "angle_convention": "glycoshape-v1",
             "phi_psi": { "bins": 2, "counts": [1, 1, 1, 1] },
         });
-        let mut observations =
-            glycosidic_torsion_observations(&structure, "result", None, &[reference.clone()]);
+        let mut observations = glycosidic_torsion_observations(
+            &structure,
+            "result",
+            None,
+            std::slice::from_ref(&reference),
+        );
         let acceptor = ResidueId {
             chain: "G".into(),
             number: 2,

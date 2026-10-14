@@ -55,11 +55,11 @@ const LARGE_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
 fn bundle_to_js(mut bundle: WorkflowBundle) -> Result<JsValue, JsValue> {
     for artifact in &mut bundle.artifacts {
-        if let AssetData::Text(text) = &mut artifact.data {
-            if text.len() > LARGE_TEXT_ARTIFACT_BYTES {
-                // Moving the String into a Vec<u8> reuses its allocation.
-                artifact.data = AssetData::Bytes(std::mem::take(text).into_bytes());
-            }
+        if let AssetData::Text(text) = &mut artifact.data
+            && text.len() > LARGE_TEXT_ARTIFACT_BYTES
+        {
+            // Moving the String into a Vec<u8> reuses its allocation.
+            artifact.data = AssetData::Bytes(std::mem::take(text).into_bytes());
         }
     }
     serde_wasm_bindgen::to_value(&bundle).map_err(|error| JsValue::from_str(&error.to_string()))

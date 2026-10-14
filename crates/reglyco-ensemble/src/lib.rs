@@ -3099,9 +3099,11 @@ where
         }
     };
     let compatibility_diagnostics = CompatibilitySearchDiagnostics {
-        algorithm: (compatibility_budget > 0)
-            .then_some("arc_consistency_backtracking_v1".into())
-            .unwrap_or_default(),
+        algorithm: if compatibility_budget > 0 {
+            "arc_consistency_backtracking_v1".into()
+        } else {
+            Default::default()
+        },
         seeded_states: compatibility_states.states.len(),
         pose_attempts: compatibility_states.proposals,
         pool_sizes: compatibility_states.pool_sizes.clone(),
@@ -3132,12 +3134,14 @@ where
         (seeded_count..population_capacity)
             .map(|_| cookbook_generate(problem.protein, problem.sites, &mut rng)),
     );
-    let mut geometry = GeometrySession::default();
     // Joint-prior Build does not use Cookbook freezing, so complete
     // transformed coordinate arrays are unnecessary in the hot loop. The
     // resident GPU returns site scores and boundary candidates; coordinates
     // are materialized only for selected output or CPU checks.
-    geometry.scores_only = policy == SearchSelectionPolicy::JointPriorV1;
+    let mut geometry = GeometrySession {
+        scores_only: policy == SearchSelectionPolicy::JointPriorV1,
+        ..GeometrySession::default()
+    };
     evaluate_population(problem, &mut population, &mut geometry).await?;
     population
         .iter_mut()
@@ -3354,7 +3358,7 @@ where
             mutation_rate = (0.15 + stagnation as f64 * 0.05).min(0.5);
             creep_std = (10.0 * (1.0 + stagnation as f64 * 0.3)).min(30.0);
             freezing_threshold = (1.1 + stagnation as f64 * 0.05).min(1.5);
-            if stagnation % 10 == 0 {
+            if stagnation.is_multiple_of(10) {
                 if cancelled() {
                     return Err(EnsembleError::Cancelled);
                 }
@@ -3399,16 +3403,14 @@ where
         }
         let elite = ((population.len() as f64 * 0.1).round() as usize).clamp(1, population.len());
         let mut next = population[..elite].to_vec();
-        if policy == SearchSelectionPolicy::JointPriorV1 {
-            if let Some(incumbent) = best_feasible.as_ref() {
-                if !next
-                    .iter()
-                    .any(|candidate| candidate.genes == incumbent.genes)
-                {
-                    next.pop();
-                    next.push(incumbent.clone());
-                }
-            }
+        if policy == SearchSelectionPolicy::JointPriorV1
+            && let Some(incumbent) = best_feasible.as_ref()
+            && !next
+                .iter()
+                .any(|candidate| candidate.genes == incumbent.genes)
+        {
+            next.pop();
+            next.push(incumbent.clone());
         }
         let needed = population.len() - next.len();
         // Repair/restart work consumes the same finite proposal budget as
@@ -3912,12 +3914,16 @@ where
     }
 
     let ga_seconds = ga_started.elapsed().as_secs_f64();
-    let geometry_gpu_seconds = (config.scoring_mode == SearchScoringMode::StericPrior)
-        .then_some(vmm_polish.geometry_gpu_seconds)
-        .unwrap_or(0.0);
-    let geometry_cpu_seconds = (config.scoring_mode == SearchScoringMode::StericPrior)
-        .then_some(vmm_polish.geometry_cpu_seconds)
-        .unwrap_or(0.0);
+    let geometry_gpu_seconds = if config.scoring_mode == SearchScoringMode::StericPrior {
+        vmm_polish.geometry_gpu_seconds
+    } else {
+        0.0
+    };
+    let geometry_cpu_seconds = if config.scoring_mode == SearchScoringMode::StericPrior {
+        vmm_polish.geometry_cpu_seconds
+    } else {
+        0.0
+    };
     let geometry_scoring_seconds = geometry_gpu_seconds + geometry_cpu_seconds;
     let scoring_seconds = if config.scoring_mode == SearchScoringMode::StericPrior {
         geometry_scoring_seconds
@@ -4024,23 +4030,23 @@ where
             let psi_component = strict_components
                 .as_ref()
                 .and_then(|(_, psi)| psi.get(index).copied());
-            let phi_within_vmm95 = phi_component.and_then(|component| {
-                Some(vmm_angle_within_95(
+            let phi_within_vmm95 = phi_component.map(|component| {
+                vmm_angle_within_95(
                     VmmAngle {
                         degrees: gene.phi,
                         component,
                     },
                     &priors.phi,
-                ))
+                )
             });
-            let psi_within_vmm95 = psi_component.and_then(|component| {
-                Some(vmm_angle_within_95(
+            let psi_within_vmm95 = psi_component.map(|component| {
+                vmm_angle_within_95(
                     VmmAngle {
                         degrees: gene.psi,
                         component,
                     },
                     &priors.psi,
-                ))
+                )
             });
             let (conformer_probability, attachment_log_density, joint_prior_score) = problem
                 .site_prior_breakdown(index, gene)
@@ -4754,10 +4760,9 @@ fn compatible_pool_target(
     let graph = conservative_site_graph(protein, sites);
     let edge_count = graph.iter().map(Vec::len).sum::<usize>() / 2;
     let pair_budget = proposal_budget.saturating_mul(32).max(16 * 16);
-    let table_target = if edge_count == 0 {
-        per_site_budget
-    } else {
-        ((pair_budget / edge_count).max(16 * 16) as f64).sqrt() as usize
+    let table_target = match pair_budget.checked_div(edge_count) {
+        None => per_site_budget,
+        Some(per_edge) => (per_edge.max(16 * 16) as f64).sqrt() as usize,
     };
     per_site_budget.min(table_target.max(minimum.max(16)))
 }
@@ -4852,7 +4857,7 @@ fn cookbook_compatible_pool_sample_with_options(
     // compatibility solve consumes the next round.  This replaces the old
     // fixed rescue pool without making a difficult case pay the largest
     // quadratic pair table up front.
-    let mut target = pool_target.min(16).max(1);
+    let mut target = pool_target.clamp(1, 16);
     let mut remaining = vec![max_attempts; sites.len()];
     let mut total_proposals = 0usize;
     let mut total_attempts_per_site = vec![0usize; sites.len()];
@@ -5112,8 +5117,8 @@ fn cookbook_compatible_pool_sample_once(
                     // pose budget in one marginal island, while a valid pose
                     // often needs the less-populated combination at the
                     // other marginal mode.
-                    if let Some(&(dominant_phi, dominant_psi, _)) = component_pairs.first() {
-                        if let Some(diverse_index) = component_pairs
+                    if let Some(&(dominant_phi, dominant_psi, _)) = component_pairs.first()
+                        && let Some(diverse_index) = component_pairs
                             .iter()
                             .enumerate()
                             .skip(1)
@@ -5127,9 +5132,8 @@ fn cookbook_compatible_pool_sample_once(
                                     .then_with(|| right.1.cmp(&left.1))
                             })
                             .map(|(index, _)| index)
-                        {
-                            component_pairs.swap(1, diverse_index);
-                        }
+                    {
+                        component_pairs.swap(1, diverse_index);
                     }
                     let mut candidates = Vec::new();
                     'rotamers: for &rotamer in &rotamers {
@@ -5730,6 +5734,9 @@ where
         )
     )
 )]
+// The GA fallback below is a `while` that runs at most once (it is seeded
+// once and reused by every chain) so that its early exits can `break`.
+#[allow(clippy::never_loop)]
 pub async fn sample_attached_ensemble_with_progress_cancel<C, P>(
     protein: &Structure,
     sites: &[SearchSite],
@@ -5839,7 +5846,7 @@ where
                     sites,
                     config,
                     &prepared,
-                    config.population_size.max(2).min(4),
+                    config.population_size.clamp(2, 4),
                     budget,
                 )?
                 .states
@@ -6256,14 +6263,13 @@ where
                     chain_psi_components = proposed_psi_components.clone();
                 }
                 structure = proposed_structure;
-                if config.pre_minimization {
-                    if let (Some(context), Some(value)) =
+                if config.pre_minimization
+                    && let (Some(context), Some(value)) =
                         (energy_context.as_ref(), proposed_energy.as_ref())
-                    {
-                        let mut system = context.system.clone();
-                        system.set_coordinates(&value.coordinates)?;
-                        structure.update_with_parameterized_hydrogens(&system)?;
-                    }
+                {
+                    let mut system = context.system.clone();
+                    system.set_coordinates(&value.coordinates)?;
+                    structure.update_with_parameterized_hydrogens(&system)?;
                 }
                 chain_energy = proposed_energy;
                 accepted_moves += 1;
@@ -6625,10 +6631,10 @@ fn sampled_frame_from_state(
         }
     }
     for atom in structure.iter_atoms() {
-        if let Some(&site_index) = residue_sites.get(&atom.residue) {
-            if let Some(coordinates) = coordinates_by_site.get_mut(site_index) {
-                coordinates.push(atom.position);
-            }
+        if let Some(&site_index) = residue_sites.get(&atom.residue)
+            && let Some(coordinates) = coordinates_by_site.get_mut(site_index)
+        {
+            coordinates.push(atom.position);
         }
     }
     for (index, (gene, site)) in state.iter().zip(sites).enumerate() {
@@ -7316,7 +7322,7 @@ pub fn linkage_priors_for_glycan(residue_name: &str, terminal_sugar: Option<&str
                         component(200.0, 3.0, 0.15),
                     ],
                     psi: vec![
-                        component(0.0, 1459.025_044_449_664, 0.80),
+                        component(0.0, 1_459.025_044_449_664, 0.80),
                         component(0.0, 2.0, 0.20),
                     ],
                 }
@@ -7328,7 +7334,7 @@ pub fn linkage_priors_for_glycan(residue_name: &str, terminal_sugar: Option<&str
                     component(200.0, 3.0, 0.15),
                 ],
                 psi: vec![
-                    component(0.0, 1459.025_044_449_664, 0.80),
+                    component(0.0, 1_459.025_044_449_664, 0.80),
                     component(0.0, 2.0, 0.20),
                 ],
             },
@@ -7744,6 +7750,14 @@ pub struct DunbrackRotamer {
     pub name: String,
     pub probability: f64,
     pub chi_degrees: Vec<f64>,
+}
+
+fn start_compute_stage() {}
+fn evaluate_candidate(
+    context: &EnergySearchContext,
+    structure: &Structure,
+) -> Result<CandidateEnergy> {
+    context.evaluate(structure)
 }
 
 #[cfg(test)]
@@ -9514,12 +9528,4 @@ mod tests {
         assert_eq!(offline.conformers[0].cluster_weight, 72.0);
         assert!(offline.provenance.starts_with("cache:"));
     }
-}
-
-fn start_compute_stage() {}
-fn evaluate_candidate(
-    context: &EnergySearchContext,
-    structure: &Structure,
-) -> Result<CandidateEnergy> {
-    context.evaluate(structure)
 }

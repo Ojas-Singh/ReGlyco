@@ -181,9 +181,11 @@ fn build_proposal_blocks(protein: &Structure, sites: &[SearchSite]) -> ProposalB
     for size in 3..=largest_group {
         enumerate_connected_groups(&graph, size, 0, &mut Vec::new(), &mut groups);
     }
-    let whole = (sites.len() > 1)
-        .then(|| (0..sites.len()).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let whole = if sites.len() > 1 {
+        (0..sites.len()).collect::<Vec<_>>()
+    } else {
+        Default::default()
+    };
     ProposalBlocks {
         singles,
         pairs,
@@ -546,8 +548,10 @@ where
     let beta = 1. / (0.001_987_204_1 * config.temperature_k);
     let mut restarts = 0;
     let mut states = Vec::new();
-    let mut geometry = GeometrySession::default();
-    geometry.scores_only = true;
+    let mut geometry = GeometrySession {
+        scores_only: true,
+        ..GeometrySession::default()
+    };
     let proposal_blocks = build_proposal_blocks(protein, sites);
     // Steric-only, no-rotamer sampling can keep the validated per-site poses
     // resident for each chain.  A proposal changes only the selected block,

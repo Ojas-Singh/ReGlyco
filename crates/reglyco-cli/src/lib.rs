@@ -887,10 +887,11 @@ fn run_ensemble(arguments: EnsembleArgs) -> anyhow::Result<()> {
             if !arguments.quiet {
                 eprintln!(
                     "ensemble: wrote sasa.pdb, real_sasa.pdb{}",
-                    arguments
-                        .calculate_hotspots
-                        .then_some(" and hotspots.pdb")
-                        .unwrap_or_default()
+                    if arguments.calculate_hotspots {
+                        " and hotspots.pdb"
+                    } else {
+                        Default::default()
+                    }
                 );
             }
         }
@@ -986,30 +987,30 @@ fn run_ensemble(arguments: EnsembleArgs) -> anyhow::Result<()> {
             report.analysis.protein_linkage_torsions.clear();
             report.analysis.sterics.clear();
         }
-        if config.scoring_mode != SearchScoringMode::StericPrior {
-            if let Some(first) = frames.first() {
-                let backend = match diagnostics.segments.as_slice() {
-                    [] => "CPU",
-                    [segment] => segment.backend.as_str(),
-                    _ => "Mixed",
-                };
-                match reglyco_ensemble::analyze_energy_structure(
-                    &sites,
-                    &first.sites,
-                    &first.structure,
-                    &builder,
-                    config.scoring_mode,
-                    config.use_obc2,
-                    config.energy_cutoff,
-                    backend,
-                ) {
-                    Ok(energy_analysis) => {
-                        report.analysis.energy_analysis = Some(energy_analysis);
-                    }
-                    Err(error) => report.warnings.push(format!(
-                        "Energy contribution analysis was unavailable for the ensemble output: {error}"
-                    )),
+        if config.scoring_mode != SearchScoringMode::StericPrior
+            && let Some(first) = frames.first()
+        {
+            let backend = match diagnostics.segments.as_slice() {
+                [] => "CPU",
+                [segment] => segment.backend.as_str(),
+                _ => "Mixed",
+            };
+            match reglyco_ensemble::analyze_energy_structure(
+                &sites,
+                &first.sites,
+                &first.structure,
+                &builder,
+                config.scoring_mode,
+                config.use_obc2,
+                config.energy_cutoff,
+                backend,
+            ) {
+                Ok(energy_analysis) => {
+                    report.analysis.energy_analysis = Some(energy_analysis);
                 }
+                Err(error) => report.warnings.push(format!(
+                    "Energy contribution analysis was unavailable for the ensemble output: {error}"
+                )),
             }
         }
         report.set_expected_clusters(&sites);
@@ -2016,15 +2017,15 @@ fn resolve_density_map(
         }
         return Ok(path);
     }
-    if let Some(arguments) = protein {
-        if let Some(identifier) = &arguments.pdb_id {
-            let provider = ProteinProvider::new(ProteinFetchOptions {
-                cache_dir: arguments.protein_cache.join("maps"),
-                offline: arguments.protein_offline,
-                ..ProteinFetchOptions::default()
-            })?;
-            return Ok(provider.fetch_eds_map(identifier)?);
-        }
+    if let Some(arguments) = protein
+        && let Some(identifier) = &arguments.pdb_id
+    {
+        let provider = ProteinProvider::new(ProteinFetchOptions {
+            cache_dir: arguments.protein_cache.join("maps"),
+            offline: arguments.protein_offline,
+            ..ProteinFetchOptions::default()
+        })?;
+        return Ok(provider.fetch_eds_map(identifier)?);
     }
     let input = input.ok_or_else(|| {
         anyhow::anyhow!(
@@ -2064,51 +2065,51 @@ fn resolve_density_map_for_refine(
         }
         return Ok((path, None));
     }
-    if let Some(arguments) = protein {
-        if let Some(identifier) = &arguments.pdb_id {
-            // PDBe EDS is the stable primary-map source used by the cached
-            // scientific regressions.  Automatic acquisition must not switch
-            // to the RCSB converted 2Fo-Fc representation merely because it
-            // happens to be available in the cache: those maps have different
-            // axes, normalization, and detail settings and therefore define a
-            // different optimization problem.  RCSB remains an explicit
-            // expert choice; it is only a fallback for `auto` when EDS cannot
-            // be acquired.
-            if matches!(source, DensityMapSourceArg::Rcsb) {
-                let cache_dir = arguments.protein_cache.join("maps");
-                match fetch_2fo_fc_map(identifier, &cache_dir, detail) {
-                    Ok(acquisition) => {
-                        return Ok((acquisition.converted_map_path.clone(), Some(acquisition)));
-                    }
-                    Err(error) => return Err(anyhow::anyhow!(error.to_string())),
-                }
-            }
-            let provider = ProteinProvider::new(ProteinFetchOptions {
-                cache_dir: arguments.protein_cache.join("maps"),
-                offline: arguments.protein_offline,
-                ..ProteinFetchOptions::default()
-            })?;
-            match provider.fetch_eds_map(identifier) {
-                Ok(path) => return Ok((path, None)),
-                Err(error) if matches!(source, DensityMapSourceArg::Auto) => {
-                    // Automatic mode is deterministic when EDS is present,
-                    // but still recovers gracefully for entries without an
-                    // EDS map by trying the explicitly documented RCSB
-                    // primary coefficients.
-                    eprintln!(
-                        "refine: warning: PDBe EDS acquisition failed ({error}); trying RCSB 2Fo-Fc"
-                    );
-                    let cache_dir = arguments.protein_cache.join("maps");
-                    let acquisition = fetch_2fo_fc_map(identifier, &cache_dir, detail)
-                        .map_err(|rcsb_error| {
-                            anyhow::anyhow!(
-                                "PDBe EDS failed ({error}); RCSB 2Fo-Fc fallback failed ({rcsb_error})"
-                            )
-                        })?;
+    if let Some(arguments) = protein
+        && let Some(identifier) = &arguments.pdb_id
+    {
+        // PDBe EDS is the stable primary-map source used by the cached
+        // scientific regressions.  Automatic acquisition must not switch
+        // to the RCSB converted 2Fo-Fc representation merely because it
+        // happens to be available in the cache: those maps have different
+        // axes, normalization, and detail settings and therefore define a
+        // different optimization problem.  RCSB remains an explicit
+        // expert choice; it is only a fallback for `auto` when EDS cannot
+        // be acquired.
+        if matches!(source, DensityMapSourceArg::Rcsb) {
+            let cache_dir = arguments.protein_cache.join("maps");
+            match fetch_2fo_fc_map(identifier, &cache_dir, detail) {
+                Ok(acquisition) => {
                     return Ok((acquisition.converted_map_path.clone(), Some(acquisition)));
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(anyhow::anyhow!(error.to_string())),
             }
+        }
+        let provider = ProteinProvider::new(ProteinFetchOptions {
+            cache_dir: arguments.protein_cache.join("maps"),
+            offline: arguments.protein_offline,
+            ..ProteinFetchOptions::default()
+        })?;
+        match provider.fetch_eds_map(identifier) {
+            Ok(path) => return Ok((path, None)),
+            Err(error) if matches!(source, DensityMapSourceArg::Auto) => {
+                // Automatic mode is deterministic when EDS is present,
+                // but still recovers gracefully for entries without an
+                // EDS map by trying the explicitly documented RCSB
+                // primary coefficients.
+                eprintln!(
+                    "refine: warning: PDBe EDS acquisition failed ({error}); trying RCSB 2Fo-Fc"
+                );
+                let cache_dir = arguments.protein_cache.join("maps");
+                let acquisition =
+                    fetch_2fo_fc_map(identifier, &cache_dir, detail).map_err(|rcsb_error| {
+                        anyhow::anyhow!(
+                            "PDBe EDS failed ({error}); RCSB 2Fo-Fc fallback failed ({rcsb_error})"
+                        )
+                    })?;
+                return Ok((acquisition.converted_map_path.clone(), Some(acquisition)));
+            }
+            Err(error) => return Err(error.into()),
         }
     }
     let path = resolve_density_map(value, input, protein)?;
