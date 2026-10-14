@@ -60,6 +60,10 @@ export interface TorsionObservation {
   phiDegrees?: number; psiDegrees?: number; omegaDegrees?: number;
   populationPercentile?: number; assessment: TorsionAssessment;
   nearestPopulation?: number; selectedPopulation?: number; policyVersion?: string;
+  /** Definitions φ/ψ/ω were measured with: those of the reference's GlycoShape entry
+   * ('glycoshape-v1': ψ C(x±1), ω C4–C5–C6–O6; 'glycoshape-v2': IUPAC, ω O5–C5–C6–O6),
+   * or ReGlyco's own ('glycoshape-v2') without a reference. */
+  angleConvention?: string; conventionsVersion?: number | null;
 }
 export interface AttachmentTorsionObservation {
   domain?: string; origin?: string; site: string; stage: string; frame?: number; phiDegrees: number; psiDegrees: number;
@@ -110,6 +114,9 @@ export interface TorsionReference {
   phiOmegaContours?: TorsionContour[]; phi_omega_contours?: TorsionContour[];
   psiOmegaContours?: TorsionContour[]; psi_omega_contours?: TorsionContour[];
   populations?: TorsionPopulation[]; contours?: TorsionContour[]; clusters?: TorsionClusterGrid[];
+  /** Torsion definitions of the GlycoShape entry (`torsions.conventions.version`); absent = version 1. */
+  angleConvention?: string; angle_convention?: string;
+  conventionsVersion?: number; conventions_version?: number;
 }
 export interface AttachmentVmmComponent {
   index: number; meanDegrees: number; concentration: number; weight: number;

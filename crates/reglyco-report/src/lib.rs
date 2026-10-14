@@ -15,6 +15,7 @@ use glysys::{ResidueId, Structure, Vec3};
 use petgraph::visit::EdgeRef;
 use plotters::coord::Shift;
 use plotters::prelude::*;
+use reglyco_core::torsion_conventions::{GlycoShapeTorsionConvention, SugarRing};
 use reglyco_core::{ClashStatus, SearchOutcome, SearchSite, SearchSiteResult};
 use reglyco_relax::RelaxationDiagnostics;
 use thiserror::Error;
@@ -316,7 +317,46 @@ pub struct TorsionReference {
     /// Highest-density thresholds for the optional ψ/ω projection.
     #[serde(default)]
     pub psi_omega_contours: Vec<TorsionContour>,
+    /// The torsion definitions of the reference's GlycoShape entry
+    /// (`glycoshape-v1`, `glycoshape-v2`); references served before they were
+    /// declared have neither field and version 1.
+    #[serde(
+        default,
+        alias = "angleConvention",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub angle_convention: Option<String>,
+    /// `torsions.conventions.version` of the reference's GlycoShape entry.
+    #[serde(
+        default,
+        alias = "conventionsVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub conventions_version: Option<u32>,
 }
+
+impl TorsionReference {
+    /// The definitions of the reference's φ, ψ and ω: its version, else its
+    /// label, else version 1; `None` for definitions this reader does not know.
+    pub fn torsion_convention(&self) -> Option<GlycoShapeTorsionConvention> {
+        match (self.conventions_version, self.angle_convention.as_deref()) {
+            (Some(version), _) => GlycoShapeTorsionConvention::from_version(u64::from(version)),
+            (None, Some(label)) => GlycoShapeTorsionConvention::from_label(label),
+            (None, None) => Some(GlycoShapeTorsionConvention::V1),
+        }
+    }
+
+    /// Whether the report's own torsions (IUPAC) can be placed in this
+    /// reference's populations.
+    fn matches_report_torsions(&self) -> bool {
+        self.torsion_convention() == Some(REPORT_TORSION_CONVENTION)
+    }
+}
+
+/// The definitions of the glycosidic torsions this report measures: the IUPAC
+/// ones, GlycoShape's version 2.
+pub const REPORT_TORSION_CONVENTION: GlycoShapeTorsionConvention =
+    GlycoShapeTorsionConvention::IUPAC;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TorsionObservation {
@@ -351,6 +391,10 @@ pub struct TorsionObservation {
     pub selected_population: Option<usize>,
     #[serde(default)]
     pub policy_version: String,
+    /// The definitions φ, ψ and ω were measured with (`glycoshape-v2`, the
+    /// IUPAC ones, for the report's own torsions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle_convention: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -659,6 +703,15 @@ impl WorkflowReport {
                 if observation.linkage != canonical_linkage {
                     continue;
                 }
+                // A reference with other torsion definitions (version 1: ψ
+                // and ω ~120° away for many linkages) cannot place the
+                // report's IUPAC torsions.
+                if !reference.matches_report_torsions() {
+                    observation.population_percentile = None;
+                    observation.assessment = TorsionAssessment::NoReference;
+                    observation.nearest_population = None;
+                    continue;
+                }
                 let percentile = torsion_percentile(
                     &reference,
                     observation.phi_degrees,
@@ -688,7 +741,8 @@ impl WorkflowReport {
             .analysis
             .torsion_references
             .iter()
-            .find(|reference| reference.canonical_linkage == canonical);
+            .find(|reference| reference.canonical_linkage == canonical)
+            .filter(|reference| reference.matches_report_torsions());
         let (percentile, assessment, nearest) = reference
             .map(|reference| {
                 let percentile =
@@ -758,6 +812,7 @@ impl WorkflowReport {
             nearest_population: nearest,
             selected_population: None,
             policy_version: "glycoshape-torsion-v1".into(),
+            angle_convention: Some(REPORT_TORSION_CONVENTION.label().into()),
         }
     }
 
@@ -1303,7 +1358,7 @@ fn torsions_csv(
     attachments: &[AttachmentTorsionObservation],
 ) -> String {
     let mut output = String::from(
-        "domain,origin,stage,frame,glycan_index,site,branch_path,linkage,phi_degrees,psi_degrees,omega_degrees,population_percentile,assessment,selected_population,selected_phi_component,selected_psi_component,involved_atoms,policy_version\n",
+        "domain,origin,stage,frame,glycan_index,site,branch_path,linkage,phi_degrees,psi_degrees,omega_degrees,population_percentile,assessment,selected_population,selected_phi_component,selected_psi_component,involved_atoms,policy_version,angle_convention\n",
     );
     for observation in observations {
         let row = [
@@ -1346,6 +1401,7 @@ fn torsions_csv(
             String::new(),
             csv_field(&observation.involved_atoms.join(";")),
             csv_field(&observation.policy_version),
+            csv_field(observation.angle_convention.as_deref().unwrap_or_default()),
         ];
         output.push_str(&row.join(","));
         output.push('\n');
@@ -1359,7 +1415,6 @@ fn torsions_csv(
                 .frame
                 .map(|frame| frame.to_string())
                 .unwrap_or_default(),
-            String::new(),
             String::new(),
             csv_field(&observation.site),
             String::new(),
@@ -1386,6 +1441,8 @@ fn torsions_csv(
                 .unwrap_or_default(),
             csv_field(&observation.involved_atoms.join(";")),
             csv_field(&observation.policy_version),
+            // ReGlyco's attachment torsions, not GlycoShape's.
+            String::new(),
         ];
         output.push_str(&row.join(","));
         output.push('\n');
@@ -1596,36 +1653,31 @@ fn glycosidic_torsions(structure: &Structure, frame: Option<usize>) -> Vec<Linka
             .and_then(|value| value.parse::<u8>().ok());
         let Some(position) = position else { continue };
         let acceptor_carbon = atom_position(structure, &acceptor.residue, &format!("C{position}"));
-        let previous = position
-            .checked_sub(1)
-            .and_then(|value| atom_position(structure, &acceptor.residue, &format!("C{value}")));
+        // The IUPAC definitions (GlycoShape's version 2): ψ = C1′–Ox–Cx–C(x−1),
+        // ω = O5–C5–C6–O6 for 1–6, O7–C7–C8–O8 for 2–8 … about every acceptor
+        // carbon outside the ring.
+        let acceptor_ring = report_sugar_ring(
+            residue_names
+                .get(&acceptor.residue)
+                .map(String::as_str)
+                .unwrap_or_default(),
+        );
+        let previous = REPORT_TORSION_CONVENTION
+            .psi_fourth_atom(acceptor_ring, position)
+            .and_then(|name| atom_position(structure, &acceptor.residue, &name));
         let phi = donor_ring
             .zip(acceptor_carbon)
             .map(|(ring, carbon)| dihedral(ring, donor.position, acceptor.position, carbon));
         let psi = acceptor_carbon.zip(previous).map(|(carbon, previous)| {
             dihedral(donor.position, acceptor.position, carbon, previous)
         });
-        let omega = (position == 6)
-            .then(|| {
-                let carbon = acceptor_carbon?;
-                let c5 = atom_position(structure, &acceptor.residue, "C5")?;
-                let acceptor_residue_name = residue_names
-                    .get(&acceptor.residue)
-                    .map(String::as_str)
-                    .unwrap_or_default();
-                let ring = if is_furanose_residue(acceptor_residue_name) {
-                    atom_position(structure, &acceptor.residue, "O4")
-                        .or_else(|| atom_position(structure, &acceptor.residue, "O5"))
-                } else if is_sialic_residue(acceptor_residue_name) {
-                    atom_position(structure, &acceptor.residue, "O6")
-                        .or_else(|| atom_position(structure, &acceptor.residue, "O5"))
-                } else {
-                    atom_position(structure, &acceptor.residue, "O5")
-                        .or_else(|| atom_position(structure, &acceptor.residue, "O6"))
-                }?;
-                Some(dihedral(acceptor.position, carbon, c5, ring))
-            })
-            .flatten();
+        let omega = REPORT_TORSION_CONVENTION
+            .omega_atoms(acceptor_ring, position)
+            .and_then(|names| {
+                let [first, second, third, fourth] =
+                    names.map(|name| atom_position(structure, &acceptor.residue, &name));
+                Some(dihedral(first?, second?, third?, fourth?))
+            });
         let glycan_index = structure
             .metadata()
             .glycan_trees
@@ -1686,6 +1738,20 @@ fn is_sialic_residue(name: &str) -> bool {
         name.trim().to_ascii_uppercase().as_str(),
         "SIA" | "NEU" | "NAN" | "NGC" | "KDN" | "KDO"
     )
+}
+
+/// The ring of a residue, by its PDB name, as far as the atoms of its
+/// torsions need it.
+fn report_sugar_ring(name: &str) -> SugarRing {
+    if is_sialic_residue(name) {
+        SugarRing::Ketopyranose
+    } else if name.trim().eq_ignore_ascii_case("FRU") {
+        SugarRing::Ketofuranose
+    } else if is_furanose_residue(name) {
+        SugarRing::Aldofuranose
+    } else {
+        SugarRing::Aldopyranose
+    }
 }
 
 fn is_acceptor_oxygen(name: &str, residue_name: &str) -> bool {
@@ -4454,6 +4520,212 @@ mod tests {
     #[test]
     fn typst_escaping_is_safe() {
         assert_eq!(typst_escape("#[a]"), "\\#\\[a\\]");
+    }
+
+    /// Gal(α1-6)Glc, the level-1 cluster-0 representative of GlycoShape's
+    /// DGalpa1-6DGlcpb1-OH analysed with GAP main (06d031a, torsion
+    /// definitions version 2): GAP stores φ 76.552°, ψ −178.044° and ω
+    /// −72.895° (O5–C5–C6–O6) for it.
+    const GAL_A16_GLC: &str = "\
+HETATM    3  C1  GLC G   2      19.290  17.564  13.524  1.00  0.00           C
+HETATM    5  O5  GLC G   2      18.142  18.192  14.171  1.00  0.00           O
+HETATM    6  C5  GLC G   2      16.986  17.196  14.308  1.00  0.00           C
+HETATM    8  C6  GLC G   2      15.745  17.893  14.914  1.00  0.00           C
+HETATM   12  C4  GLC G   2      17.345  15.869  15.036  1.00  0.00           C
+HETATM   14  O4  GLC G   2      16.256  14.917  14.947  1.00  0.00           O
+HETATM   16  C3  GLC G   2      18.689  15.293  14.423  1.00  0.00           C
+HETATM   18  O3  GLC G   2      19.147  14.218  15.382  1.00  0.00           O
+HETATM   20  C2  GLC G   2      19.813  16.347  14.285  1.00  0.00           C
+HETATM   22  O2  GLC G   2      20.939  15.767  13.575  1.00  0.00           O
+HETATM   23  O6  GLC G   2      15.997  18.139  16.350  1.00  0.00           O
+HETATM   24  C1  GLA G   3      14.856  18.766  17.066  1.00  0.00           C
+HETATM   26  C2  GLA G   3      15.367  19.422  18.400  1.00  0.00           C
+HETATM   28  C3  GLA G   3      15.750  18.319  19.427  1.00  0.00           C
+HETATM   30  C4  GLA G   3      14.595  17.312  19.662  1.00  0.00           C
+HETATM   32  C5  GLA G   3      14.162  16.721  18.265  1.00  0.00           C
+HETATM   34  C6  GLA G   3      12.990  15.699  18.469  1.00  0.00           C
+HETATM   37  O6  GLA G   3      12.670  15.035  17.312  1.00  0.00           O
+HETATM   39  O5  GLA G   3      13.796  17.807  17.350  1.00  0.00           O
+HETATM   40  O4  GLA G   3      13.473  18.010  20.209  1.00  0.00           O
+HETATM   42  O3  GLA G   3      16.122  18.883  20.690  1.00  0.00           O
+HETATM   44  O2  GLA G   3      16.511  20.353  18.111  1.00  0.00           O
+END
+";
+
+    fn gal_a16_glc() -> Structure {
+        let mut structure = glysys::read_pdb_str(
+            GAL_A16_GLC,
+            &glysys::BuildOptions {
+                add_water: false,
+                add_ions: false,
+                ..glysys::BuildOptions::default()
+            },
+        )
+        .unwrap();
+        let residue = |number| ResidueId {
+            chain: "G".into(),
+            number,
+            insertion_code: None,
+        };
+        structure
+            .metadata_mut()
+            .glycan_trees
+            .push(glysys::GlycanTree {
+                chain: "G".into(),
+                residue_ids: vec![residue(2), residue(3)],
+                attachment_site: None,
+            });
+        structure
+    }
+
+    fn empty_report() -> WorkflowReport {
+        WorkflowReport {
+            status: "complete".into(),
+            clash_status: None,
+            search: None,
+            relaxation: None,
+            provenance: Provenance::default(),
+            warnings: Vec::new(),
+            diagnostics: Vec::new(),
+            analysis: ReportAnalysis::default(),
+        }
+    }
+
+    #[test]
+    fn report_glycosidic_torsions_are_the_iupac_ones() {
+        let torsions = glycosidic_torsions(&gal_a16_glc(), None);
+        assert_eq!(torsions.len(), 1);
+        let torsion = &torsions[0];
+        // GlycoShape's version 2 values of this frame, within the three
+        // decimals of the PDB coordinates.
+        assert!((torsion.phi_degrees.unwrap() - 76.552).abs() < 0.05);
+        assert!((torsion.psi_degrees.unwrap() - -178.044).abs() < 0.1);
+        assert!((torsion.omega_degrees.unwrap() - -72.895).abs() < 0.1);
+
+        let mut report = empty_report();
+        report.analyze_structure(&gal_a16_glc());
+        assert_eq!(
+            report.analysis.torsion_observations[0]
+                .angle_convention
+                .as_deref(),
+            Some("glycoshape-v2")
+        );
+    }
+
+    #[test]
+    fn report_torsions_are_placed_only_in_references_of_their_definitions() {
+        let reference = |fields: serde_json::Value| -> TorsionReference {
+            let mut value = serde_json::json!({
+                "version": "glycoshape-torsion-v1",
+                "canonical_linkage": "GLA1-GLC6",
+                "phi_psi": { "bins": 2, "counts": [0, 0, 3, 1] },
+            });
+            for (key, item) in fields.as_object().unwrap() {
+                value[key] = item.clone();
+            }
+            serde_json::from_value(value).unwrap()
+        };
+        assert_eq!(
+            reference(serde_json::json!({})).torsion_convention(),
+            Some(GlycoShapeTorsionConvention::V1)
+        );
+        assert_eq!(
+            reference(serde_json::json!({ "angleConvention": "glycoshape-v2" }))
+                .torsion_convention(),
+            Some(GlycoShapeTorsionConvention::V2)
+        );
+        assert_eq!(
+            reference(serde_json::json!({ "conventions_version": 7 })).torsion_convention(),
+            None
+        );
+
+        for (fields, assessed) in [
+            (serde_json::json!({}), false),
+            (
+                serde_json::json!({ "angle_convention": "glycoshape-v1" }),
+                false,
+            ),
+            (serde_json::json!({ "conventions_version": 1 }), false),
+            (
+                serde_json::json!({ "angle_convention": "glycoshape-v2" }),
+                true,
+            ),
+            (serde_json::json!({ "conventions_version": 2 }), true),
+        ] {
+            // A reference added after the observations ...
+            let mut report = empty_report();
+            report.analyze_structure(&gal_a16_glc());
+            report.add_torsion_reference(reference(fields.clone()));
+            let observation = &report.analysis.torsion_observations[0];
+            assert_eq!(
+                observation.population_percentile.is_some(),
+                assessed,
+                "{fields}"
+            );
+            assert_eq!(
+                observation.assessment != TorsionAssessment::NoReference,
+                assessed,
+                "{fields}"
+            );
+            // ... and one present before.
+            let mut report = empty_report();
+            report.add_torsion_reference(reference(fields.clone()));
+            report.analyze_structure(&gal_a16_glc());
+            let observation = &report.analysis.torsion_observations[0];
+            assert_eq!(
+                observation.population_percentile.is_some(),
+                assessed,
+                "{fields}"
+            );
+        }
+    }
+
+    #[test]
+    fn torsion_csv_rows_have_the_header_columns() {
+        let mut report = empty_report();
+        report.analyze_structure(&gal_a16_glc());
+        report
+            .analysis
+            .attachment_observations
+            .push(AttachmentTorsionObservation {
+                domain: "attachment".into(),
+                origin: "accepted".into(),
+                site: "A:1".into(),
+                stage: "result".into(),
+                frame: None,
+                phi_degrees: -80.0,
+                psi_degrees: 180.0,
+                glycan_index: None,
+                linkage: None,
+                involved_atoms: Vec::new(),
+                population_percentile: None,
+                assessment: TorsionAssessment::NoReference,
+                selected_phi_component: None,
+                selected_psi_component: None,
+                policy_version: "glycoshape-attachment-vmm-v1".into(),
+            });
+        let csv = torsions_csv(
+            &report.analysis.torsion_observations,
+            &report.analysis.attachment_observations,
+        );
+        let mut lines = csv.lines();
+        let header = lines.next().unwrap().split(',').collect::<Vec<_>>();
+        assert_eq!(header.last(), Some(&"angle_convention"));
+        let rows = lines
+            .map(|line| line.split(',').collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.len(), header.len());
+        }
+        let column = |name: &str| header.iter().position(|item| *item == name).unwrap();
+        assert_eq!(rows[0][column("angle_convention")], "glycoshape-v2");
+        assert_eq!(rows[1][column("site")], "A:1");
+        assert_eq!(rows[1][column("phi_degrees")], "-80");
+        assert_eq!(
+            rows[1][column("policy_version")],
+            "glycoshape-attachment-vmm-v1"
+        );
     }
 
     #[test]
