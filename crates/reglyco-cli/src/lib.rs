@@ -2295,7 +2295,7 @@ fn discover_glycan_sites(
                 .and_then(serde_json::Value::as_str)
                 .is_none_or(|value| value.trim().is_empty())
             {
-                let iupac = write_iupac_condensed_canonical(&glycan.graph)?;
+                let iupac = topology_iupac(&glycan.graph)?;
                 if provider.offline && from_cache {
                     anyhow::bail!(
                         "GlycoShape topology cache contains no resolvable identifier for {canonical}"
@@ -2314,8 +2314,8 @@ fn discover_glycan_sites(
                 .ok_or_else(|| anyhow::anyhow!("resolver returned no WURCS for {canonical}"))?;
             let reparsed = parse_wurcs(resolved_wurcs)
                 .map_err(|error| anyhow::anyhow!("resolver returned invalid WURCS: {error}"))?;
-            let deposited_iupac = write_iupac_condensed_canonical(&glycan.graph)?;
-            let resolved_iupac = write_iupac_condensed_canonical(&reparsed)?;
+            let deposited_iupac = topology_iupac(&glycan.graph)?;
+            let resolved_iupac = topology_iupac(&reparsed)?;
             // Run this check for both network responses and cached resolver
             // records.  A stale or manually edited cache must never bypass
             // the atomic preflight and cause a topology-incompatible
@@ -2336,8 +2336,7 @@ fn discover_glycan_sites(
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
                 .unwrap_or_else(|| {
-                    write_iupac_condensed_canonical(&glycan.graph)
-                        .unwrap_or_else(|_| canonical.clone())
+                    topology_iupac(&glycan.graph).unwrap_or_else(|_| canonical.clone())
                 });
             let glycoshape_id = value
                 .get("glycoshape_id")
@@ -2382,6 +2381,36 @@ fn discover_glycan_sites(
         anyhow::bail!("no supported protein-linked carbohydrate attachment was found");
     }
     Ok(discovered)
+}
+
+/// IUPAC condensed of a glycan without its reducing-end anomer.
+///
+/// crabWURCS writes the anomer of the reducing end when the WURCS declares it
+/// (`Gal(b1-4)GlcNAc(b1-`, since 0.3.2), but GlycoShape records may leave it
+/// open (`u2122h`), and a deposited glycan's attachment anomer is taken from
+/// the deposited graph separately. The resolver query and the topology check
+/// therefore compare the glycan itself, as they did before 0.3.2.
+fn topology_iupac(graph: &crabwurcs_core::ResidueGraph) -> anyhow::Result<String> {
+    let iupac = write_iupac_condensed_canonical(graph)?;
+    Ok(without_reducing_end_anomer(&iupac).to_owned())
+}
+
+/// `Gal(b1-4)GlcNAc(b1-` -> `Gal(b1-4)GlcNAc`; other strings unchanged.
+fn without_reducing_end_anomer(iupac: &str) -> &str {
+    let Some(open) = iupac.rfind('(') else {
+        return iupac;
+    };
+    let Some(linkage) = iupac[open + 1..].strip_suffix('-') else {
+        return iupac;
+    };
+    let mut characters = linkage.chars();
+    let anomer = matches!(characters.next(), Some('a' | 'b' | '?'));
+    let position = characters.as_str();
+    if anomer && !position.is_empty() && position.chars().all(|c| c.is_ascii_digit()) {
+        &iupac[..open]
+    } else {
+        iupac
+    }
 }
 
 fn pdb_attachment_links(
@@ -2888,9 +2917,32 @@ mod tests {
     use glysys::{AtomId, BuildOptions, GlycanTree, GlycosylationSite, ResidueId, read_pdb_str};
 
     use super::{
-        Cli, Command, ObjectiveArg, OutputFormatArg, glycan_atom_count, parse_site,
-        validate_cookbook_scan_config, verify_relaxed_glycans,
+        Cli, Command, ObjectiveArg, OutputFormatArg, glycan_atom_count, parse_site, topology_iupac,
+        validate_cookbook_scan_config, verify_relaxed_glycans, without_reducing_end_anomer,
     };
+
+    #[test]
+    fn topology_iupac_ignores_the_reducing_end_anomer() {
+        let declared =
+            crabwurcs_core::parse_wurcs("WURCS=2.0/1,2,1/[a2122h-1b_1-5_2*NCC/3=O]/1-1/a4-b1")
+                .unwrap();
+        let open = crabwurcs_core::parse_wurcs(
+            "WURCS=2.0/2,2,1/[u2122h_2*NCC/3=O][a2122h-1b_1-5_2*NCC/3=O]/1-2/a4-b1",
+        )
+        .unwrap();
+        assert_eq!(
+            crabwurcs_iupac::write_iupac_condensed_canonical(&declared).unwrap(),
+            "GlcNAc(b1-4)GlcNAc(b1-"
+        );
+        assert_eq!(topology_iupac(&declared).unwrap(), "GlcNAc(b1-4)GlcNAc");
+        assert_eq!(topology_iupac(&open).unwrap(), "GlcNAc(b1-4)GlcNAc");
+        assert_eq!(without_reducing_end_anomer("Neu5Ac(a2-"), "Neu5Ac");
+        assert_eq!(without_reducing_end_anomer("Man(?1-"), "Man");
+        assert_eq!(
+            without_reducing_end_anomer("Gal(b1-4)GlcNAc"),
+            "Gal(b1-4)GlcNAc"
+        );
+    }
 
     #[test]
     fn parses_site_selectors() {
