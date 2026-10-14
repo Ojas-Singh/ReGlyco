@@ -22,12 +22,15 @@ const GRID_CELL: f64 = 1.7;
 #[derive(Debug, Clone)]
 struct Pose {
     coordinates: Vec<Vec3>,
-    /// Number of attachment-proximal atoms ignored by the Cookbook steric
-    /// scorer (C1 plus its immediate linkage neighbors).
-    excluded_prefix: usize,
     target_b: Vec3,
     target_link: Vec3,
     psi_base: f64,
+    /// The glycan atom bonded to the protein (C1, or C2 of a ketose). It is
+    /// the only glycan atom the steric test skips: its distance to the link
+    /// atom is the bond itself. Every other atom, H1 included, is tested
+    /// (the next nearest pairs across the bond, such as H1 or O5 to ND2, are
+    /// about 2.0 to 2.4 A apart). The protein set has no hydrogens, as the
+    /// PDB reader discards protein hydrogens, so none sits on the link atom.
     c1_atom: usize,
     o5_atom: usize,
 }
@@ -37,6 +40,9 @@ struct PreparedSite {
     poses: Vec<Vec<Pose>>,
     rotamer_updates: Vec<Vec<(usize, Vec3)>>,
     rotamer_probabilities: Vec<f64>,
+    /// Protein atoms of the glycosylated residue. A side chain turned to a
+    /// library rotamer is tested against every other protein atom.
+    residue_atoms: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,13 +112,17 @@ pub struct PreparedEvaluation {
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedSitePose {
     coordinates: Arc<Vec<Vec3>>,
-    excluded_prefix: usize,
+    /// Index of the glycan atom bonded to the protein (see [`Pose::c1_atom`]).
+    attachment_atom: usize,
     grid: Arc<SpatialGrid>,
     bounds: Option<([f64; 3], [f64; 3])>,
 }
 
-fn pose_bounds(coordinates: &[Vec3], excluded_prefix: usize) -> Option<([f64; 3], [f64; 3])> {
-    let mut atoms = coordinates.iter().skip(excluded_prefix);
+/// Bounding box of every atom of a pose. A pose is tested with all of its
+/// atoms when it is the second partner of a glycan/glycan test, so the box
+/// must include the attachment atom too.
+fn pose_bounds(coordinates: &[Vec3]) -> Option<([f64; 3], [f64; 3])> {
+    let mut atoms = coordinates.iter();
     let first = atoms.next()?;
     let mut low = [first.x, first.y, first.z];
     let mut high = low;
@@ -260,10 +270,17 @@ impl PreparedAttachmentContext {
                     .collect::<Result<Vec<_>, _>>()?;
                 poses.push(conformer_poses);
             }
+            let residue_atoms = protein
+                .atoms()
+                .into_iter()
+                .filter(|atom| atom.residue == site.site.residue)
+                .filter_map(|atom| atoms.iter().position(|flat| flat.id == atom.id))
+                .collect::<Vec<_>>();
             prepared_sites.push(PreparedSite {
                 poses,
                 rotamer_updates,
                 rotamer_probabilities,
+                residue_atoms,
             });
         }
 
@@ -328,12 +345,12 @@ impl PreparedAttachmentContext {
         let coordinates = transform_pose(pose, gene.phi, gene.psi)?;
 
         if rotamer != 0 {
-            let mut protein_coordinates = self.protein_coordinates.clone();
-            for &(index, position) in site
+            let updates = site
                 .rotamer_updates
                 .get(rotamer)
-                .ok_or(ReGlycoError::InvalidGeometry)?
-            {
+                .ok_or(ReGlycoError::InvalidGeometry)?;
+            let mut protein_coordinates = self.protein_coordinates.clone();
+            for &(index, position) in updates {
                 protein_coordinates[index] = position;
             }
             // This local grid lives only for the score below.
@@ -341,34 +358,83 @@ impl PreparedAttachmentContext {
             // no-rotamer path.
             let dynamic_grid =
                 SpatialGrid::build(&protein_coordinates, self.protein_indices.iter().copied());
-            let score = protein_score(
-                &coordinates,
-                pose.excluded_prefix,
+            let mut score = sidechain_score(
+                updates,
+                &site.residue_atoms,
                 &protein_coordinates,
                 &dynamic_grid,
                 clash_distance,
             );
+            if score <= 2.0 {
+                score = score.max(protein_score(
+                    &coordinates,
+                    pose.c1_atom,
+                    &protein_coordinates,
+                    &dynamic_grid,
+                    clash_distance,
+                ));
+            }
             return Ok((score <= 1.1).then(|| PreparedSitePose {
                 grid: Arc::new(SpatialGrid::build(&coordinates, 0..coordinates.len())),
-                bounds: pose_bounds(&coordinates, pose.excluded_prefix),
+                bounds: pose_bounds(&coordinates),
                 coordinates: Arc::new(coordinates),
-                excluded_prefix: pose.excluded_prefix,
+                attachment_atom: pose.c1_atom,
             }));
         }
 
         let score = protein_score(
             &coordinates,
-            pose.excluded_prefix,
+            pose.c1_atom,
             &self.protein_coordinates,
             &self.static_grid,
             clash_distance,
         );
         Ok((score <= 1.1).then(|| PreparedSitePose {
             grid: Arc::new(SpatialGrid::build(&coordinates, 0..coordinates.len())),
-            bounds: pose_bounds(&coordinates, pose.excluded_prefix),
+            bounds: pose_bounds(&coordinates),
             coordinates: Arc::new(coordinates),
-            excluded_prefix: pose.excluded_prefix,
+            attachment_atom: pose.c1_atom,
         }))
+    }
+
+    /// Steric score of the side chains that `state` turns to library
+    /// rotamers, each against every protein atom outside its own residue, in
+    /// the protein frame of the whole state. 1.0 per site that keeps the side
+    /// chain as given. The GPU kernel scores glycan atoms only; its callers
+    /// combine its scores with these.
+    #[cfg_attr(not(feature = "webgpu"), allow(dead_code))]
+    pub(crate) fn sidechain_scores(
+        &self,
+        state: &[Gene],
+        clash_distance: f64,
+    ) -> Result<Vec<f64>, ReGlycoError> {
+        if state.len() != self.sites.len() {
+            return Err(ReGlycoError::InvalidGeometry);
+        }
+        if state.iter().all(|gene| gene.rotamer.is_none()) {
+            return Ok(vec![1.0; state.len()]);
+        }
+        let (protein_coordinates, grid) = self.protein_frame(state)?;
+        state
+            .iter()
+            .zip(&self.sites)
+            .map(|(gene, site)| {
+                let Some(rotamer) = gene.rotamer else {
+                    return Ok(1.0);
+                };
+                let updates = site
+                    .rotamer_updates
+                    .get(rotamer + 1)
+                    .ok_or(ReGlycoError::InvalidGeometry)?;
+                Ok(sidechain_score(
+                    updates,
+                    &site.residue_atoms,
+                    &protein_coordinates,
+                    &grid,
+                    clash_distance,
+                ))
+            })
+            .collect()
     }
 
     pub(crate) fn site_poses_compatible(
@@ -394,9 +460,8 @@ impl PreparedAttachmentContext {
         let cell_radius = (clash_distance / GRID_CELL).ceil().max(1.0) as i32;
         pair_score(
             &first.coordinates,
-            first.excluded_prefix,
+            first.attachment_atom,
             &second.coordinates,
-            Some(second.excluded_prefix),
             clash_distance,
             cell_radius,
             &second.grid,
@@ -583,7 +648,7 @@ impl PreparedAttachmentContext {
             .map(|(index, (pose, current_coordinates))| {
                 let mut score = 1.0;
                 for (atom_index, position) in current_coordinates.iter().enumerate() {
-                    if atom_index < pose.excluded_prefix {
+                    if atom_index == pose.c1_atom {
                         continue;
                     }
                     candidates.clear();
@@ -603,15 +668,30 @@ impl PreparedAttachmentContext {
                         break;
                     }
                 }
+                if let Some(rotamer) = state[index].rotamer
+                    && score <= 2.0
+                {
+                    let site = &self.sites[index];
+                    let updates = site
+                        .rotamer_updates
+                        .get(rotamer + 1)
+                        .map_or(&[][..], Vec::as_slice);
+                    score = score.max(sidechain_score(
+                        updates,
+                        &site.residue_atoms,
+                        protein_coordinates,
+                        grid,
+                        clash_distance,
+                    ));
+                }
                 for (other_index, other_coordinates) in coordinates.iter().enumerate() {
                     if other_index == index || score > 2.0 {
                         continue;
                     }
                     score = score.max(pair_score(
                         current_coordinates,
-                        pose.excluded_prefix,
+                        pose.c1_atom,
                         other_coordinates,
-                        Some(poses[other_index].excluded_prefix),
                         clash_distance,
                         cell_radius,
                         &glycan_grids[other_index],
@@ -657,43 +737,126 @@ impl PreparedAttachmentContext {
 mod bounds_tests {
     use super::*;
 
-    fn candidate(points: &[[f64; 3]], excluded_prefix: usize) -> PreparedSitePose {
-        let coordinates = points
-            .iter()
-            .map(|point| Vec3 {
-                x: point[0],
-                y: point[1],
-                z: point[2],
-            })
-            .collect::<Vec<_>>();
+    fn point(value: [f64; 3]) -> Vec3 {
+        Vec3 {
+            x: value[0],
+            y: value[1],
+            z: value[2],
+        }
+    }
+
+    fn candidate(points: &[[f64; 3]], attachment_atom: usize) -> PreparedSitePose {
+        let coordinates = points.iter().copied().map(point).collect::<Vec<_>>();
         PreparedSitePose {
-            bounds: pose_bounds(&coordinates, excluded_prefix),
+            bounds: pose_bounds(&coordinates),
             grid: Arc::new(SpatialGrid::build(&coordinates, 0..coordinates.len())),
             coordinates: Arc::new(coordinates),
-            excluded_prefix,
+            attachment_atom,
         }
     }
 
     #[test]
-    fn pair_bounds_preserve_clash_decisions_and_ignore_attachment_prefix() {
+    fn pair_bounds_preserve_clash_decisions_and_skip_only_the_own_attachment_atom() {
         let context = PreparedAttachmentContext {
             protein_coordinates: Vec::new(),
             protein_indices: Vec::new(),
             static_grid: SpatialGrid::build(&[], std::iter::empty()),
             sites: Vec::new(),
         };
-        let first = candidate(&[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], 1);
-        let far = candidate(&[[10.0, 0.0, 0.0], [20.0, 0.0, 0.0]], 1);
-        let near = candidate(&[[0.0, 0.0, 0.0], [10.5, 0.0, 0.0]], 1);
+        let first = candidate(&[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], 0);
+        let far = candidate(&[[30.0, 0.0, 0.0], [20.0, 0.0, 0.0]], 0);
+        let near = candidate(&[[30.0, 0.0, 0.0], [10.5, 0.0, 0.0]], 0);
         assert!(context.site_poses_compatible(&first, &far, 1.7));
         assert!(!context.site_poses_compatible(&first, &near, 1.7));
-        assert!(context.site_poses_compatible(&first, &candidate(&[[10.0, 0.0, 0.0]], 1), 1.7));
+        // The other glycan's attachment atom is not bonded to this glycan,
+        // so it is tested (here it lies 0.5 A from a tested atom).
+        let other_attachment = candidate(&[[10.5, 0.0, 0.0], [30.0, 0.0, 0.0]], 0);
+        assert!(!context.site_poses_compatible(&first, &other_attachment, 1.7));
+        // Only the own attachment atom (index 0 of `first`) is skipped.
+        assert!(context.site_poses_compatible(
+            &first,
+            &candidate(&[[0.5, 0.0, 0.0], [30.0, 0.0, 0.0]], 1),
+            1.7
+        ));
     }
+
+    #[test]
+    fn protein_test_skips_the_attachment_atom_by_identity_not_by_position() {
+        let protein = vec![point([0.0, 0.0, 0.0])];
+        let grid = SpatialGrid::build(&protein, 0..1);
+        // A protein atom 1.0 A from the second glycan atom: a clash whether
+        // the attachment atom is first or last in the pose.
+        let pose = [
+            point([5.0, 0.0, 0.0]),
+            point([1.0, 0.0, 0.0]),
+            point([9.0, 0.0, 0.0]),
+        ];
+        assert!(protein_score(&pose, 0, &protein, &grid, 1.7) > 2.0);
+        assert!(protein_score(&pose, 2, &protein, &grid, 1.7) > 2.0);
+        // Nothing but the attachment atom near the protein: no clash.
+        assert_eq!(protein_score(&pose, 1, &protein, &grid, 1.7), 1.0);
+    }
+
+    #[test]
+    fn turned_side_chain_is_tested_against_other_residues_only() {
+        // Indices 0 and 1: the glycosylated residue; 2: another residue.
+        let protein = vec![
+            point([0.0, 0.0, 0.0]),
+            point([1.0, 0.0, 0.0]),
+            point([5.0, 0.0, 0.0]),
+        ];
+        let grid = SpatialGrid::build(&protein, 0..3);
+        let own = vec![0, 1];
+        // Moved atom 1.2 A from its own residue's atom: not a clash.
+        assert_eq!(
+            sidechain_score(&[(1, point([1.2, 0.0, 0.0]))], &own, &protein, &grid, 1.7),
+            1.0
+        );
+        // Moved atom 1.0 A from another residue's atom: a clash.
+        let mut moved = protein.clone();
+        moved[1] = point([4.0, 0.0, 0.0]);
+        let moved_grid = SpatialGrid::build(&moved, 0..3);
+        assert!(sidechain_score(&[(1, moved[1])], &own, &moved, &moved_grid, 1.7) > 2.0);
+    }
+}
+
+/// Steric score of the moved atoms of a turned side chain against every
+/// protein atom outside the glycosylated residue (`own`, sorted indices), in
+/// the frame that already carries the move. Same contact rule and score as
+/// the glycan tests.
+fn sidechain_score(
+    updates: &[(usize, Vec3)],
+    own: &[usize],
+    protein_coordinates: &[Vec3],
+    grid: &SpatialGrid,
+    clash_distance: f64,
+) -> f64 {
+    let threshold2 = clash_distance * clash_distance;
+    let cell_radius = (clash_distance / GRID_CELL).ceil().max(1.0) as i32;
+    let mut candidates = Vec::with_capacity(64);
+    let mut score = 1.0;
+    for &(_, position) in updates {
+        candidates.clear();
+        grid.append_candidates(position, cell_radius, &mut candidates);
+        for &protein_index in &candidates {
+            if own.binary_search(&protein_index).is_ok() {
+                continue;
+            }
+            let distance2 = squared_distance(position, protein_coordinates[protein_index]);
+            if distance2 < threshold2 {
+                score += 200.0 * (-distance2).exp();
+                if score > 2.0 {
+                    return score;
+                }
+            }
+        }
+    }
+    score
 }
 
 fn protein_score(
     coordinates: &[Vec3],
-    excluded_prefix: usize,
+    attachment_atom: usize,
     protein_coordinates: &[Vec3],
     grid: &SpatialGrid,
     clash_distance: f64,
@@ -703,7 +866,7 @@ fn protein_score(
     let mut candidates = Vec::with_capacity(64);
     let mut score = 1.0;
     for (atom_index, position) in coordinates.iter().enumerate() {
-        if atom_index < excluded_prefix {
+        if atom_index == attachment_atom {
             continue;
         }
         candidates.clear();
@@ -760,10 +923,8 @@ fn make_conformer_pose_from_reference(
         (-base_phi).to_radians(),
     )?;
     let psi_base = dihedral_degrees(target_a, target_b, target_link, coordinates[c1_atom]);
-    let excluded_prefix = 3.min(coordinates.len());
     Ok(Pose {
         coordinates,
-        excluded_prefix,
         target_b,
         target_link,
         c1_atom,
@@ -813,11 +974,12 @@ fn rotate_all(
     Ok(())
 }
 
+/// Glycan/glycan steric score: every atom of `first` except its attachment
+/// atom against every atom of `second` (no bond joins two glycans).
 fn pair_score(
     first: &[Vec3],
-    excluded_first: usize,
+    first_attachment_atom: usize,
     second: &[Vec3],
-    excluded_second: Option<usize>,
     threshold: f64,
     cell_radius: i32,
     grid: &SpatialGrid,
@@ -827,7 +989,7 @@ fn pair_score(
     let threshold2 = threshold * threshold;
     let mut score = 1.0;
     for (first_index, first_position) in first.iter().enumerate() {
-        if first_index < excluded_first {
+        if first_index == first_attachment_atom {
             continue;
         }
         if let Some((low, high)) = second_bounds {
@@ -844,9 +1006,6 @@ fn pair_score(
         candidates.clear();
         grid.append_candidates(*first_position, cell_radius, &mut candidates);
         for &second_index in &candidates {
-            if second_index < excluded_second.unwrap_or(0) {
-                continue;
-            }
             let second_position = &second[second_index];
             let distance2 = squared_distance(*first_position, *second_position);
             if distance2 < threshold2 {
@@ -1006,26 +1165,36 @@ impl PreparedAttachmentContext {
                 }
                 let end = library.updates.len() as u32;
                 for pose in poses {
-                    if pose.coordinates.len() != count {
+                    if pose.coordinates.len() != count || pose.c1_atom >= count {
                         return Err(ReGlycoError::InvalidGeometry);
                     }
                     conformers.push(library.poses.len() as u32);
                     let mut link = point(pose.target_link);
                     link[3] = pose.psi_base.to_radians() as f32;
+                    // The kernel skips a leading run of atoms (`bounds[2]`).
+                    // Put the attachment atom first and skip just that one,
+                    // so the GPU tests the same atoms as the CPU reference.
+                    let o5_atom = if pose.o5_atom < pose.c1_atom {
+                        pose.o5_atom + 1
+                    } else {
+                        pose.o5_atom
+                    };
                     library.poses.push(AttachmentPose {
-                        bounds: [
-                            library.coordinates.len() as u32,
-                            count as u32,
-                            pose.excluded_prefix as u32,
-                            pose.c1_atom as u32,
-                        ],
-                        indices: [pose.o5_atom as u32, start, end, 0],
+                        bounds: [library.coordinates.len() as u32, count as u32, 1, 0],
+                        indices: [o5_atom as u32, start, end, 0],
                         b: point(pose.target_b),
                         link,
                     });
                     library
                         .coordinates
-                        .extend(pose.coordinates.iter().copied().map(point));
+                        .push(point(pose.coordinates[pose.c1_atom]));
+                    library.coordinates.extend(
+                        pose.coordinates
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| *index != pose.c1_atom)
+                            .map(|(_, position)| point(*position)),
+                    );
                 }
                 rotations.push(conformers);
             }
