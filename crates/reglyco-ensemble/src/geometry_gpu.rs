@@ -210,10 +210,19 @@ pub(super) async fn evaluate_population_async(
         .zip(scores.chunks_exact(sites))
         .zip(conformations)
     {
-        // Boundary decisions are always made by the same f64 reference.
-        if values
-            .iter()
-            .any(|v| *v < 0. || (*v - 1.1).abs() < 0.003 || (*v - 2.).abs() < 0.003)
+        // Boundary decisions are always made by the same f64 reference. The
+        // kernel scores glycan atoms only, so a candidate whose turned side
+        // chain touches another residue is scored by the reference as well.
+        let sidechain_contact = c.genes.iter().any(|gene| gene.rotamer.is_some())
+            && problem
+                .prepared
+                .sidechain_scores(&c.genes, problem.clash_distance)?
+                .iter()
+                .any(|score| *score > 1.0);
+        if sidechain_contact
+            || values
+                .iter()
+                .any(|v| *v < 0. || (*v - 1.1).abs() < 0.003 || (*v - 2.).abs() < 0.003)
         {
             let cpu_started = Instant::now();
             if session.scores_only {

@@ -40,7 +40,7 @@ use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
-use glysys::{BuildOptions, ResidueId, Structure, Vec3, read_pdb_str};
+use glysys::{AtomId, BuildOptions, ResidueId, Structure, Vec3, read_pdb_str};
 use glysys_energy::prior::CircularMixture;
 use glysys_energy::{AtomGroupMask, EnergyComponents, EnergyEvaluator, EnergyOptions, Obc2Options};
 use glysys_opt::{
@@ -6867,9 +6867,58 @@ pub fn steric_score(structure: &Structure, clash_distance: f64) -> f64 {
         .fold(1.0, f64::max)
 }
 
+/// The atoms at each glycan's bond to the protein, found by identity for the
+/// steric test of a complete structure.
+struct BondAtoms {
+    /// Per glycan tree: the glycan atom bonded to the protein (C1, or C2 of a
+    /// ketose), named by the tree's glycosylation-site record. It is the only
+    /// glycan atom the steric test skips.
+    attachment: Vec<Option<AtomId>>,
+    /// Per glycan tree: the position of the protein link atom.
+    link_position: Vec<Option<Vec3>>,
+}
+
+impl BondAtoms {
+    fn new(structure: &Structure) -> Self {
+        let metadata = structure.metadata();
+        let sites = &metadata.glycosylation_sites;
+        let mut attachment = Vec::with_capacity(metadata.glycan_trees.len());
+        let mut link_position = Vec::with_capacity(metadata.glycan_trees.len());
+        for (tree_index, tree) in metadata.glycan_trees.iter().enumerate() {
+            let site = sites
+                .iter()
+                .find(|site| tree.residue_ids.contains(&site.glycan_residue));
+            attachment.push(match site {
+                Some(site) => structure.find_atom(&site.glycan_residue, &site.glycan_atom),
+                // A tree without a site record: its reducing-end anomeric
+                // carbon, C1 (C2 of a ketose).
+                None => tree.residue_ids.first().and_then(|root| {
+                    structure
+                        .find_atom(root, "C1")
+                        .or_else(|| structure.find_atom(root, "C2"))
+                }),
+            });
+            link_position.push(
+                site.or_else(|| sites.get(tree_index))
+                    .and_then(|site| structure.find_atom(&site.protein_residue, &site.protein_atom))
+                    .and_then(|atom| structure.atom_position(atom)),
+            );
+        }
+        Self {
+            attachment,
+            link_position,
+        }
+    }
+}
+
 /// Compute the Cookbook-compatible steric score for each attached glycan.
+///
+/// Every glycan atom is tested except the one bonded to the protein (found by
+/// identity, see [`BondAtoms`]): against the protein, and against every atom
+/// of the other glycans.
 pub fn steric_site_scores(structure: &Structure, clash_distance: f64) -> Vec<f64> {
     let trees = &structure.metadata().glycan_trees;
+    let bond = BondAtoms::new(structure);
     let mut residue_trees = HashMap::<&ResidueId, Vec<usize>>::new();
     for (tree_index, tree) in trees.iter().enumerate() {
         for residue in &tree.residue_ids {
@@ -6878,6 +6927,7 @@ pub fn steric_site_scores(structure: &Structure, clash_distance: f64) -> Vec<f64
     }
     // One residue lookup per atom; membership of every tree follows from it.
     let mut positions = Vec::new();
+    let mut ids = Vec::new();
     let mut is_glycan = Vec::new();
     let mut tree_members = vec![Vec::new(); trees.len()];
     for atom in structure.iter_atoms() {
@@ -6885,6 +6935,7 @@ pub fn steric_site_scores(structure: &Structure, clash_distance: f64) -> Vec<f64
             .get(&atom.residue)
             .map_or(&[][..], Vec::as_slice);
         positions.push(atom.position);
+        ids.push(atom.id);
         is_glycan.push(!atom_trees.is_empty());
         for (tree_index, members) in tree_members.iter_mut().enumerate() {
             members.push(atom_trees.contains(&tree_index));
@@ -6895,16 +6946,10 @@ pub fn steric_site_scores(structure: &Structure, clash_distance: f64) -> Vec<f64
         .iter()
         .enumerate()
         .map(|(site_index, _)| {
-            let attachment = structure.metadata().glycosylation_sites.get(site_index);
-            let link_position = attachment
-                .and_then(|site| structure.find_atom(&site.protein_residue, &site.protein_atom))
-                .and_then(|atom| structure.atom_position(atom));
-            // The Cookbook scorer ignores the three attachment-proximal
-            // atoms (C1 and its immediate neighbors), preventing the fixed
-            // bond geometry from dominating the steric objective.
+            let link_position = bond.link_position[site_index];
+            let attachment = bond.attachment[site_index];
             let glycan_atoms = (0..positions.len())
-                .filter(|&index| tree_members[site_index][index])
-                .skip(3)
+                .filter(|&index| tree_members[site_index][index] && Some(ids[index]) != attachment)
                 .collect::<Vec<_>>();
             let mut score = grid.pair_steric_score(&glycan_atoms, clash_distance, |index| {
                 !is_glycan[index]
@@ -7013,18 +7058,30 @@ impl<'a> ContactGrid<'a> {
 pub fn clash_partner_labels(structure: &Structure, clash_distance: f64) -> Vec<Vec<String>> {
     let atoms = structure.atoms();
     let trees = &structure.metadata().glycan_trees;
+    let bond = BondAtoms::new(structure);
     let all_glycan_residues = trees
         .iter()
         .flat_map(|tree| tree.residue_ids.iter().cloned())
         .collect::<HashSet<_>>();
-    let groups = trees
+    let members = trees
         .iter()
         .map(|tree| {
             let residues = tree.residue_ids.iter().cloned().collect::<HashSet<_>>();
             atoms
                 .iter()
                 .filter(|atom| residues.contains(&atom.residue))
-                .skip(3)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // The same atoms as the score: all but the attachment atom of a glycan.
+    let groups = members
+        .iter()
+        .zip(&bond.attachment)
+        .map(|(atoms, attachment)| {
+            atoms
+                .iter()
+                .copied()
+                .filter(|atom| Some(atom.id) != *attachment)
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -7041,7 +7098,7 @@ pub fn clash_partner_labels(structure: &Structure, clash_distance: f64) -> Vec<V
                     labels[index].insert(format!("protein:{}", second.residue));
                 }
             }
-            for (other_index, other) in groups.iter().enumerate().skip(index + 1) {
+            for (other_index, other) in members.iter().enumerate().skip(index + 1) {
                 if other.iter().any(|second| {
                     squared_distance(first.position, second.position) < threshold_squared
                 }) {
@@ -8507,6 +8564,7 @@ mod tests {
             .iter()
             .flat_map(|tree| tree.residue_ids.iter().cloned())
             .collect::<HashSet<_>>();
+        let bond = BondAtoms::new(structure);
         structure
             .metadata()
             .glycan_trees
@@ -8514,18 +8572,11 @@ mod tests {
             .enumerate()
             .map(|(site_index, tree)| {
                 let residues = tree.residue_ids.iter().cloned().collect::<HashSet<_>>();
-                let attachment = structure.metadata().glycosylation_sites.get(site_index);
-                let link_position = attachment
-                    .and_then(|site| structure.find_atom(&site.protein_residue, &site.protein_atom))
-                    .and_then(|atom| structure.atom(atom))
-                    .map(|atom| atom.position);
-                // The Cookbook scorer ignores the three attachment-proximal
-                // atoms (C1 and its immediate neighbors), preventing the fixed
-                // bond geometry from dominating the steric objective.
+                let link_position = bond.link_position[site_index];
                 let glycan_atoms = atoms
                     .iter()
                     .filter(|atom| residues.contains(&atom.residue))
-                    .skip(3)
+                    .filter(|atom| Some(atom.id) != bond.attachment[site_index])
                     .collect::<Vec<_>>();
                 let protein_atoms = atoms
                     .iter()
@@ -8599,6 +8650,210 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The fixture glycan on Asn A1 of the fixture protein, and a state whose
+    /// pose is clear of the protein.
+    fn steric_fixture() -> (tempfile::TempDir, Vec<SearchSite>, Vec<Gene>) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ensemble.pdb");
+        fs::write(&path, GLYCAN).unwrap();
+        let query = GlycanQuery {
+            source: GlycanSource::LocalBundle(path),
+            anomer: Anomer::Beta,
+            format: "PDB".into(),
+            level: "3".into(),
+        };
+        let ensemble = LocalBundleProvider.load(&query).unwrap();
+        let sites = vec![SearchSite {
+            site: reglyco_core::GlycosylationSite::new("A", 1),
+            ensemble,
+        }];
+        let state = vec![Gene {
+            conformer: 0,
+            phi: -91.0,
+            psi: 178.5,
+            rotamer: None,
+        }];
+        (directory, sites, state)
+    }
+
+    fn named_position(structure: &Structure, residue: &ResidueId, name: &str) -> Vec3 {
+        structure
+            .find_atom(residue, name)
+            .and_then(|atom| structure.atom_position(atom))
+            .unwrap()
+    }
+
+    fn unit(vector: Vec3) -> Vec3 {
+        let length = (vector.x * vector.x + vector.y * vector.y + vector.z * vector.z).sqrt();
+        Vec3 {
+            x: vector.x / length,
+            y: vector.y / length,
+            z: vector.z / length,
+        }
+    }
+
+    fn offset(position: Vec3, direction: Vec3, length: f64) -> Vec3 {
+        Vec3 {
+            x: position.x + direction.x * length,
+            y: position.y + direction.y * length,
+            z: position.z + direction.z * length,
+        }
+    }
+
+    #[test]
+    fn steric_tests_check_h1_and_skip_only_the_attachment_atom() {
+        let (_directory, sites, state) = steric_fixture();
+        let protein = read_pdb_str(PROTEIN, &dry_options()).unwrap();
+        let builder = glysys::SystemBuilder::new(dry_options()).unwrap();
+        let structure = build_state(&protein, &sites, &state, &builder).unwrap();
+        assert!(steric_site_scores(&structure, 1.7)[0] <= 1.1);
+        let site = structure.metadata().glycosylation_sites[0].clone();
+        let c1 = named_position(&structure, &site.glycan_residue, &site.glycan_atom);
+        let h1 = named_position(&structure, &site.glycan_residue, "H1");
+        let tree_atoms = structure
+            .atoms()
+            .into_iter()
+            .filter(|atom| {
+                structure.metadata().glycan_trees[0]
+                    .residue_ids
+                    .contains(&atom.residue)
+            })
+            .collect::<Vec<_>>();
+        // The first three glycan atoms (C1, H1, O5 here) were once skipped by
+        // count. Put an atom of another residue 1.0 A from H1, at least 1.8 A
+        // from every other glycan atom, so only a test of H1 can see it.
+        assert_eq!(
+            tree_atoms
+                .iter()
+                .take(2)
+                .map(|atom| atom.name.as_str())
+                .collect::<Vec<_>>(),
+            ["C1", "H1"]
+        );
+        let away = unit(Vec3 {
+            x: h1.x - c1.x,
+            y: h1.y - c1.y,
+            z: h1.z - c1.z,
+        });
+        let target = offset(h1, away, 1.0);
+        assert!(
+            tree_atoms
+                .iter()
+                .filter(|atom| atom.name != "H1")
+                .all(|atom| squared_distance(atom.position, target).sqrt() >= 1.8)
+        );
+        let serine = ResidueId {
+            chain: "B".into(),
+            number: 2,
+            insertion_code: None,
+        };
+        let mut moved = protein.clone();
+        let ca = moved.find_atom(&serine, "CA").unwrap();
+        moved.set_atom_position(ca, target).unwrap();
+        let moved_structure = build_state(&moved, &sites, &state, &builder).unwrap();
+        assert!(steric_site_scores(&moved_structure, 1.7)[0] > 2.0);
+        let prepared = PreparedAttachmentContext::new(&moved, &sites, false).unwrap();
+        assert!(prepared.evaluate(&state, 1.7).unwrap().score > 2.0);
+        assert_eq!(
+            clash_partner_labels(&moved_structure, 1.7)[0],
+            vec![format!("protein:{serine}")]
+        );
+    }
+
+    #[test]
+    fn input_protein_hydrogens_never_reach_the_steric_test() {
+        // The test skips only the attachment atom. That is safe for inputs
+        // with hydrogens because the reader discards protein hydrogens: the
+        // amide hydrogen the glycan displaces (under 1.7 A from H1) would
+        // otherwise block every pose.
+        let (_directory, sites, state) = steric_fixture();
+        let protein = read_pdb_str(PROTEIN, &dry_options()).unwrap();
+        let builder = glysys::SystemBuilder::new(dry_options()).unwrap();
+        let structure = build_state(&protein, &sites, &state, &builder).unwrap();
+        let site = structure.metadata().glycosylation_sites[0].clone();
+        let c1 = named_position(&structure, &site.glycan_residue, &site.glycan_atom);
+        let nd2 = named_position(&structure, &site.protein_residue, "ND2");
+        let hydrogen = offset(
+            nd2,
+            unit(Vec3 {
+                x: c1.x - nd2.x,
+                y: c1.y - nd2.y,
+                z: c1.z - nd2.z,
+            }),
+            1.01,
+        );
+        let h1 = named_position(&structure, &site.glycan_residue, "H1");
+        assert!(squared_distance(h1, hydrogen).sqrt() < 1.7);
+        let line = format!(
+            "ATOM     99 HD21 ASN A   1    {:8.3}{:8.3}{:8.3}  1.00  0.00           H",
+            hydrogen.x, hydrogen.y, hydrogen.z
+        );
+        let text = PROTEIN.replacen("TER", &format!("{line}\nTER"), 1);
+        assert_eq!(text.lines().count(), PROTEIN.lines().count() + 1);
+        let protonated = read_pdb_str(&text, &dry_options()).unwrap();
+        assert_eq!(protonated.atoms().len(), protein.atoms().len());
+        let bare = PreparedAttachmentContext::new(&protein, &sites, false)
+            .unwrap()
+            .evaluate(&state, 1.7)
+            .unwrap();
+        let with_hydrogen = PreparedAttachmentContext::new(&protonated, &sites, false)
+            .unwrap()
+            .evaluate(&state, 1.7)
+            .unwrap();
+        assert!(bare.score <= 1.1);
+        assert_eq!(bare.site_scores, with_hydrogen.site_scores);
+        let built = build_state(&protonated, &sites, &state, &builder).unwrap();
+        assert_eq!(
+            steric_site_scores(&built, 1.7),
+            steric_site_scores(&structure, 1.7)
+        );
+    }
+
+    #[test]
+    fn turned_side_chain_is_tested_against_the_rest_of_the_protein() {
+        let (_directory, sites, state) = steric_fixture();
+        let protein = read_pdb_str(PROTEIN, &dry_options()).unwrap();
+        let site = sites[0].site.residue.clone();
+        assert!(!dunbrack::rotamers(&protein, &site).is_empty());
+        let mut turned = protein.clone();
+        dunbrack::apply(&mut turned, &site, 0).unwrap();
+        let nd2 = named_position(&turned, &site, "ND2");
+        let cg = named_position(&turned, &site, "CG");
+        // An atom of another residue 1.0 A beyond the turned ND2.
+        let target = offset(
+            nd2,
+            unit(Vec3 {
+                x: nd2.x - cg.x,
+                y: nd2.y - cg.y,
+                z: nd2.z - cg.z,
+            }),
+            1.0,
+        );
+        let serine = ResidueId {
+            chain: "B".into(),
+            number: 2,
+            insertion_code: None,
+        };
+        let mut crowded = protein.clone();
+        let ca = crowded.find_atom(&serine, "CA").unwrap();
+        crowded.set_atom_position(ca, target).unwrap();
+        let prepared = PreparedAttachmentContext::new(&crowded, &sites, true).unwrap();
+        let with_rotamer = vec![Gene {
+            rotamer: Some(0),
+            ..state[0].clone()
+        }];
+        assert!(prepared.sidechain_scores(&with_rotamer, 1.7).unwrap()[0] > 2.0);
+        assert!(prepared.evaluate(&with_rotamer, 1.7).unwrap().site_scores[0] > 2.0);
+        assert!(
+            prepared
+                .prepare_site_pose(0, &with_rotamer[0], 1.7)
+                .unwrap()
+                .is_none()
+        );
+        // The side chain as given is not affected by the moved atom.
+        assert_eq!(prepared.sidechain_scores(&state, 1.7).unwrap(), vec![1.0]);
     }
 
     #[test]
@@ -9108,15 +9363,16 @@ mod tests {
                 }
                 grid
             };
+            // Every atom of `first` but its attachment atom against every atom
+            // of `second`.
             let pair = |first: &[Vec3],
-                        excluded_first: usize,
+                        first_attachment: Option<usize>,
                         second: &[Vec3],
-                        excluded_second: usize,
                         grid: &HashMap<(i32, i32, i32), Vec<usize>>| {
                 let mut score = 1.0;
                 let threshold2 = 1.7 * 1.7;
                 for (first_index, first_position) in first.iter().enumerate() {
-                    if first_index < excluded_first {
+                    if Some(first_index) == first_attachment {
                         continue;
                     }
                     let center = cell(*first_position);
@@ -9129,9 +9385,6 @@ mod tests {
                                     continue;
                                 };
                                 for &second_index in indices {
-                                    if second_index < excluded_second {
-                                        continue;
-                                    }
                                     let distance2 =
                                         squared_distance(*first_position, second[second_index]);
                                     if distance2 < threshold2 {
@@ -9153,25 +9406,36 @@ mod tests {
                 .iter()
                 .flat_map(|tree| tree.residue_ids.iter().cloned())
                 .collect::<HashSet<_>>();
+            let bond = BondAtoms::new(&structure);
             let protein_positions = atoms
                 .iter()
                 .filter(|atom| !glycan_residues.contains(&atom.residue))
                 .map(|atom| atom.position)
                 .collect::<Vec<_>>();
             let protein_grid = make_grid(&protein_positions);
-            let glycan_positions = structure
+            let (glycan_positions, attachments): (Vec<_>, Vec<_>) = structure
                 .metadata()
                 .glycan_trees
                 .iter()
-                .map(|tree| {
+                .enumerate()
+                .map(|(tree_index, tree)| {
                     let residues = tree.residue_ids.iter().cloned().collect::<HashSet<_>>();
-                    atoms
+                    let tree_atoms = atoms
                         .iter()
                         .filter(|atom| residues.contains(&atom.residue))
-                        .map(|atom| atom.position)
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    let attachment = tree_atoms
+                        .iter()
+                        .position(|atom| Some(atom.id) == bond.attachment[tree_index]);
+                    (
+                        tree_atoms
+                            .iter()
+                            .map(|atom| atom.position)
+                            .collect::<Vec<_>>(),
+                        attachment,
+                    )
                 })
-                .collect::<Vec<_>>();
+                .unzip();
             let grids = glycan_positions
                 .iter()
                 .map(|coordinates| make_grid(coordinates))
@@ -9180,13 +9444,19 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(site, coordinates)| {
-                    let mut score = pair(coordinates, 3, &protein_positions, 0, &protein_grid);
+                    let attachment = attachments[site];
+                    let mut score =
+                        pair(coordinates, attachment, &protein_positions, &protein_grid);
                     for (other, other_coordinates) in glycan_positions.iter().enumerate() {
                         if site == other {
                             continue;
                         }
-                        score =
-                            score.max(pair(coordinates, 3, other_coordinates, 3, &grids[other]));
+                        score = score.max(pair(
+                            coordinates,
+                            attachment,
+                            other_coordinates,
+                            &grids[other],
+                        ));
                     }
                     score
                 })
