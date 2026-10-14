@@ -16,6 +16,7 @@ use glysys::{BuildOptions, ResidueId, Structure, SystemBuilder, read_pdb_str};
 use reglyco_build::{
     GlycosylationSite, hydroxylate_proline, remove_glycan_at_site, scan_n_linked_sequons,
 };
+use reglyco_core::torsion_conventions::{GlycoShapeTorsionConvention, SugarRing};
 use reglyco_core::{
     Anomer, ClashStatus, ConformerPopulationSource, EnergySearchDiagnostics, GlycanQuery,
     GlycanSource, ReGlycoError, ResidueNameFormat, SamplingTarget, SearchBudgetMode,
@@ -4100,11 +4101,16 @@ fn torsion_observation_key(
 }
 
 fn annotate_torsion_observation(observation: &mut Value, references: &[Value]) {
-    let reference_value = torsion_reference_for_observation(observation, references);
+    // A point measured with other torsion definitions than the reference's
+    // entry (ψ or ω ~120° apart) is not placed in its populations.
+    let reference_value = torsion_reference_for_observation(observation, references)
+        .filter(|reference| observation_matches_reference_convention(observation, reference));
     let Some(object) = observation.as_object_mut() else {
         return;
     };
     let Some(reference_value) = reference_value else {
+        object.remove("populationPercentile");
+        object.remove("nearestPopulation");
         object.insert("assessment".into(), json!("no_reference"));
         object.insert("policyVersion".into(), json!("glycoshape-torsion-v1"));
         return;
@@ -5340,7 +5346,8 @@ fn annotate_torsion_observations(analysis: &mut Value) {
         return;
     };
     for observation in observations {
-        let reference = torsion_reference_for_observation(observation, &references);
+        let reference = torsion_reference_for_observation(observation, &references)
+            .filter(|reference| observation_matches_reference_convention(observation, reference));
         let Some(observation_object) = observation.as_object_mut() else {
             continue;
         };
@@ -5549,7 +5556,7 @@ fn residue_to_string(value: &Value) -> String {
 
 fn torsion_csv(values: &[Value], attachments: &[Value]) -> String {
     let mut output = String::from(
-        "domain,origin,stage,frame,glycan_index,glycan,site,branch_path,linkage,phi_degrees,psi_degrees,omega_degrees,population_percentile,assessment,selected_population,selected_phi_component,selected_psi_component,involved_atoms,policy_version\n",
+        "domain,origin,stage,frame,glycan_index,glycan,site,branch_path,linkage,phi_degrees,psi_degrees,omega_degrees,population_percentile,assessment,selected_population,selected_phi_component,selected_psi_component,involved_atoms,policy_version,angle_convention\n",
     );
     for value in values {
         let object = value.as_object();
@@ -5610,6 +5617,8 @@ fn torsion_csv(values: &[Value], attachments: &[Value]) -> String {
             numeric(field(&["selectedPsiComponent", "selected_psi_component"])),
             text(field(&["involvedAtoms", "involved_atoms"])),
             text(field(&["policyVersion", "policy_version", "policy"])),
+            // The definitions of φ, ψ and ω (GlycoShape version 1 or 2).
+            text(field(&["angleConvention", "angle_convention"])),
         ];
         output.push_str(&row.join(","));
         output.push('\n');
@@ -5673,6 +5682,8 @@ fn torsion_csv(values: &[Value], attachments: &[Value]) -> String {
             numeric(field(&["selectedPsiComponent", "selected_psi_component"])),
             text(field(&["involvedAtoms", "involved_atoms"])),
             text(field(&["policyVersion", "policy_version", "policy"])),
+            // ReGlyco's attachment torsions, not GlycoShape's.
+            String::new(),
         ];
         output.push_str(&row.join(","));
         output.push('\n');
@@ -5987,12 +5998,31 @@ fn glycosidic_torsion_observations(
                 .to_ascii_uppercase(),
             acceptor_position.to_string(),
         ];
+        let canonical = format!(
+            "{}{}-{}{}",
+            donor_name.clone().unwrap_or_default().to_ascii_uppercase(),
+            donor
+                .name
+                .trim()
+                .to_ascii_uppercase()
+                .strip_prefix('C')
+                .unwrap_or_default(),
+            acceptor_name
+                .clone()
+                .unwrap_or_default()
+                .to_ascii_uppercase(),
+            acceptor_position
+        );
+        // The reference the observation will be assessed against
+        // (`torsion_reference_for_observation`), so that it is measured on
+        // that reference's atoms and definitions.
         let torsion_reference = torsion_reference_for_pdb_occurrence(
             references,
             &pdb_branch_path,
             &donor.residue,
             &acceptor.residue,
-        );
+        )
+        .or_else(|| torsion_reference_for_linkage_name(references, &canonical));
         let donor_name_text = donor_name.as_deref().unwrap_or_default();
         let donor_ring_atom = if is_furanose_residue(donor_name_text) {
             structure
@@ -6011,9 +6041,28 @@ fn glycosidic_torsion_observations(
         };
         let donor_ring = donor_ring_atom.and_then(|id| lookup.position_of(id));
         let acceptor_carbon = lookup.position(&acceptor.residue, &format!("C{acceptor_position}"));
-        let previous = acceptor_position
-            .checked_sub(1)
-            .and_then(|position| lookup.position(&acceptor.residue, &format!("C{position}")));
+        // A torsion is measured on the four atoms the reference declares for
+        // it, whatever its definitions.  Without them, on the definitions of
+        // the reference's entry (`torsions.conventions` version 1 or 2), or
+        // on ReGlyco's own (IUPAC, version 2) when there is no reference.  A
+        // reference declaring definitions this reader does not know gets no
+        // fallback at all.
+        let declared = torsion_reference.map(reference_torsion_convention);
+        let fallback_convention = match &declared {
+            None => Some(GlycoShapeTorsionConvention::IUPAC),
+            Some(DeclaredTorsionConvention::Known(convention)) => Some(*convention),
+            Some(DeclaredTorsionConvention::Unknown(_)) => None,
+        };
+        let acceptor_ring = sugar_ring(acceptor_name.as_deref().map(str::trim).unwrap_or_default());
+        let fallback_atoms = |names: &[String]| {
+            names
+                .iter()
+                .map(|name| lookup.position(&acceptor.residue, name))
+                .collect::<Option<Vec<_>>>()
+        };
+        let psi_fourth = fallback_convention
+            .and_then(|convention| convention.psi_fourth_atom(acceptor_ring, acceptor_position))
+            .and_then(|name| lookup.position(&acceptor.residue, &name));
         let phi = torsion_reference
             .and_then(|reference| {
                 reference_defined_torsion(
@@ -6025,6 +6074,11 @@ fn glycosidic_torsion_observations(
                 )
             })
             .or_else(|| {
+                // φ = O5′–C1′–Ox–Cx (O4′ of a furanose, O6′–C2′ of a sialic
+                // acid) in both versions.
+                if fallback_convention.is_none() {
+                    return None;
+                }
                 donor_ring.zip(acceptor_carbon).map(|(ring, carbon)| {
                     glycoshape_dihedral_degrees(ring, donor.position, acceptor.position, carbon)
                 })
@@ -6040,13 +6094,14 @@ fn glycosidic_torsion_observations(
                 )
             })
             .or_else(|| {
-                acceptor_carbon.zip(previous).map(|(carbon, previous)| {
-                    glycoshape_dihedral_degrees(donor.position, acceptor.position, carbon, previous)
+                acceptor_carbon.zip(psi_fourth).map(|(carbon, fourth)| {
+                    glycoshape_dihedral_degrees(donor.position, acceptor.position, carbon, fourth)
                 })
             });
-        // 1→6 linkages have a third periodic torsion around the acceptor
-        // sidechain. Keep it optional for other acceptor positions so older
-        // references and consumers remain schema-compatible.
+        // ω about the bond from the acceptor carbon outside the ring:
+        // C4–C5–C6–O6 (1–6) and C6–C7–C8–O8 (2–8) in version 1, the IUPAC
+        // O5–C5–C6–O6, O7–C7–C8–O8, O8–C8–C9–O9 … in version 2.  Absent for a
+        // linkage to a ring carbon.
         let omega = torsion_reference
             .and_then(|reference| {
                 reference_defined_torsion(
@@ -6058,39 +6113,21 @@ fn glycosidic_torsion_observations(
                 )
             })
             .or_else(|| {
-                (acceptor_position == 6)
-                    .then(|| {
-                        // GlycoShape's standard pyranose omega convention is
-                        // C4-C5-C6-O6.  The former O5-C5-C6-O6 fallback
-                        // measured a different torsion and could not be
-                        // compared with the source population.
-                        let first = lookup.position(&acceptor.residue, "C4")?;
-                        let c5 = lookup.position(&acceptor.residue, "C5")?;
-                        let c6 = lookup.position(&acceptor.residue, "C6")?;
-                        Some(glycoshape_dihedral_degrees(
-                            first,
-                            c5,
-                            c6,
-                            acceptor.position,
-                        ))
-                    })
-                    .flatten()
+                let names = fallback_convention?.omega_atoms(acceptor_ring, acceptor_position)?;
+                let atoms = fallback_atoms(&names)?;
+                Some(glycoshape_dihedral_degrees(
+                    atoms[0], atoms[1], atoms[2], atoms[3],
+                ))
             });
-        let canonical = format!(
-            "{}{}-{}{}",
-            donor_name.clone().unwrap_or_default().to_ascii_uppercase(),
-            donor
-                .name
-                .trim()
-                .to_ascii_uppercase()
-                .strip_prefix('C')
-                .unwrap_or_default(),
-            acceptor_name
-                .clone()
-                .unwrap_or_default()
-                .to_ascii_uppercase(),
-            acceptor_position
-        );
+        let angle_convention = match &declared {
+            None => GlycoShapeTorsionConvention::IUPAC.label().to_string(),
+            Some(declared) => declared.label().to_string(),
+        };
+        let conventions_version = match &declared {
+            None => Some(GlycoShapeTorsionConvention::IUPAC.version()),
+            Some(DeclaredTorsionConvention::Known(convention)) => Some(convention.version()),
+            Some(DeclaredTorsionConvention::Unknown(_)) => None,
+        };
         let glycan_index = structure
             .metadata()
             .glycan_trees
@@ -6120,10 +6157,100 @@ fn glycosidic_torsion_observations(
             "omegaDegrees": omega,
             "assessment": "no_reference",
             "policyVersion": "glycoshape-torsion-v1",
-            "angleConvention": "glycoshape-v1",
+            // The definitions φ, ψ and ω were measured with: those of the
+            // reference's GlycoShape entry, or ReGlyco's own (IUPAC).
+            "angleConvention": angle_convention,
+            "conventionsVersion": conventions_version,
         }));
     }
     observations
+}
+
+/// The definitions of GlycoShape torsions a reference declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclaredTorsionConvention {
+    Known(GlycoShapeTorsionConvention),
+    /// A version or label this reader does not know.
+    Unknown(String),
+}
+
+impl DeclaredTorsionConvention {
+    fn label(&self) -> &str {
+        match self {
+            Self::Known(convention) => convention.label(),
+            Self::Unknown(label) => label,
+        }
+    }
+}
+
+/// The definitions of a torsion reference's GlycoShape entry: its
+/// `conventions_version` (`torsions.conventions.version` of the entry), else
+/// its `angle_convention` label.  A reference declaring neither was served
+/// before the IUPAC definitions existed, so it has version 1.
+fn reference_torsion_convention(reference: &Value) -> DeclaredTorsionConvention {
+    let field = |names: &[&str]| names.iter().find_map(|name| reference.get(*name));
+    if let Some(version) =
+        field(&["conventions_version", "conventionsVersion"]).filter(|value| !value.is_null())
+    {
+        return match version.as_u64() {
+            Some(number) => GlycoShapeTorsionConvention::from_version(number)
+                .map(DeclaredTorsionConvention::Known)
+                .unwrap_or_else(|| {
+                    DeclaredTorsionConvention::Unknown(format!("glycoshape-v{number}"))
+                }),
+            None => DeclaredTorsionConvention::Unknown(version.to_string()),
+        };
+    }
+    if let Some(label) = field(&["angle_convention", "angleConvention"]).and_then(Value::as_str) {
+        return GlycoShapeTorsionConvention::from_label(label)
+            .map(DeclaredTorsionConvention::Known)
+            .unwrap_or_else(|| DeclaredTorsionConvention::Unknown(label.trim().to_string()));
+    }
+    DeclaredTorsionConvention::Known(GlycoShapeTorsionConvention::V1)
+}
+
+/// Whether an observation was measured with the definitions of a reference.
+/// Observations of engines before the versions carry no `conventionsVersion`
+/// (only a constant `glycoshape-v1` label) and are taken to agree: they were
+/// measured on the atoms of the reference they came with.
+fn observation_matches_reference_convention(observation: &Value, reference: &Value) -> bool {
+    if observation.get("conventionsVersion").is_none()
+        && observation.get("conventions_version").is_none()
+    {
+        return true;
+    }
+    let Some(observed) = observation
+        .get("angleConvention")
+        .or_else(|| observation.get("angle_convention"))
+        .and_then(Value::as_str)
+    else {
+        return true;
+    };
+    match (
+        GlycoShapeTorsionConvention::from_label(observed),
+        reference_torsion_convention(reference),
+    ) {
+        (Some(observed), DeclaredTorsionConvention::Known(declared)) => observed == declared,
+        (_, declared) => observed.trim().eq_ignore_ascii_case(declared.label()),
+    }
+}
+
+/// The ring of a residue, by its PDB name, as far as the atoms of its
+/// torsions need it.
+fn sugar_ring(residue_name: &str) -> SugarRing {
+    if is_sialic_residue(residue_name) {
+        SugarRing::Ketopyranose
+    } else if is_ketofuranose_residue(residue_name) {
+        SugarRing::Ketofuranose
+    } else if is_furanose_residue(residue_name) {
+        SugarRing::Aldofuranose
+    } else {
+        SugarRing::Aldopyranose
+    }
+}
+
+fn is_ketofuranose_residue(name: &str) -> bool {
+    matches!(name.trim().to_ascii_uppercase().as_str(), "FRU")
 }
 
 fn torsion_reference_for_pdb_branch<'a>(
@@ -6263,6 +6390,13 @@ fn torsion_reference_for_observation<'a>(
         }
     }
     let linkage = observation.get("linkage").and_then(Value::as_str)?;
+    torsion_reference_for_linkage_name(references, linkage)
+}
+
+fn torsion_reference_for_linkage_name<'a>(
+    references: &'a [Value],
+    linkage: &str,
+) -> Option<&'a Value> {
     references.iter().find(|reference| {
         reference
             .get("canonicalLinkage")
@@ -7509,6 +7643,331 @@ END
         assert_eq!(decoded.search_budget_mode, None);
         assert_eq!(decoded.population_size, 128);
         assert_eq!(decoded.generations, 100);
+    }
+
+    /// Gal(α1-6)Glc, heavy atoms of the level-1 cluster-0 representative of
+    /// GlycoShape's DGalpa1-6DGlcpb1-OH (frame 32965) as GAP main (06d031a,
+    /// torsion definitions version 2) exports it.  GAP stores φ 76.552°,
+    /// ψ −178.044°, ω −72.895° (O5–C5–C6–O6) for that frame; the PDB keeps
+    /// three decimals of the coordinates.
+    const GAL_A16_GLC: &str = "\
+HETATM    3  C1  GLC G   2      19.290  17.564  13.524  1.00  0.00           C
+HETATM    5  O5  GLC G   2      18.142  18.192  14.171  1.00  0.00           O
+HETATM    6  C5  GLC G   2      16.986  17.196  14.308  1.00  0.00           C
+HETATM    8  C6  GLC G   2      15.745  17.893  14.914  1.00  0.00           C
+HETATM   12  C4  GLC G   2      17.345  15.869  15.036  1.00  0.00           C
+HETATM   14  O4  GLC G   2      16.256  14.917  14.947  1.00  0.00           O
+HETATM   16  C3  GLC G   2      18.689  15.293  14.423  1.00  0.00           C
+HETATM   18  O3  GLC G   2      19.147  14.218  15.382  1.00  0.00           O
+HETATM   20  C2  GLC G   2      19.813  16.347  14.285  1.00  0.00           C
+HETATM   22  O2  GLC G   2      20.939  15.767  13.575  1.00  0.00           O
+HETATM   23  O6  GLC G   2      15.997  18.139  16.350  1.00  0.00           O
+HETATM   24  C1  GLA G   3      14.856  18.766  17.066  1.00  0.00           C
+HETATM   26  C2  GLA G   3      15.367  19.422  18.400  1.00  0.00           C
+HETATM   28  C3  GLA G   3      15.750  18.319  19.427  1.00  0.00           C
+HETATM   30  C4  GLA G   3      14.595  17.312  19.662  1.00  0.00           C
+HETATM   32  C5  GLA G   3      14.162  16.721  18.265  1.00  0.00           C
+HETATM   34  C6  GLA G   3      12.990  15.699  18.469  1.00  0.00           C
+HETATM   37  O6  GLA G   3      12.670  15.035  17.312  1.00  0.00           O
+HETATM   39  O5  GLA G   3      13.796  17.807  17.350  1.00  0.00           O
+HETATM   40  O4  GLA G   3      13.473  18.010  20.209  1.00  0.00           O
+HETATM   42  O3  GLA G   3      16.122  18.883  20.690  1.00  0.00           O
+HETATM   44  O2  GLA G   3      16.511  20.353  18.111  1.00  0.00           O
+END
+";
+
+    fn gal_a16_glc() -> Structure {
+        let mut structure = read_pdb_str(
+            GAL_A16_GLC,
+            &BuildOptions {
+                add_water: false,
+                add_ions: false,
+                ..BuildOptions::default()
+            },
+        )
+        .unwrap();
+        let residue = |number| ResidueId {
+            chain: "G".into(),
+            number,
+            insertion_code: None,
+        };
+        structure.metadata_mut().glycan_trees.push(GlycanTree {
+            chain: "G".into(),
+            residue_ids: vec![residue(2), residue(3)],
+            attachment_site: None,
+        });
+        structure
+    }
+
+    fn acceptor_atom(name: &str) -> serde_json::Value {
+        json!({ "residue_role": "acceptor", "atom_name": name })
+    }
+
+    fn gal_a16_glc_reference(fields: serde_json::Value) -> serde_json::Value {
+        let mut reference = json!({
+            "canonical_linkage": "GLA1-GLC6",
+            "pdb_branch_paths": [["GLA", "1", "GLC", "6"]],
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            reference[key] = value.clone();
+        }
+        reference
+    }
+
+    fn observed(observations: &[serde_json::Value], axis: &str) -> f64 {
+        assert_eq!(observations.len(), 1, "one Gal(α1-6)Glc linkage");
+        observations[0][axis].as_f64().unwrap()
+    }
+
+    #[test]
+    fn without_a_reference_linkage_torsions_are_the_iupac_ones() {
+        let structure = gal_a16_glc();
+        let observations = glycosidic_torsion_observations(&structure, "result", None, &[]);
+        // ReGlyco's own definitions are GlycoShape's version 2: the values GAP
+        // stores for this frame, within the three decimals of the PDB.
+        assert!((observed(&observations, "phiDegrees") - 76.552).abs() < 0.05);
+        assert!((observed(&observations, "psiDegrees") - -178.044).abs() < 0.1);
+        assert!((observed(&observations, "omegaDegrees") - -72.895).abs() < 0.1);
+        assert_eq!(observations[0]["angleConvention"], "glycoshape-v2");
+        assert_eq!(observations[0]["conventionsVersion"], 2);
+    }
+
+    #[test]
+    fn fallback_torsions_follow_the_version_of_the_reference() {
+        let structure = gal_a16_glc();
+        let acceptor = ResidueId {
+            chain: "G".into(),
+            number: 2,
+            insertion_code: None,
+        };
+        let at = |name: &str| {
+            structure
+                .atom(structure.find_atom(&acceptor, name).unwrap())
+                .unwrap()
+                .position
+        };
+        let c4_c5_c6_o6 = glycoshape_dihedral_degrees(at("C4"), at("C5"), at("C6"), at("O6"));
+        let o5_c5_c6_o6 = glycoshape_dihedral_degrees(at("O5"), at("C5"), at("C6"), at("O6"));
+        // The two ω differ by about 120° (here 130°): never interchangeable.
+        assert!(circular_distance(c4_c5_c6_o6, o5_c5_c6_o6).abs() > 100.0);
+
+        // A reference without atoms: version 1 (declared, or served before the
+        // version existed) and version 2, by `conventions_version` or label.
+        for (fields, omega, label, version) in [
+            (
+                json!({ "angle_convention": "glycoshape-v1" }),
+                c4_c5_c6_o6,
+                "glycoshape-v1",
+                1,
+            ),
+            (json!({}), c4_c5_c6_o6, "glycoshape-v1", 1),
+            (
+                json!({ "conventions_version": 1 }),
+                c4_c5_c6_o6,
+                "glycoshape-v1",
+                1,
+            ),
+            (
+                json!({ "angle_convention": "glycoshape-v2" }),
+                o5_c5_c6_o6,
+                "glycoshape-v2",
+                2,
+            ),
+            (
+                json!({ "angle_convention": "glycoshape-v1", "conventions_version": 2 }),
+                o5_c5_c6_o6,
+                "glycoshape-v2",
+                2,
+            ),
+        ] {
+            let reference = gal_a16_glc_reference(fields.clone());
+            let observations =
+                glycosidic_torsion_observations(&structure, "result", None, &[reference]);
+            assert!(
+                (observed(&observations, "omegaDegrees") - omega).abs() < 1e-9,
+                "{fields}"
+            );
+            assert_eq!(observations[0]["angleConvention"], label, "{fields}");
+            assert_eq!(observations[0]["conventionsVersion"], version, "{fields}");
+            // φ and ψ (C(x−1)) are the same rule in both versions here.
+            assert!((observed(&observations, "phiDegrees") - 76.552).abs() < 0.05);
+            assert!((observed(&observations, "psiDegrees") - -178.044).abs() < 0.1);
+        }
+
+        // Definitions this reader does not know: no torsion is guessed.
+        let reference = gal_a16_glc_reference(json!({ "conventions_version": 3 }));
+        let observations =
+            glycosidic_torsion_observations(&structure, "result", None, &[reference]);
+        assert!(observations[0]["omegaDegrees"].is_null());
+        assert!(observations[0]["phiDegrees"].is_null());
+        assert_eq!(observations[0]["angleConvention"], "glycoshape-v3");
+        assert!(observations[0]["conventionsVersion"].is_null());
+    }
+
+    #[test]
+    fn declared_atoms_are_measured_whatever_the_version() {
+        let structure = gal_a16_glc();
+        // A version 1 reference whose ψ ends at C(x+1)-like atoms is measured
+        // on them: the atoms of the reference decide, not the rule.
+        for (version, omega_atoms) in [(1, ["C4", "C5", "C6", "O6"]), (2, ["O5", "C5", "C6", "O6"])]
+        {
+            let reference = gal_a16_glc_reference(json!({
+                "conventions_version": version,
+                "angle_definitions": {
+                    "omega": omega_atoms.map(acceptor_atom),
+                }
+            }));
+            let observations =
+                glycosidic_torsion_observations(&structure, "result", None, &[reference.clone()]);
+            let defined = reference_defined_torsion(
+                &AtomLookup::new(&structure),
+                &reference,
+                "omega",
+                &ResidueId {
+                    chain: "G".into(),
+                    number: 3,
+                    insertion_code: None,
+                },
+                &ResidueId {
+                    chain: "G".into(),
+                    number: 2,
+                    insertion_code: None,
+                },
+            )
+            .unwrap();
+            assert!((observed(&observations, "omegaDegrees") - defined).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn a_reference_found_by_linkage_name_is_measured_on_its_definitions() {
+        // No PDB branch path: the reference is matched by its linkage name, as
+        // the assessment matches it, and its version 1 ω is measured.
+        let structure = gal_a16_glc();
+        let reference = json!({
+            "canonical_linkage": "GLA1-GLC6",
+            "angle_convention": "glycoshape-v1",
+            "phi_psi": { "bins": 2, "counts": [1, 1, 1, 1] },
+        });
+        let mut observations =
+            glycosidic_torsion_observations(&structure, "result", None, &[reference.clone()]);
+        let acceptor = ResidueId {
+            chain: "G".into(),
+            number: 2,
+            insertion_code: None,
+        };
+        let at = |name: &str| {
+            structure
+                .atom(structure.find_atom(&acceptor, name).unwrap())
+                .unwrap()
+                .position
+        };
+        let c4_c5_c6_o6 = glycoshape_dihedral_degrees(at("C4"), at("C5"), at("C6"), at("O6"));
+        assert!((observed(&observations, "omegaDegrees") - c4_c5_c6_o6).abs() < 1e-9);
+        assert_eq!(observations[0]["angleConvention"], "glycoshape-v1");
+        annotate_torsion_observation(&mut observations[0], &[reference]);
+        assert_ne!(observations[0]["assessment"], "no_reference");
+    }
+
+    #[test]
+    fn a_point_is_assessed_only_against_a_reference_of_its_definitions() {
+        let grid = json!({ "bins": 2, "counts": [4, 0, 0, 0] });
+        let reference = |version: u32| {
+            gal_a16_glc_reference(json!({
+                "conventions_version": version,
+                "phi_psi": grid.clone(),
+            }))
+        };
+        let observation = |label: &str| {
+            json!({
+                "linkage": "GLA1-GLC6",
+                "branchPath": ["GLA", "1", "GLC", "6"],
+                "phiDegrees": -90.0,
+                "psiDegrees": -90.0,
+                "angleConvention": label,
+                "conventionsVersion": GlycoShapeTorsionConvention::from_label(label).unwrap().version(),
+            })
+        };
+        for (label, version, assessed) in [
+            ("glycoshape-v1", 1, true),
+            ("glycoshape-v2", 2, true),
+            ("glycoshape-v1", 2, false),
+            ("glycoshape-v2", 1, false),
+        ] {
+            let mut point = observation(label);
+            annotate_torsion_observation(&mut point, &[reference(version)]);
+            assert_eq!(
+                point["assessment"] != "no_reference",
+                assessed,
+                "{label} vs {version}"
+            );
+
+            let mut analysis = json!({
+                "torsionReferences": [reference(version)],
+                "torsionObservations": [observation(label)],
+            });
+            annotate_torsion_observations(&mut analysis);
+            assert_eq!(
+                analysis["torsionObservations"][0]
+                    .get("populationPercentile")
+                    .is_some(),
+                assessed,
+                "{label} vs {version}"
+            );
+        }
+        // Points of engines before the versions (a constant `glycoshape-v1`
+        // label, no version) or with no label at all are assessed.
+        let mut point = observation("glycoshape-v1");
+        point.as_object_mut().unwrap().remove("conventionsVersion");
+        annotate_torsion_observation(&mut point, &[reference(2)]);
+        assert_ne!(point["assessment"], "no_reference");
+        point.as_object_mut().unwrap().remove("angleConvention");
+        annotate_torsion_observation(&mut point, &[reference(2)]);
+        assert_ne!(point["assessment"], "no_reference");
+    }
+
+    #[test]
+    fn reference_conventions_are_read_from_version_or_label() {
+        use GlycoShapeTorsionConvention::{V1, V2};
+        let known = DeclaredTorsionConvention::Known;
+        assert_eq!(reference_torsion_convention(&json!({})), known(V1));
+        assert_eq!(
+            reference_torsion_convention(&json!({ "angle_convention": "glycoshape-v1" })),
+            known(V1)
+        );
+        assert_eq!(
+            reference_torsion_convention(&json!({ "angleConvention": "glycoshape-v2" })),
+            known(V2)
+        );
+        assert_eq!(
+            reference_torsion_convention(&json!({ "conventionsVersion": 2 })),
+            known(V2)
+        );
+        assert_eq!(
+            reference_torsion_convention(
+                &json!({ "conventions_version": null, "angle_convention": "glycoshape-v2" })
+            ),
+            known(V2)
+        );
+        assert_eq!(
+            reference_torsion_convention(&json!({ "angle_convention": "someone-else" })),
+            DeclaredTorsionConvention::Unknown("someone-else".into())
+        );
+    }
+
+    #[test]
+    fn sialic_acid_omega_follows_the_version() {
+        // Neu5Ac(α2-8)Neu5Ac: the acceptor's C6, C7, C8, O6, O7, O8 only matter.
+        assert_eq!(sugar_ring("SIA"), SugarRing::Ketopyranose);
+        assert_eq!(sugar_ring("GAL"), SugarRing::Aldopyranose);
+        assert_eq!(
+            GlycoShapeTorsionConvention::V1.omega_atoms(sugar_ring("SIA"), 8),
+            Some(["C6", "C7", "C8", "O8"].map(String::from))
+        );
+        assert_eq!(
+            GlycoShapeTorsionConvention::V2.omega_atoms(sugar_ring("SIA"), 8),
+            Some(["O7", "C7", "C8", "O8"].map(String::from))
+        );
     }
 
     #[test]

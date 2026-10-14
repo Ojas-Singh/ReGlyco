@@ -1313,6 +1313,10 @@ fn default_true() -> bool {
     true
 }
 
+/// The definitions of the glycosidic torsions GlycoShape stores (version 1
+/// or 2 of an entry's `torsions.conventions`).
+pub mod torsion_conventions;
+
 #[cfg(test)]
 mod residue_name_format_tests {
     use super::ResidueNameFormat;
