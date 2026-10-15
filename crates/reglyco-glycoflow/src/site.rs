@@ -424,20 +424,41 @@ fn reducing_end_glycam(glycam: &str, root_anomer: char) -> String {
     format!("{s}{root_anomer}1-OH")
 }
 
+/// crabWURCS's GLYCAM sequence of the deposited glycan, and what the coordinates of its residues
+/// say against their names.
+///
+/// The sequence is read with the residue names deciding wherever they say something
+/// (`NamePolicy::Names`): the deposited labels are the fit's reference (the tree, the
+/// deposition checks, the comparison of the fit with the deposit), and crabWURCS's reading
+/// checks the tree's linkages from the bond graph. crabWURCS's default reading (0.3.3) takes
+/// every residue from its coordinates; under it a deposit whose names and coordinates disagree
+/// fails [`same_tree`] although the tree is the same. Neither side is reliably right then: of
+/// the 10 of 351 benchmark sites where they disagree, the coordinates are the error in six
+/// (a beta-modelled `FUC`, an alpha-modelled chitobiose `NAG`, an L-gulose under `MAN`) and the
+/// names in three (`MAN` on the beta core mannose). The names keep deciding, and every
+/// disagreement is reported.
 fn crabwurcs_glycam(
     structure: &Structure,
     tree: &[DepositedResidue],
-) -> std::result::Result<String, String> {
+) -> std::result::Result<(String, Vec<String>), String> {
+    use crabwurcs_pdb::{NamePolicy, PdbReadOptions, PdbWarningKind};
+
     let pdb = structure.to_pdb_string();
-    let glycans = crabwurcs_pdb::extract_glycans_with_provenance_from_str(&pdb, false)
-        .map_err(|e| e.to_string())?;
+    let reading = crabwurcs_pdb::read_glycans_from_str(
+        &pdb,
+        false,
+        &PdbReadOptions::with_policy(NamePolicy::Names),
+    )
+    .map_err(|e| e.to_string())?;
     let want: BTreeSet<(String, isize)> = tree
         .iter()
         .map(|r| (r.id.chain.clone(), r.id.number as isize))
         .collect();
-    let glycan = glycans
+    let (index, glycan) = reading
+        .glycans
         .iter()
-        .find(|g| {
+        .enumerate()
+        .find(|(_, g)| {
             g.residues
                 .iter()
                 .map(|r| (r.chain.clone(), r.sequence_number))
@@ -447,7 +468,19 @@ fn crabwurcs_glycam(
         .ok_or_else(|| "crabWURCS found no glycan with the deposited residues".to_string())?;
     let glycam = crabwurcs_iupac::write_glycam(&glycan.graph).map_err(|e| e.to_string())?;
     let root_anomer = glycam_of(&tree[0].name).map_or('b', |g| g.1);
-    Ok(reducing_end_glycam(&glycam, root_anomer))
+    let disagreements = reading
+        .warnings
+        .iter()
+        .filter(|w| {
+            w.glycan_index == index
+                && matches!(
+                    w.kind,
+                    PdbWarningKind::NameContradictsCoordinates | PdbWarningKind::NoRing
+                )
+        })
+        .map(|w| format!("deposited glycan, {w}"))
+        .collect();
+    Ok((reducing_end_glycam(&glycam, root_anomer), disagreements))
 }
 
 /// Residue paths of a GLYCAM sequence (builder convention) with their (token, anomer).
@@ -568,7 +601,10 @@ pub fn load_site(
     let mut warnings = Vec::new();
     let crab = match &tree {
         Some(t) => match crabwurcs_glycam(structure, t) {
-            Ok(s) => Some(s),
+            Ok((s, disagreements)) => {
+                warnings.extend(disagreements);
+                Some(s)
+            }
             Err(e) => {
                 warnings.push(format!("crabWURCS GLYCAM export failed: {e}"));
                 None
@@ -678,6 +714,49 @@ mod tests {
         let keys = p.keys().cloned().collect::<Vec<_>>();
         assert_eq!(keys, vec!["r", "r/4", "r/4/4", "r/4/4/3", "r/4/4/6"]);
         assert_eq!(p["r/4/4"], ("DManp".to_string(), 'b'));
+    }
+
+    /// 8VM1: the core mannose is named `MAN` (alpha) but modelled beta. crabWURCS 0.3.3 reads
+    /// it beta from the coordinates by default; the site keeps the names' sequence from
+    /// crabWURCS (the tree is the same) and reports the disagreement.
+    #[test]
+    fn names_decide_the_sequence_and_coordinates_are_reported() {
+        let text = include_str!("../test-data/8vm1_asn92_glycan.pdb");
+        let options = glysys::BuildOptions {
+            add_water: false,
+            add_ions: false,
+            ..glysys::BuildOptions::default()
+        };
+        let structure = glysys::read_pdb_str(text, &options).unwrap();
+        let residue = ResidueId {
+            chain: "A".into(),
+            number: 92,
+            insertion_code: None,
+        };
+        let crystal = CrystalInput {
+            cryst1: None,
+            map_cell: None,
+            map_space_group: None,
+            map_full_cell: false,
+        };
+        let site = load_site(&structure, &residue, &crystal, &SiteOptions::default()).unwrap();
+        let sequence = &site.sequence;
+        assert_eq!(sequence.source, "crabwurcs write_glycam");
+        assert_eq!(
+            sequence.sequence, "DManpa1-4DGlcpNAcb1-4DGlcpNAcb1-OH",
+            "{sequence:?}"
+        );
+        assert_eq!(
+            sequence.warnings,
+            [
+                "deposited glycan, residue MAN B:3: named α-D-Manp, coordinates say β-D-Manp (anomer)"
+            ]
+        );
+        // what the default reading (coordinates) gives: not the deposited tree's labels
+        let coordinates =
+            crabwurcs_pdb::extract_glycans_from_str(&structure.to_pdb_string(), false).unwrap();
+        let glycam = crabwurcs_iupac::write_glycam(&coordinates[0].graph).unwrap();
+        assert!(glycam.starts_with("DManpb1-4"), "{glycam}");
     }
 
     #[test]
