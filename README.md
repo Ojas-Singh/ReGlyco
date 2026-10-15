@@ -20,11 +20,31 @@ network access.
 ## GlycoShape data access
 
 Glycan ensembles named by GlyTouCan ID are fetched from the GlycoShape API at
-`https://glycoshape.org` (`--api-base`). Command-line clients receive Level 1,
-the public dataset, which is the default `--level`. Levels 2 and 3 are not
-served to command-line clients, and requesting them fails with an explanatory
-error. Local ensemble bundles (`--glycan PATH` or `--attach SITE=PATH`) are used
-as supplied. glycoshape.io is retired and should not be used as `--api-base`.
+`https://glycoshape.org` (`--api-base`). Level 1, the public dataset, is the
+default `--level` and needs nothing else. Local ensemble bundles (`--glycan
+PATH` or `--attach SITE=PATH`) are used as supplied. glycoshape.io is retired
+and should not be used as `--api-base`.
+
+Level 2 (CC BY-NC-ND 4.0, under the GlycoShape Level 2 terms: no
+redistribution, no training or evaluation of machine-learning models without
+written permission) is open to people the GlycoShape team has given access.
+Log in once on each computer:
+
+```console
+reglyco login            # shows a code: enter it at https://glycoshape.org/device and approve
+reglyco whoami           # who this computer is logged in as, and whether Level 2 is open to it
+reglyco search ... --level 2
+reglyco logout           # ends the login here and on the site
+```
+
+The login is good for Level 2 data only, for 90 days or until it is ended
+(`reglyco logout`, or on the account page of the website, where all logins
+are listed). It is kept in `credentials.json` of the configuration folder
+(`$REGLYCO_CONFIG_DIR`, else `$XDG_CONFIG_HOME/reglyco` or
+`~/.config/reglyco`; `%APPDATA%\reglyco` on Windows), readable by its owner
+only, and sent only to the site that issued it, over HTTPS, with Level 2
+requests. When the Level 2 terms change, ReGlyco says where to accept the new
+version (`https://glycoshape.org/account#level-2`). Level 3 is private.
 
 ## Licensing
 
