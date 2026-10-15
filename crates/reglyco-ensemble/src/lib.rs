@@ -484,10 +484,25 @@ fn canonical_query(query: &GlycanQuery) -> Result<GlycanQuery> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GlycoShapeProvider {
     pub api_base_url: String,
     client: reqwest::blocking::Client,
+    /// A GlycoShape login for Level 2 (`reglyco login`): sent as a bearer
+    /// token with Level 2 requests only, and only to `api_base_url`.
+    token: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for GlycoShapeProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The token never reaches a log or an error message.
+        formatter
+            .debug_struct("GlycoShapeProvider")
+            .field("api_base_url", &self.api_base_url)
+            .field("token", &self.token.as_ref().map(|_| "<hidden>"))
+            .finish()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -500,7 +515,67 @@ impl GlycoShapeProvider {
         Ok(Self {
             api_base_url: api_base_url.into(),
             client,
+            token: None,
         })
+    }
+
+    /// The GlycoShape login to use for Level 2 requests (none: Level 1 only).
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token.filter(|token| !token.is_empty());
+        self
+    }
+
+    fn get(&self, url: &str, level: &str) -> reqwest::blocking::RequestBuilder {
+        let request = self.client.get(url);
+        match &self.token {
+            Some(token) if level.trim() != "1" => request.bearer_auth(token),
+            _ => request,
+        }
+    }
+
+    /// Why the site refused a Level 2 or 3 request, in words a person can act on.
+    fn refusal(
+        &self,
+        identifier: &str,
+        level: &str,
+        response: reqwest::blocking::Response,
+    ) -> EnsembleError {
+        let status = response.status().as_u16();
+        let body = response.json::<serde_json::Value>().unwrap_or_default();
+        let code = body
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let base = self.api_base_url.trim_end_matches('/');
+        let reason = match code {
+            "level2_token_invalid" => {
+                "your GlycoShape login has expired or was revoked: run `reglyco login` again"
+                    .to_string()
+            }
+            "level2_access_required" => {
+                "your GlycoShape account does not have Level 2 access: ask the GlycoShape team for \
+                 Level 2 access (support@glycoshape.org)"
+                    .to_string()
+            }
+            "level2_terms_required" => format!(
+                "the Level 2 terms have changed or were not accepted yet: accept them at \
+                 {base}/account#level-2, then run the command again"
+            ),
+            "dataset_private" => format!("Level {level} is private and not available from {base}"),
+            "level2_downloads_unavailable" => {
+                format!("{base} does not serve Level 2 to logged-in clients")
+            }
+            _ if self.token.is_none() && level.trim() == "2" => {
+                "Level 2 needs a GlycoShape login: run `reglyco login` (with an account the \
+                 GlycoShape team has given Level 2 access)"
+                    .to_string()
+            }
+            _ => format!(
+                "Level {level} is not available from {base} to command-line clients (HTTP {status}); \
+                 Level 1 is public: use `--level 1` or a local ensemble bundle"
+            ),
+        };
+        EnsembleError::Remote(format!("{identifier} Level {level}: {reason}"))
     }
 }
 
@@ -528,18 +603,13 @@ impl EnsembleProvider for GlycoShapeProvider {
             query.level
         );
         let response = self
-            .client
-            .get(&url)
+            .get(&url, &query.level)
             .send()
             .map_err(|error| EnsembleError::Remote(error.to_string()))?;
-        if matches!(response.status().as_u16(), 401 | 403) {
-            return Err(EnsembleError::Remote(format!(
-                "{identifier} Level {} is not available from {} to command-line clients \
-                 (HTTP {}). Only Level 1 is public; use `--level 1` or a local ensemble bundle.",
-                query.level,
-                self.api_base_url.trim_end_matches('/'),
-                response.status().as_u16()
-            )));
+        if matches!(response.status().as_u16(), 401 | 403)
+            || (response.status().as_u16() == 503 && query.level.trim() != "1")
+        {
+            return Err(self.refusal(identifier, &query.level, response));
         }
         let response = response
             .error_for_status()
@@ -547,14 +617,23 @@ impl EnsembleProvider for GlycoShapeProvider {
         let pdb = response
             .text()
             .map_err(|error| EnsembleError::Remote(error.to_string()))?;
-        let metadata_url = format!(
-            "{}/api/glycan/{}",
-            self.api_base_url.trim_end_matches('/'),
-            identifier
-        );
+        // The populations of the level asked for (Level 1 keeps the address it always had).
+        let metadata_url = if query.level.trim() == "1" {
+            format!(
+                "{}/api/glycan/{}",
+                self.api_base_url.trim_end_matches('/'),
+                identifier
+            )
+        } else {
+            format!(
+                "{}/api/glycan/{}?level={}",
+                self.api_base_url.trim_end_matches('/'),
+                identifier,
+                query.level.trim()
+            )
+        };
         let metadata = self
-            .client
-            .get(&metadata_url)
+            .get(&metadata_url, &query.level)
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
             .and_then(reqwest::blocking::Response::json::<serde_json::Value>)
@@ -9527,5 +9606,127 @@ mod tests {
         assert_eq!(offline.conformers.len(), 1);
         assert_eq!(offline.conformers[0].cluster_weight, 72.0);
         assert!(offline.provenance.starts_with("cache:"));
+    }
+
+    /// A server that answers each request with the next of `responses` and
+    /// hands back what it was asked (request line and headers, lowercased).
+    fn answering(responses: Vec<(u16, String)>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                asked.push(String::from_utf8_lossy(&request[..read]).to_ascii_lowercase());
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            asked
+        });
+        (format!("http://{address}"), server)
+    }
+
+    fn level_query(level: &str) -> GlycanQuery {
+        GlycanQuery {
+            source: GlycanSource::GlyTouCan("GTEST".into()),
+            anomer: Anomer::Beta,
+            format: "PDB".into(),
+            level: level.into(),
+        }
+    }
+
+    #[test]
+    fn a_glycoshape_login_is_sent_with_level_two_requests_only() {
+        let metadata = r#"{"archetype":{"cluster_levels":{"level_2":{"clusters":[72.0]}},"coverage_clusters_per_main":{"0":[0]}}}"#;
+        let (base, server) = answering(vec![(200, GLYCAN.into()), (200, metadata.into())]);
+        let provider = GlycoShapeProvider::new(&base)
+            .unwrap()
+            .with_token(Some("gs2_secret".into()));
+        assert!(!format!("{provider:?}").contains("gs2_secret"));
+        let ensemble = provider.load(&level_query("2")).unwrap();
+        assert_eq!(ensemble.conformers[0].cluster_weight, 72.0);
+        assert!(!ensemble.provenance.contains("gs2_secret"));
+        let asked = server.join().unwrap();
+        assert!(asked[0].starts_with("get /api/structure/pdb/gtest?anomer=beta&level=2 "));
+        assert!(
+            asked[1].starts_with("get /api/glycan/gtest?level=2 "),
+            "{}",
+            asked[1]
+        );
+        for request in &asked {
+            assert!(
+                request.contains("authorization: bearer gs2_secret"),
+                "{request}"
+            );
+        }
+
+        // Level 1 is public: the login stays at home.
+        let (base, server) = answering(vec![
+            (200, GLYCAN.into()),
+            (200, r#"{"archetype":{}}"#.into()),
+        ]);
+        let provider = GlycoShapeProvider::new(&base)
+            .unwrap()
+            .with_token(Some("gs2_secret".into()));
+        provider.load(&level_query("1")).unwrap();
+        let asked = server.join().unwrap();
+        assert!(asked[1].starts_with("get /api/glycan/gtest "));
+        assert!(
+            asked
+                .iter()
+                .all(|request| !request.contains("authorization"))
+        );
+    }
+
+    #[test]
+    fn a_refused_level_two_request_says_what_to_do() {
+        let cases = [
+            (
+                None,
+                401,
+                r#"{"code":"website_session_required"}"#,
+                "run `reglyco login`",
+            ),
+            (
+                Some("gs2_old"),
+                401,
+                r#"{"code":"level2_token_invalid"}"#,
+                "expired or was revoked: run `reglyco login` again",
+            ),
+            (
+                Some("gs2_x"),
+                403,
+                r#"{"code":"level2_access_required"}"#,
+                "ask the GlycoShape team for Level 2 access",
+            ),
+            (
+                Some("gs2_x"),
+                403,
+                r#"{"code":"level2_terms_required"}"#,
+                "/account#level-2",
+            ),
+            (
+                Some("gs2_x"),
+                503,
+                r#"{"code":"level2_downloads_unavailable"}"#,
+                "does not serve Level 2",
+            ),
+        ];
+        for (token, status, body, expected) in cases {
+            let (base, server) = answering(vec![(status, body.into())]);
+            let provider = GlycoShapeProvider::new(&base)
+                .unwrap()
+                .with_token(token.map(String::from));
+            let error = provider.load(&level_query("2")).unwrap_err().to_string();
+            server.join().unwrap();
+            assert!(error.contains(expected), "{body}: {error}");
+            assert!(!error.contains("gs2_"), "{error}");
+        }
     }
 }

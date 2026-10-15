@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 
 mod glycoflow;
 mod glycoflow_model;
+mod login;
 mod saxs;
 
 #[derive(Debug, Parser)]
@@ -72,6 +73,12 @@ enum Command {
     Saxs(saxs::SaxsArgs),
     /// Accept the GlycoFlow model licence and locate or download the model (printed path).
     GlycoflowModel(glycoflow_model::GlycoflowModelArgs),
+    /// Log in to GlycoShape for Level 2 ensembles (`--level 2`): shows a code to approve on the website.
+    Login(login::LoginArgs),
+    /// End the GlycoShape login of this computer, here and on the site.
+    Logout(login::SiteArgs),
+    /// Show the GlycoShape login of this computer and whether Level 2 is open to it.
+    Whoami(login::SiteArgs),
 }
 
 /// Residue-name convention used for remote glycan structure assets.  The
@@ -275,8 +282,10 @@ struct ProviderArgs {
     offline: bool,
     #[arg(long, default_value = "beta")]
     anomer: String,
-    /// GlycoShape dataset level. glycoshape.org serves Level 1 to
-    /// command-line clients; Levels 2 and 3 are not available from it.
+    /// GlycoShape dataset level. Level 1 is public. Level 2 needs `reglyco
+    /// login` with an account the GlycoShape team has given Level 2 access
+    /// (and the current Level 2 terms accepted on the website). Level 3 is
+    /// private.
     #[arg(long, default_value = "1")]
     level: String,
 }
@@ -591,6 +600,9 @@ pub fn run_with_version(version: &'static str) -> anyhow::Result<()> {
         Command::Density(arguments) => run_density(arguments),
         Command::Saxs(arguments) => saxs::run(arguments),
         Command::GlycoflowModel(arguments) => glycoflow_model::run(arguments),
+        Command::Login(arguments) => login::run_login(arguments),
+        Command::Logout(arguments) => login::run_logout(arguments),
+        Command::Whoami(arguments) => login::run_whoami(arguments),
     }
 }
 
@@ -2534,7 +2546,11 @@ fn load_ensemble(
     match &query.source {
         GlycanSource::LocalBundle(_) => Ok(LocalBundleProvider.load(query)?),
         GlycanSource::GlyTouCan(_) => {
-            let remote = GlycoShapeProvider::new(&provider.api_base)?;
+            // The GlycoShape login of this computer for that site, for Level 2 only.
+            let token = (provider.level.trim() != "1")
+                .then(|| login::token_for(&provider.api_base))
+                .flatten();
+            let remote = GlycoShapeProvider::new(&provider.api_base)?.with_token(token);
             Ok(CachingProvider::new(remote, &provider.cache, provider.offline).load(query)?)
         }
     }
