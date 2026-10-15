@@ -35,10 +35,26 @@ jobs:
   dependencies:
     name: GlySys, crabSAXS and crabWURCS on crates.io
     runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: ReGlyco
     steps:
+      # The check reads the workspace, whose members name ../GlySys and
+      # ../crabSAXS by path: check them out beside it, as the validate job does.
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_REF }}
+          path: ReGlyco
+      - uses: actions/checkout@v4
+        with:
+          repository: Ojas-Singh/GlySys
+          ref: ${{ env.GLYSYS_REF }}
+          path: GlySys
+      - uses: actions/checkout@v4
+        with:
+          repository: Ojas-Singh/crabSAXS
+          ref: ${{ env.CRABSAXS_REF }}
+          path: crabSAXS
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97"
