@@ -3025,6 +3025,8 @@ fn cookbook_try_rotamer_repair(
         cookbook_repair_with_cancel(sync, async = "cookbook_repair_with_cancel_async")
     )
 )]
+// The session is set field by field: with the `webgpu` feature its other fields are private.
+#[allow(clippy::field_reassign_with_default)]
 async fn cookbook_steric_search_with_cancel<F, C>(
     problem: &SearchProblem<'_>,
     config: &SearchConfig,
@@ -3138,10 +3140,8 @@ where
     // transformed coordinate arrays are unnecessary in the hot loop. The
     // resident GPU returns site scores and boundary candidates; coordinates
     // are materialized only for selected output or CPU checks.
-    let mut geometry = GeometrySession {
-        scores_only: policy == SearchSelectionPolicy::JointPriorV1,
-        ..GeometrySession::default()
-    };
+    let mut geometry = GeometrySession::default();
+    geometry.scores_only = policy == SearchSelectionPolicy::JointPriorV1;
     evaluate_population(problem, &mut population, &mut geometry).await?;
     population
         .iter_mut()
