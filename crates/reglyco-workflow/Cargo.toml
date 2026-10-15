@@ -1,6 +1,6 @@
 [package]
 name = "reglyco-workflow"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -29,14 +29,14 @@ full = [
 maybe-async-cfg = "0.2.5"
 glysys.workspace = true
 glysys-energy.workspace = true
-reglyco-build = { version = "0.1.0", path = "../reglyco-build" }
-reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
-reglyco-ensemble = { version = "0.1.0", path = "../reglyco-ensemble" }
-reglyco-relax = { version = "0.1.0", path = "../reglyco-relax" }
-reglyco-validate = { version = "0.1.0", path = "../reglyco-validate", default-features = false }
-reglyco-refine = { version = "0.1.0", path = "../reglyco-refine", optional = true }
-reglyco-saxs = { version = "0.1.0", path = "../reglyco-saxs", optional = true }
-reglyco-density = { version = "0.1.0", path = "../reglyco-density", optional = true }
+reglyco-build = { version = "0.2.3", path = "../reglyco-build" }
+reglyco-core = { version = "0.2.3", path = "../reglyco-core" }
+reglyco-ensemble = { version = "0.2.3", path = "../reglyco-ensemble" }
+reglyco-relax = { version = "0.2.3", path = "../reglyco-relax" }
+reglyco-validate = { version = "0.2.3", path = "../reglyco-validate", default-features = false }
+reglyco-refine = { version = "0.2.3", path = "../reglyco-refine", optional = true }
+reglyco-saxs = { version = "0.2.3", path = "../reglyco-saxs", optional = true }
+reglyco-density = { version = "0.2.3", path = "../reglyco-density", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -47,7 +47,7 @@ web-time = "1.1"
 # not offer the density workflow yet.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 candle-core = { version = "0.9.2", optional = true }
-reglyco-glycoflow = { version = "0.1.0", path = "../reglyco-glycoflow", optional = true }
+reglyco-glycoflow = { version = "0.2.3", path = "../reglyco-glycoflow", optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true

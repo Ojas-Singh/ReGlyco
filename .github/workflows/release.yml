@@ -1,0 +1,181 @@
+name: Release
+
+# Runs on a version tag only (or by hand for an existing tag). The crates are
+# published here only when the repository has a CARGO_REGISTRY_TOKEN secret;
+# without it the publish job skips with a notice, and the crates are published
+# from a maintainer machine with scripts/publish_crates.sh (docs/release.md).
+# The Colab binary is built from crates.io once `reglyco` is there, so after a
+# local publication, run this workflow again by hand to attach it.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version of an existing tag, without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/v{0}', inputs.version) || github.ref }}
+  # The released sibling versions the manifests require (checked by
+  # scripts/check_release.sh).
+  GLYSYS_REF: v0.1.2
+  CRABSAXS_REF: "0.1.1"
+
+jobs:
+  dependencies:
+    name: GlySys, crabSAXS and crabWURCS on crates.io
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+      - name: Stop unless the dependencies are released
+        run: ./scripts/check_release.sh --dependencies "${RELEASE_VERSION#v}"
+
+  validate:
+    needs: dependencies
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: ReGlyco
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          path: ReGlyco
+      - uses: actions/checkout@v4
+        with:
+          repository: Ojas-Singh/GlySys
+          ref: ${{ env.GLYSYS_REF }}
+          path: GlySys
+      - uses: actions/checkout@v4
+        with:
+          repository: Ojas-Singh/crabSAXS
+          ref: ${{ env.CRABSAXS_REF }}
+          path: crabSAXS
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
+      - name: Check release metadata and package every crate
+        run: ./scripts/check_release.sh "${RELEASE_VERSION#v}"
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: ReGlyco
+    steps:
+      - name: Look for the crates.io token
+        id: token
+        working-directory: .
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -n "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=crates.io publication skipped::This repository has no CARGO_REGISTRY_TOKEN secret, so nothing was published. Publish from a maintainer machine with scripts/publish_crates.sh ${RELEASE_VERSION#v} (docs/release.md), then re-run this workflow to build and attach the Colab binary."
+          fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          path: ReGlyco
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          repository: Ojas-Singh/GlySys
+          ref: ${{ env.GLYSYS_REF }}
+          path: GlySys
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          repository: Ojas-Singh/crabSAXS
+          ref: ${{ env.CRABSAXS_REF }}
+          path: crabSAXS
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.token.outputs.present == 'true'
+        with:
+          toolchain: "1.97"
+      - name: Publish crates in dependency order
+        if: steps.token.outputs.present == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: ./scripts/publish_crates.sh "${RELEASE_VERSION#v}"
+
+  binary:
+    name: Linux x86-64 binary for Colab
+    needs: publish
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - name: Is reglyco on crates.io?
+        id: crate
+        run: |
+          version="${RELEASE_VERSION#v}"
+          if curl --fail --silent https://index.crates.io/re/gl/reglyco |
+            jq --exit-status --arg v "$version" 'select(.vers == $v)' >/dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Colab binary not built::reglyco ${version} is not on crates.io yet. Re-run this workflow (Run workflow, version ${version}) after publishing to build and attach reglyco-${version}-linux-x86_64."
+          fi
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.crate.outputs.present == 'true'
+        with:
+          toolchain: "1.97"
+      - name: cargo install reglyco from crates.io
+        if: steps.crate.outputs.present == 'true'
+        run: ./scripts/release_binary.sh "${RELEASE_VERSION#v}"
+      - uses: actions/upload-artifact@v4
+        if: steps.crate.outputs.present == 'true'
+        with:
+          name: colab-binary
+          path: dist/
+          if-no-files-found: error
+
+  github-release:
+    needs: [validate, publish, binary]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: colab-binary
+          path: dist
+      - name: Release version and checksums
+        id: release
+        run: |
+          echo "version=${RELEASE_VERSION#v}" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+          if compgen -G "dist/*.sha256" >/dev/null; then
+            cat dist/*.sha256
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.release.outputs.version }}
+          name: ReGlyco ${{ steps.release.outputs.version }}
+          generate_release_notes: true
+          files: dist/*

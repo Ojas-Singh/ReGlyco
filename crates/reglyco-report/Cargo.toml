@@ -1,6 +1,6 @@
 [package]
 name = "reglyco-report"
-version = "0.1.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -19,8 +19,8 @@ petgraph.workspace = true
 glysys.workspace = true
 glysys-energy.workspace = true
 plotters.workspace = true
-reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
-reglyco-relax = { version = "0.1.0", path = "../reglyco-relax" }
+reglyco-core = { version = "0.2.3", path = "../reglyco-core" }
+reglyco-relax = { version = "0.2.3", path = "../reglyco-relax" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

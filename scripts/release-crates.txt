@@ -1,0 +1,20 @@
+# Crates published to crates.io, in dependency order (dev-dependencies
+# included: crates.io needs every listed dependency to exist). A crate without
+# a version carries the workspace version; glycoflow-core keeps its own.
+# reglyco-wasm and reglyco-pdf-wasm are `publish = false`.
+# Read by scripts/check_release.sh, scripts/publish_crates.sh and the release
+# workflow.
+glycoflow-core 0.1.1
+reglyco-core
+reglyco-build
+reglyco-relax
+reglyco-density
+reglyco-validate
+reglyco-report
+reglyco-saxs
+reglyco-ensemble
+reglyco-refine
+reglyco-glycoflow
+reglyco-workflow
+reglyco-cli
+reglyco

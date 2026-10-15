@@ -1,6 +1,6 @@
 [package]
 name = "reglyco-glycoflow"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -21,11 +21,11 @@ cuda = ["glycoflow-core/cuda"]
 candle-core = "0.9.2"
 crabwurcs-iupac.workspace = true
 crabwurcs-pdb.workspace = true
-glycoflow-core = { version = "0.1.0", path = "../glycoflow-core" }
+glycoflow-core = { version = "0.1.1", path = "../glycoflow-core" }
 glysys.workspace = true
 rayon.workspace = true
-reglyco-density = { version = "0.1.0", path = "../reglyco-density" }
-reglyco-validate = { version = "0.1.0", path = "../reglyco-validate" }
+reglyco-density = { version = "0.2.3", path = "../reglyco-density" }
+reglyco-validate = { version = "0.2.3", path = "../reglyco-validate" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

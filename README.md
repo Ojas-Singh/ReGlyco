@@ -65,16 +65,22 @@ Third-party dependencies remain subject to their respective licences.
 
 ## Installation
 
-After the first public release, install the native executable from crates.io
-with the locked dependency graph:
+Install the native executable from crates.io with the locked dependency
+graph (Rust 1.97 or later):
 
 ```console
-cargo install reglyco --locked --version 0.1.0
+cargo install reglyco --locked --version 0.2.3
 ```
 
-Development checkouts can instead use `cargo run --release -- ...`. Release
-publication order and the pinned Colab binary workflow are documented in
-[`docs/release.md`](docs/release.md).
+To use GlycoShape Level 2 data, log in once on each computer with
+`reglyco login` and pass `--level 2` (see
+[GlycoShape data access](#glycoshape-data-access)); Level 1 needs no login.
+Changes between releases are listed in [`CHANGELOG.md`](CHANGELOG.md).
+
+Development checkouts can instead use `cargo run --release -- ...`; they
+expect the GlySys and crabSAXS repositories next to this one (`../GlySys`,
+`../crabSAXS`). Release publication order and the pinned Colab binary
+workflow are documented in [`docs/release.md`](docs/release.md).
 
 ## Runnable examples
 

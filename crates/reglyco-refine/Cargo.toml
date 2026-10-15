@@ -1,6 +1,6 @@
 [package]
 name = "reglyco-refine"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -9,9 +9,9 @@ repository = "https://github.com/Ojas-Singh/ReGlyco"
 
 [dependencies]
 glysys.workspace = true
-reglyco-build = { version = "0.1.0", path = "../reglyco-build" }
-reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
-reglyco-ensemble = { version = "0.1.0", path = "../reglyco-ensemble" }
-reglyco-relax = { version = "0.1.0", path = "../reglyco-relax" }
-reglyco-report = { version = "0.1.0", path = "../reglyco-report" }
+reglyco-build = { version = "0.2.3", path = "../reglyco-build" }
+reglyco-core = { version = "0.2.3", path = "../reglyco-core" }
+reglyco-ensemble = { version = "0.2.3", path = "../reglyco-ensemble" }
+reglyco-relax = { version = "0.2.3", path = "../reglyco-relax" }
+reglyco-report = { version = "0.2.3", path = "../reglyco-report" }
 thiserror.workspace = true
