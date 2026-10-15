@@ -58,6 +58,7 @@ jobs:
           components: rust-src
       - run: cargo check -p reglyco-wasm --target wasm32-unknown-unknown --no-default-features --features public
       - run: cargo check -p reglyco-wasm --target wasm32-unknown-unknown --no-default-features --features full
+      - run: cargo check -p reglyco-wasm --target wasm32-unknown-unknown --no-default-features --features full,webgpu
       - run: cargo check -p reglyco-pdf-wasm --target wasm32-unknown-unknown
       - run: RUSTC_BOOTSTRAP=1 cargo check -Z build-std=panic_abort,std --config 'target.wasm32-unknown-unknown.rustflags=["-C","target-feature=+atomics,+bulk-memory,+mutable-globals","--cfg","getrandom_backend=\"custom\""]' -p reglyco-wasm --target wasm32-unknown-unknown --no-default-features --features full,threaded
       - name: Assert public capability boundary

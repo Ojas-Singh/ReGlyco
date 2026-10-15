@@ -366,6 +366,8 @@ fn target(mode: SearchScoringMode, prior: f64, energy: f64, beta: f64) -> f64 {
         genetic_optimize_with_progress_cancelled(sync, async = "gpu_optimize")
     )
 )]
+// The session is set field by field: with the `webgpu` feature its other fields are private.
+#[allow(clippy::field_reassign_with_default)]
 pub(super) async fn sample_statistical<C>(
     protein: &Structure,
     sites: &[SearchSite],
@@ -548,10 +550,8 @@ where
     let beta = 1. / (0.001_987_204_1 * config.temperature_k);
     let mut restarts = 0;
     let mut states = Vec::new();
-    let mut geometry = GeometrySession {
-        scores_only: true,
-        ..GeometrySession::default()
-    };
+    let mut geometry = GeometrySession::default();
+    geometry.scores_only = true;
     let proposal_blocks = build_proposal_blocks(protein, sites);
     // Steric-only, no-rotamer sampling can keep the validated per-site poses
     // resident for each chain.  A proposal changes only the selected block,
