@@ -6,6 +6,8 @@ rust-version = "1.97"
 license.workspace = true
 description = "Browser WASM bindings for ReGlyco workflows"
 repository = "https://github.com/Ojas-Singh/ReGlyco"
+# Built into the browser bundles of a release, not published to crates.io.
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -20,10 +22,10 @@ threaded = ["dep:wasm-bindgen-rayon"]
 [dependencies]
 wasm-bindgen-futures = { version = "0.4", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
-reglyco-ensemble = { version = "0.1.0", path = "../reglyco-ensemble", optional = true }
+reglyco-ensemble = { version = "0.2.3", path = "../reglyco-ensemble", optional = true }
 getrandom.workspace = true
 js-sys.workspace = true
-reglyco-workflow = { version = "0.1.0", path = "../reglyco-workflow", default-features = false }
+reglyco-workflow = { version = "0.2.3", path = "../reglyco-workflow", default-features = false }
 serde-wasm-bindgen.workspace = true
 serde_json.workspace = true
 wasm-bindgen.workspace = true

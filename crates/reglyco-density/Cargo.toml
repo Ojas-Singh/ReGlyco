@@ -1,6 +1,6 @@
 [package]
 name = "reglyco-density"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -12,7 +12,7 @@ glysys.workspace = true
 nalgebra.workspace = true
 mrc.workspace = true
 open-bcif.workspace = true
-reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
+reglyco-core = { version = "0.2.3", path = "../reglyco-core" }
 rayon.workspace = true
 serde.workspace = true
 sha2.workspace = true

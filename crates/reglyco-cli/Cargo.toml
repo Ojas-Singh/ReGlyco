@@ -1,6 +1,6 @@
 [package]
 name = "reglyco-cli"
-version = "0.2.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -13,23 +13,23 @@ glycoflow-cuda = ["reglyco-glycoflow/cuda"]
 
 [dependencies]
 anyhow.workspace = true
-crabsaxs = { package = "crabsaxs", version = "0.1.0", path = "../../../crabSAXS" }
+crabsaxs = { package = "crabsaxs", version = "0.1.1", path = "../../../crabSAXS" }
 crabwurcs-core.workspace = true
 crabwurcs-iupac.workspace = true
 crabwurcs-pdb.workspace = true
 clap.workspace = true
 glysys.workspace = true
-reglyco-build = { version = "0.1.0", path = "../reglyco-build" }
-reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
-reglyco-density = { version = "0.1.0", path = "../reglyco-density" }
-reglyco-ensemble = { version = "0.1.0", path = "../reglyco-ensemble" }
-reglyco-glycoflow = { version = "0.1.0", path = "../reglyco-glycoflow" }
-reglyco-refine = { version = "0.1.0", path = "../reglyco-refine" }
-reglyco-relax = { version = "0.1.0", path = "../reglyco-relax" }
-reglyco-report = { version = "0.1.0", path = "../reglyco-report" }
-reglyco-saxs = { version = "0.1.0", path = "../reglyco-saxs" }
-reglyco-validate = { version = "0.1.0", path = "../reglyco-validate" }
-reglyco-workflow = { version = "0.1.0", path = "../reglyco-workflow" }
+reglyco-build = { version = "0.2.3", path = "../reglyco-build" }
+reglyco-core = { version = "0.2.3", path = "../reglyco-core" }
+reglyco-density = { version = "0.2.3", path = "../reglyco-density" }
+reglyco-ensemble = { version = "0.2.3", path = "../reglyco-ensemble" }
+reglyco-glycoflow = { version = "0.2.3", path = "../reglyco-glycoflow" }
+reglyco-refine = { version = "0.2.3", path = "../reglyco-refine" }
+reglyco-relax = { version = "0.2.3", path = "../reglyco-relax" }
+reglyco-report = { version = "0.2.3", path = "../reglyco-report" }
+reglyco-saxs = { version = "0.2.3", path = "../reglyco-saxs" }
+reglyco-validate = { version = "0.2.3", path = "../reglyco-validate" }
+reglyco-workflow = { version = "0.2.3", path = "../reglyco-workflow" }
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true

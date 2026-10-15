@@ -1,6 +1,6 @@
 [package]
 name = "reglyco-relax"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.97"
 license.workspace = true
@@ -11,6 +11,6 @@ repository = "https://github.com/Ojas-Singh/ReGlyco"
 glysys.workspace = true
 glysys-energy.workspace = true
 glysys-opt.workspace = true
-reglyco-core = { version = "0.1.0", path = "../reglyco-core" }
+reglyco-core = { version = "0.2.3", path = "../reglyco-core" }
 serde.workspace = true
 thiserror.workspace = true

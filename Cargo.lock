@@ -1861,7 +1861,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "glycoflow-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -4029,7 +4029,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reglyco"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "glysys",
@@ -4049,7 +4049,7 @@ dependencies = [
 
 [[package]]
 name = "reglyco-build"
-version = "0.1.0"
+version = "0.2.3"
 dependencies = [
  "flate2",
  "glysys",
@@ -4063,7 +4063,7 @@ dependencies = [
 
 [[package]]
 name = "reglyco-cli"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -4092,7 +4092,7 @@ dependencies = [
 
 [[package]]
 name = "reglyco-core"
-version = "0.1.1"
+version = "0.2.3"
 dependencies = [
  "glysys",
  "serde",
@@ -4102,7 +4102,7 @@ dependencies = [
 
 [[package]]
 name = "reglyco-density"
-version = "0.1.0"
+version = "0.2.3"
 dependencies = [
  "flate2",
  "glysys",
@@ -4121,7 +4121,7 @@ dependencies = [
 
 [[package]]
 name = "reglyco-ensemble"
-version = "0.1.1"
+version = "0.2.3"
 dependencies = [
  "flate2",
  "glysys",
@@ -4147,7 +4147,7 @@ dependencies = [
 
 [[package]]
 name = "reglyco-glycoflow"
-version = "0.1.0"
+version = "0.2.3"
 dependencies = [
  "candle-core",
  "crabwurcs-iupac",
@@ -4175,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "reglyco-refine"
-version = "0.1.0"
+version = "0.2.3"
 dependencies = [
  "glysys",
  "reglyco-build",
@@ -4188,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "reglyco-relax"
-version = "0.1.0"
+version = "0.2.3"
 dependencies = [
  "glysys",
  "glysys-energy",
@@ -4200,7 +4200,7 @@ dependencies = [
 
 [[package]]
 name = "reglyco-report"
-version = "0.1.1"
+version = "0.2.3"
 dependencies = [
  "base64 0.22.1",
  "contour",
@@ -4226,7 +4226,7 @@ dependencies = [
 
 [[package]]
 name = "reglyco-saxs"
-version = "0.1.1"
+version = "0.2.3"
 dependencies = [
  "crabsaxs",
  "glysys",
@@ -4240,7 +4240,7 @@ dependencies = [
 
 [[package]]
 name = "reglyco-validate"
-version = "0.1.0"
+version = "0.2.3"
 dependencies = [
  "glysys",
  "reglyco-core",
@@ -4269,7 +4269,7 @@ dependencies = [
 
 [[package]]
 name = "reglyco-workflow"
-version = "0.1.0"
+version = "0.2.3"
 dependencies = [
  "candle-core",
  "glysys",
