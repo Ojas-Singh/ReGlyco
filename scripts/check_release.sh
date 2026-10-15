@@ -8,6 +8,10 @@
 # ReGlyco builds against ../GlySys and ../crabSAXS by path and crabWURCS from
 # git. The published crates take them from crates.io, so those releases must
 # be in the crates.io index first; the check stops there otherwise.
+#
+# Run it from a clean checkout of the commit to be tagged, with ../GlySys and
+# ../crabSAXS at their released tags; then tag it and publish with
+# scripts/publish_crates.sh VERSION (docs/release.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -149,3 +153,4 @@ done
 
 echo "release metadata and crate packages are consistent at $version"
 echo "publish order: ${crates[*]}"
+echo "next: tag v$version, then scripts/publish_crates.sh $version (docs/release.md)"
