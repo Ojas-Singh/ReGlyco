@@ -86,8 +86,9 @@ grep -q "^  GLYSYS_REF: v$glysys_version$" .github/workflows/release.yml ||
 grep -q "^  CRABSAXS_REF: \"$crabsaxs_version\"$" .github/workflows/release.yml ||
   fail "release.yml does not check out crabSAXS $crabsaxs_version"
 
-metadata=$(cargo metadata --no-deps --format-version 1 --locked) ||
+cargo metadata --format-version 1 --locked >/dev/null ||
   fail "Cargo.lock is not up to date (cargo metadata --locked failed)"
+metadata=$(cargo metadata --no-deps --format-version 1)
 
 # The list holds every publishable workspace member and nothing else.
 listed=$(printf '%s\n' "${crates[@]}" | sort)
