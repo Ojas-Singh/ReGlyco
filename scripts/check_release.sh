@@ -130,7 +130,13 @@ package_args=()
 for crate in "${crates[@]}"; do
   package_args+=(-p "$crate")
 done
-cargo package --locked --allow-dirty "${package_args[@]}"
+# gemm (candle, via glycoflow-core) has fp16 NEON assembly that assembles on
+# aarch64 only when optimised. Cargo.toml raises its opt-level for the
+# workspace, but each package is verified on its own, without that profile.
+cargo package --locked --allow-dirty \
+  --config 'profile.dev.package.gemm-common.opt-level = 3' \
+  --config 'profile.dev.package.gemm-f16.opt-level = 3' \
+  "${package_args[@]}"
 
 target_dir=$(jq -r .target_directory <<<"$metadata")
 for crate in "${crates[@]}"; do

@@ -51,7 +51,11 @@ while read -r crate pinned; do
     continue
   fi
   echo "publishing $crate $crate_version"
-  cargo publish -p "$crate" --locked
+  # The gemm opt-level of Cargo.toml, for verification on aarch64
+  # (scripts/check_release.sh).
+  cargo publish -p "$crate" --locked \
+    --config 'profile.dev.package.gemm-common.opt-level = 3' \
+    --config 'profile.dev.package.gemm-f16.opt-level = 3' </dev/null
   for _ in $(seq 60); do
     in_index "$crate" "$crate_version" && break
     sleep 10
