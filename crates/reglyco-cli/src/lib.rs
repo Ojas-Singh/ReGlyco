@@ -7,7 +7,7 @@ use std::{
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use crabwurcs_core::{AnomericSymbol, parse_wurcs, write_wurcs_canonical};
 use crabwurcs_iupac::write_iupac_condensed_canonical;
-use crabwurcs_pdb::extract_glycans_with_provenance_from_str;
+use crabwurcs_pdb::{NamePolicy, PdbReadOptions, PdbWarningKind, read_glycans_from_str};
 use glysys::{BuildOptions, ResidueId, SystemBuilder, read_pdb, write_pdb};
 use reglyco_build::{
     FetchedProtein, LinkageDefinition, ProteinFetchOptions, ProteinProvider, ProteinSource,
@@ -491,6 +491,9 @@ struct DiscoveredGlycanSite {
     root_anomer: Anomer,
     source_residues: Vec<String>,
     residue_count: usize,
+    /// Residues whose names and coordinates disagree (crabWURCS); the names decided.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1330,9 +1333,14 @@ fn run_refine(arguments: RefineArgs) -> anyhow::Result<()> {
         }
         if !quiet {
             eprintln!(
-                "refine: discovered {} protein-linked glycan site(s) from crabWURCS 0.3.1",
+                "refine: discovered {} protein-linked glycan site(s) with crabWURCS",
                 search_arguments.attachments.len()
             );
+            for site in &discovered_glycans {
+                for warning in &site.warnings {
+                    eprintln!("refine: glycan at {}: {warning}", site.site);
+                }
+            }
         }
     } else if search_arguments.attachments.is_empty() {
         search_arguments.attachments = arguments
@@ -2198,15 +2206,21 @@ fn discover_glycan_sites(
     provider: &ProviderArgs,
 ) -> anyhow::Result<Vec<DiscoveredGlycanSite>> {
     let pdb = structure.to_pdb_string();
-    let extracted = extract_glycans_with_provenance_from_str(&pdb, false)
-        .map_err(|error| anyhow::anyhow!("crabWURCS glycan extraction failed: {error}"))?;
+    // The glycan to model is the one the deposited residue names declare: since crabWURCS
+    // 0.3.3 the default reading takes each residue from its coordinates, which turns a
+    // modelling error (a beta-modelled core fucose, an alpha-modelled Asn-linked GlcNAc) into
+    // another glycan to look up and another root anomer to build. Where names and coordinates
+    // disagree, the disagreement is recorded with the site.
+    let reading =
+        read_glycans_from_str(&pdb, false, &PdbReadOptions::with_policy(NamePolicy::Names))
+            .map_err(|error| anyhow::anyhow!("crabWURCS glycan extraction failed: {error}"))?;
     let attachment_links = pdb_attachment_links(&pdb, structure);
     let client = reqwest::blocking::Client::builder()
         .user_agent("reglyco-rs/0.1")
         .build()?;
     let mut cache = BTreeMap::<String, (String, String, Option<String>)>::new();
     let mut discovered = Vec::new();
-    for glycan in extracted {
+    for (index, glycan) in reading.glycans.into_iter().enumerate() {
         let Some(attachment) = glycan.attachment_site.as_deref() else {
             continue;
         };
@@ -2373,6 +2387,18 @@ fn discover_glycan_sites(
             root_anomer,
             source_residues,
             residue_count: glycan.residues.len(),
+            warnings: reading
+                .warnings
+                .iter()
+                .filter(|warning| {
+                    warning.glycan_index == index
+                        && matches!(
+                            warning.kind,
+                            PdbWarningKind::NameContradictsCoordinates | PdbWarningKind::NoRing
+                        )
+                })
+                .map(ToString::to_string)
+                .collect(),
         });
     }
     discovered.sort_by(|left, right| left.site.cmp(&right.site));
@@ -2941,6 +2967,53 @@ mod tests {
         assert_eq!(
             without_reducing_end_anomer("Gal(b1-4)GlcNAc"),
             "Gal(b1-4)GlcNAc"
+        );
+    }
+
+    /// 8VM1: the core mannose is named `MAN` (alpha) but modelled beta. Discovery looks up the
+    /// glycan the names declare, builds the anomer of the name, and records the disagreement.
+    /// The resolver's answer comes from an offline cache.
+    #[test]
+    fn discovery_follows_the_residue_names_and_records_disagreements() {
+        use sha2::Digest;
+
+        let text = include_str!("../../reglyco-glycoflow/test-data/8vm1_asn92_glycan.pdb");
+        let structure = read_pdb_str(text, &BuildOptions::default()).unwrap();
+        let declared = "WURCS=2.0/2,3,2/[a2122h-1b_1-5_2*NCC/3=O][a1122h-1a_1-5]/1-1-2/a4-b1_b4-c1";
+        let canonical =
+            crabwurcs_core::write_wurcs_canonical(&crabwurcs_core::parse_wurcs(declared).unwrap())
+                .unwrap();
+        let cache =
+            std::env::temp_dir().join(format!("reglyco-discovery-test-{}", std::process::id()));
+        let resolutions = cache.join("topology-resolutions");
+        std::fs::create_dir_all(&resolutions).unwrap();
+        std::fs::write(
+            resolutions.join(format!(
+                "{:x}.json",
+                sha2::Sha256::digest(canonical.as_bytes())
+            )),
+            serde_json::json!({"glytoucan": "G00TEST", "wurcs": canonical}).to_string(),
+        )
+        .unwrap();
+        let provider = super::ProviderArgs {
+            api_base: "http://127.0.0.1:9".into(),
+            cache: cache.clone(),
+            offline: true,
+            anomer: "beta".into(),
+            level: "1".into(),
+        };
+        let discovered = super::discover_glycan_sites(&structure, &provider);
+        std::fs::remove_dir_all(&cache).unwrap();
+        let discovered = discovered.unwrap();
+        assert_eq!(discovered.len(), 1);
+        let site = &discovered[0];
+        assert_eq!(site.site.to_string(), "A:92");
+        assert_eq!(site.canonical_wurcs, canonical);
+        assert_eq!(site.glytoucan, "G00TEST");
+        assert!(matches!(site.root_anomer, reglyco_core::Anomer::Beta));
+        assert_eq!(
+            site.warnings,
+            ["residue MAN B:3: named α-D-Manp, coordinates say β-D-Manp (anomer)"]
         );
     }
 

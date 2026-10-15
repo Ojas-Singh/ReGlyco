@@ -9,7 +9,7 @@ use contour::ContourBuilder;
 use crabwurcs_core::ResidueGraph;
 use crabwurcs_core::write_wurcs_canonical;
 use crabwurcs_iupac::write_iupac_condensed_canonical;
-use crabwurcs_pdb::{PdbResidueReference, extract_glycans_with_provenance_from_str};
+use crabwurcs_pdb::{PdbReadOptions, PdbResidueReference, PdbWarningKind, read_glycans_from_str};
 use crabwurcs_snfg::{HighlightSelection, RenderOptions, render_svg, render_svg_with_selection};
 use glysys::{ResidueId, Structure, Vec3};
 use petgraph::visit::EdgeRef;
@@ -595,6 +595,16 @@ impl WorkflowReport {
         std::fs::write(path, contents + "\n")
     }
 
+    /// Add warnings that are not in the report yet (a structure analysed at several stages
+    /// reports the same glycan warnings each time).
+    fn add_warnings(&mut self, warnings: Vec<String>) {
+        for warning in warnings {
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning);
+            }
+        }
+    }
+
     /// Attach reusable structural analysis to this report. A failed carbohydrate
     /// extraction is retained as a warning so computational results are never lost.
     pub fn analyze_structure(&mut self, structure: &Structure) {
@@ -612,7 +622,7 @@ impl WorkflowReport {
             .iter()
             .map(|torsion| self.torsion_observation(structure, torsion, stage, "accepted", None))
             .collect();
-        self.warnings.extend(warnings);
+        self.add_warnings(warnings);
         if let Some(search) = &self.search {
             self.analysis.protein_linkage_torsions = search
                 .sites
@@ -1020,7 +1030,7 @@ impl WorkflowReport {
     pub fn analyze_glycan_identity(&mut self, structure: &Structure) {
         let (glycans, warnings) = glycan_summaries(structure);
         self.analysis.glycans = glycans;
-        self.warnings.extend(warnings);
+        self.add_warnings(warnings);
     }
 
     /// Write the complete reproducible PDF bundle. `report.json` is written
@@ -1126,11 +1136,15 @@ impl WorkflowReport {
     }
 }
 
+/// The glycans of a structure as their coordinates describe them (crabWURCS's default reading),
+/// with a warning for every residue whose name says otherwise or that the coordinates could not
+/// read. Missing atoms are not reported: a structure without hydrogens lacks some by design, and
+/// the residue name fills them in.
 fn glycan_summaries(structure: &Structure) -> (Vec<GlycanSummary>, Vec<String>) {
     let mut warnings = Vec::new();
     let pdb = structure.to_pdb_string();
-    let extracted = match extract_glycans_with_provenance_from_str(&pdb, false) {
-        Ok(glycans) => glycans,
+    let reading = match read_glycans_from_str(&pdb, false, &PdbReadOptions::default()) {
+        Ok(reading) => reading,
         Err(error) => {
             warnings.push(format!("crabWURCS could not extract glycans: {error}"));
             return (Vec::new(), warnings);
@@ -1153,23 +1167,36 @@ fn glycan_summaries(structure: &Structure) -> (Vec<GlycanSummary>, Vec<String>) 
                 })
         })
         .collect::<BTreeSet<_>>();
-    let extracted = if expected_attachments.is_empty() {
-        extracted
-    } else {
-        extracted
-            .into_iter()
-            .filter(|glycan| {
-                glycan
+    let extracted = reading
+        .glycans
+        .into_iter()
+        .enumerate()
+        .filter(|(_, glycan)| {
+            expected_attachments.is_empty()
+                || glycan
                     .attachment_site
                     .as_ref()
                     .is_some_and(|site| expected_attachments.contains(site))
-            })
-            .collect()
-    };
+        })
+        .collect::<Vec<_>>();
     let result = extracted
         .into_iter()
         .enumerate()
-        .map(|(index, glycan)| {
+        .map(|(index, (read_index, glycan))| {
+            let label = match glycan.attachment_site.as_deref() {
+                Some(site) => format!("glycan {} at {site}", index + 1),
+                None => format!("glycan {}", index + 1),
+            };
+            warnings.extend(
+                reading
+                    .warnings
+                    .iter()
+                    .filter(|warning| {
+                        warning.glycan_index == read_index
+                            && warning.kind != PdbWarningKind::MissingAtoms
+                    })
+                    .map(|warning| format!("{label}: {warning}")),
+            );
             let wurcs = write_wurcs_canonical(&glycan.graph).ok();
             let iupac = write_iupac_condensed_canonical(&glycan.graph).ok();
             let snfg_svg = render_svg(&glycan.graph).ok();
@@ -4674,6 +4701,44 @@ END
                 "{fields}"
             );
         }
+    }
+
+    /// The glycan is reported as its coordinates describe it, and a residue name that says
+    /// otherwise is a warning (once, however often the structure is analysed). The reducing
+    /// glucose has no O1: missing atoms are not reported.
+    #[test]
+    fn residue_names_that_contradict_the_coordinates_are_warnings() {
+        let structure = glysys::read_pdb_str(
+            &GAL_A16_GLC.replace(" GLA G ", " GAL G "),
+            &glysys::BuildOptions {
+                add_water: false,
+                add_ions: false,
+                ..glysys::BuildOptions::default()
+            },
+        )
+        .unwrap();
+        let mut report = empty_report();
+        report.analyze_glycan_identity(&structure);
+        report.analyze_glycan_identity(&structure);
+        assert_eq!(report.analysis.glycans.len(), 1);
+        assert!(
+            report.analysis.glycans[0]
+                .iupac
+                .as_deref()
+                .is_some_and(|iupac| iupac.starts_with("Gal(a1-6)Glc")),
+            "{:?}",
+            report.analysis.glycans[0].iupac
+        );
+        assert_eq!(
+            report.warnings,
+            [
+                "glycan 1 at G/GLC/2: residue GAL G:3: named β-D-Galp, coordinates say α-D-Galp (anomer)"
+            ],
+        );
+
+        let mut report = empty_report();
+        report.analyze_glycan_identity(&gal_a16_glc());
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
     #[test]
