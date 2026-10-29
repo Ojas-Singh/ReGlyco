@@ -658,7 +658,7 @@ pub enum ReGlycoError {
     MissingGlycanAtom(String),
     #[error("attachment geometry contains coincident or collinear anchors")]
     InvalidGeometry,
-    #[error("no unused single-character chain identifier remains")]
+    #[error("no single-character chain identifier is free or can be shared for the glycan")]
     NoAvailableChain,
     #[error("ensemble input is missing: {0}")]
     MissingInput(String),

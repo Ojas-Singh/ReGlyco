@@ -1083,7 +1083,7 @@ fn attach(
     )?;
     glycan.remove_residues_named(&["ROH"]);
 
-    let chain = next_chain(protein)?;
+    let chain = next_chain(protein, &site)?;
     let appended = protein.append(&glycan, &chain)?;
     let appended_root = appended
         .residue(&root)
@@ -1367,16 +1367,52 @@ fn glycan_root(glycan: &Structure) -> Result<ResidueId> {
     }
 }
 
-fn next_chain(structure: &Structure) -> Result<String> {
-    let used = structure
-        .residues()
-        .into_iter()
-        .map(|residue| residue.id.chain)
+/// The single-character chain identifiers a PDB file can hold, in the order
+/// GlySys' writers use them.
+const CHAIN_IDS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/// The chain a new glycan goes on: an unused identifier while one is left,
+/// then (a large glycoprotein with many chains and glycans) the glycan-only
+/// chain holding the fewest glycans, and with none, the chain of the site.
+/// Glycans that share a chain keep their own residue numbers (`append`
+/// numbers after the chain's last residue) and are told apart by their bonds,
+/// as GlySys does when it reads such a file back.
+fn next_chain(structure: &Structure, site: &ResidueId) -> Result<String> {
+    let residues = structure.residues();
+    let used = residues
+        .iter()
+        .map(|residue| residue.id.chain.clone())
         .collect::<BTreeSet<_>>();
-    ('A'..='Z')
-        .map(|chain| chain.to_string())
+    if let Some(free) = CHAIN_IDS
+        .chars()
+        .map(String::from)
         .find(|chain| !used.contains(chain))
-        .ok_or(ReGlycoError::NoAvailableChain)
+    {
+        return Ok(free);
+    }
+    let trees = &structure.metadata().glycan_trees;
+    let glycan_residues = trees
+        .iter()
+        .flat_map(|tree| &tree.residue_ids)
+        .collect::<BTreeSet<_>>();
+    let shared = used
+        .iter()
+        .filter(|chain| chain.chars().count() == 1)
+        .filter(|chain| {
+            residues
+                .iter()
+                .filter(|residue| &residue.id.chain == *chain)
+                .all(|residue| glycan_residues.contains(&residue.id))
+        })
+        .min_by_key(|chain| {
+            let glycans = trees.iter().filter(|tree| &tree.chain == *chain).count();
+            (glycans, CHAIN_IDS.find(chain.as_str()))
+        });
+    match shared {
+        Some(chain) => Ok(chain.clone()),
+        None if site.chain.chars().count() == 1 => Ok(site.chain.clone()),
+        None => Err(ReGlycoError::NoAvailableChain),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1830,6 +1866,125 @@ END
         assert!(cleaned.contains("ATOM      1"));
         assert!(!cleaned.contains("LINK"));
         assert!(!cleaned.contains("CONECT"));
+    }
+
+    /// The fixture protein plus a second asparagine on chain C and one-residue
+    /// chains on every other identifier but the last `free` ones.
+    fn protein_with_chains_taken(free: usize) -> String {
+        let mut pdb = PROTEIN.replace("END\n", "");
+        let mut serial = 15;
+        for line in PROTEIN.lines().filter(|line| line.contains(" ASN A ")) {
+            let x: f64 = line[30..38].trim().parse().unwrap();
+            pdb.push_str(&format!(
+                "{}{serial:>5}{}C{}{:>8.3}{}\n",
+                &line[..6],
+                &line[11..21],
+                &line[22..30],
+                x + 40.0,
+                &line[38..]
+            ));
+            serial += 1;
+        }
+        pdb.push_str("TER\n");
+        let taken = CHAIN_IDS.len() - free;
+        for (index, chain) in CHAIN_IDS
+            .chars()
+            .take(taken)
+            .filter(|c| !"ABC".contains(*c))
+            .enumerate()
+        {
+            let x = 200.0 + 6.0 * index as f64;
+            for (name, dx, dy, element) in [
+                ("N", 0.0, 0.0, "N"),
+                ("CA", 1.45, 0.0, "C"),
+                ("C", 2.0, 1.42, "C"),
+                ("O", 1.35, 2.44, "O"),
+            ] {
+                pdb.push_str(&format!(
+                    "ATOM  {serial:>5}  {name:<3} GLY {chain}   1    {:>8.3}{:>8.3}{:>8.3}  1.00  0.00           {element}\n",
+                    x + dx,
+                    dy,
+                    0.0
+                ));
+                serial += 1;
+            }
+            pdb.push_str("TER\n");
+        }
+        pdb.push_str("END\n");
+        pdb
+    }
+
+    fn glycosylate(protein: &str, sites: &[(&str, i32)]) -> Structure {
+        let options = dry_options();
+        let protein = read_pdb_str(protein, &options).unwrap();
+        let glycan = read_pdb_str(GLYCAN, &options).unwrap();
+        let builder = SystemBuilder::new(options).unwrap();
+        build(
+            BuildRequest {
+                protein,
+                attachments: sites
+                    .iter()
+                    .map(|(chain, number)| AttachmentRequest {
+                        site: GlycosylationSite::new(*chain, *number),
+                        conformer: GlycanConformer::new(glycan.clone()),
+                    })
+                    .collect(),
+                parameterize: false,
+            },
+            &builder,
+        )
+        .unwrap()
+        .structure
+    }
+
+    #[test]
+    fn glycans_share_a_chain_once_every_chain_identifier_is_taken() {
+        // one identifier left for two glycans: the second shares the first's chain
+        let built = glycosylate(&protein_with_chains_taken(1), &[("A", 1), ("C", 1)]);
+        let trees = &built.metadata().glycan_trees;
+        assert_eq!(trees.len(), 2);
+        assert!(trees.iter().all(|tree| tree.chain == "9"));
+        let residues = trees
+            .iter()
+            .flat_map(|tree| tree.residue_ids.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            residues.len(),
+            trees
+                .iter()
+                .map(|tree| tree.residue_ids.len())
+                .sum::<usize>()
+        );
+        // written as PDB and read back, the two glycans stay apart
+        let reread = read_pdb_str(&built.to_pdb_string(), &dry_options()).unwrap();
+        let mut sites = reread
+            .metadata()
+            .glycosylation_sites
+            .iter()
+            .map(|site| {
+                (
+                    site.protein_residue.chain.clone(),
+                    site.glycan_residue.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        sites.sort();
+        assert_eq!(sites.len(), 2);
+        assert_ne!(sites[0].1, sites[1].1);
+        assert!(sites.iter().all(|(_, glycan)| glycan.chain == "9"));
+        let reread_trees = &reread.metadata().glycan_trees;
+        assert_eq!(reread_trees.len(), 2);
+        assert!(
+            reread_trees
+                .iter()
+                .all(|tree| tree.residue_ids.len() == trees[0].residue_ids.len())
+        );
+
+        // with no identifier left at all, a glycan goes on the chain of its site
+        let built = glycosylate(&protein_with_chains_taken(0), &[("C", 1)]);
+        let tree = &built.metadata().glycan_trees[0];
+        assert_eq!(tree.chain, "C");
+        assert!(tree.residue_ids.iter().all(|residue| residue.number > 1));
     }
 
     #[test]
