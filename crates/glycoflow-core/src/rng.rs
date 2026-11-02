@@ -50,3 +50,29 @@ pub fn uniform_torsions(rng: &mut SplitMix64, n: usize) -> Vec<f32> {
         .map(|_| (rng.uniform_f32() * 2.0 - 1.0) * std::f32::consts::PI)
         .collect()
 }
+
+/// Standard normal draws (Box-Muller), as many as `n`.
+pub fn normal_f32(rng: &mut SplitMix64, n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n + 1);
+    while out.len() < n {
+        let u = rng.uniform_f64().max(1e-300);
+        let v = rng.uniform_f64();
+        let r = (-2.0 * u.ln()).sqrt();
+        let a = 2.0 * std::f64::consts::PI * v;
+        out.push((r * a.cos()) as f32);
+        out.push((r * a.sin()) as f32);
+    }
+    out.truncate(n);
+    out
+}
+
+/// Ring-shape prior draws for `samples` conformers (`flow.sample`): standard normal on the
+/// Cremer-Pople components each ring has (`chan`, [R*3], from `Sampler::pucker_channels`), zero on
+/// the rest.
+pub fn ring_prior(rng: &mut SplitMix64, chan: &[f32], samples: usize) -> Vec<f32> {
+    let mut q = normal_f32(rng, samples * chan.len());
+    for (k, v) in q.iter_mut().enumerate() {
+        *v *= chan[k % chan.len().max(1)];
+    }
+    q
+}

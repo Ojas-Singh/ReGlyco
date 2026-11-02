@@ -9,10 +9,13 @@ use crate::geometry::{rotate_torsions, torsion_gradient, Real};
 use crate::sampler::{Guidance, GuidanceContext};
 use crate::topology::ELEMENTS;
 
-/// Contact floors (`flow.CC_FLOOR`, `C_POLAR_FLOOR`, `POLAR_FLOOR`).
+/// Contact floors (`flow.CC_FLOOR`, `C_POLAR_FLOOR`, `POLAR_FLOOR`, `flow.H_FLOOR`).
 pub const CC_FLOOR: f32 = 3.0;
 pub const C_POLAR_FLOOR: f32 = 2.8;
 pub const POLAR_FLOOR: f32 = 2.5;
+/// Any pair involving a (polar) hydrogen: an intramolecular hydrogen bond is 1.8-2.0 A, so the
+/// heavy-atom floors would read every one of them as a clash and guidance would pull it apart.
+pub const H_FLOOR: f32 = 1.7;
 
 pub struct ClashGuidance {
     pub scale: f32,
@@ -34,13 +37,18 @@ impl ClashGuidance {
     fn pairs(&mut self, ctx: &GuidanceContext) -> &[(usize, usize, f32)] {
         self.pairs.get_or_insert_with(|| {
             let n = ctx.topology.n_atoms;
-            let c_tok = ELEMENTS.iter().position(|e| *e == "C").unwrap() as u32;
+            let tok = |e: &str| ELEMENTS.iter().position(|x| *x == e).unwrap() as u32;
+            let (c_tok, h_tok) = (tok("C"), tok("H"));
             let mut out = Vec::new();
             for i in 0..n {
                 for j in i + 1..n {
                     if ctx.topology.topo_dist[i * n + j] >= 4 {
                         let (ci, cj) = (ctx.tokens[i][0] == c_tok, ctx.tokens[j][0] == c_tok);
-                        let floor = if ci && cj {
+                        let any_h =
+                            ctx.tokens[i][0] == h_tok || ctx.tokens[j][0] == h_tok;
+                        let floor = if any_h {
+                            H_FLOOR
+                        } else if ci && cj {
                             CC_FLOOR
                         } else if ci ^ cj {
                             C_POLAR_FLOOR

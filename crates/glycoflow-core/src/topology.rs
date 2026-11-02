@@ -11,8 +11,9 @@ use crate::geometry;
 
 /// Cap of the topological distance matrix (`data.TOPO_DIST_CAP`).
 pub const TOPO_DIST_CAP: u8 = 12;
-/// Element vocabulary (`dataset.ELEMENTS`).
-pub const ELEMENTS: [&str; 7] = ["<pad>", "<unk>", "C", "N", "O", "S", "P"];
+/// Element vocabulary (`dataset.ELEMENTS`). H is last, so the indices an earlier heavy-atom
+/// checkpoint was trained with are unchanged and both kinds of checkpoint share this table.
+pub const ELEMENTS: [&str; 8] = ["<pad>", "<unk>", "C", "N", "O", "S", "P", "H"];
 
 fn atomic_number(el: &str) -> i32 {
     match el {
@@ -30,6 +31,9 @@ fn atomic_number(el: &str) -> i32 {
 pub struct Topology {
     pub n_atoms: usize,
     pub ring_atoms: Vec<bool>,
+    /// the sugar rings in canonical order, with their substituent sets: the ring-shape coordinate
+    /// the pucker head generates and `pucker::set_puckers` writes (`data.ring_cycles`)
+    pub rings: Vec<crate::pucker::Ring>,
     /// topological distance, row-major [N, N], capped at 12
     pub topo_dist: Vec<u8>,
     /// rotatable torsions (a, b, c, d), bond b->c oriented away from atom 0, sorted by depth of b
@@ -170,6 +174,7 @@ impl Topology {
         Ok(Self {
             n_atoms: n,
             ring_atoms,
+            rings: crate::pucker::ring_cycles(n, bonds, elements),
             topo_dist,
             quads,
             distal,
