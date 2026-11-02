@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use crate::cartesian::coordinate_objective;
-use crate::problem::{SiteProblem, Terms, V3};
+use crate::problem::{Pose, SiteProblem, Terms, V3, dihedral};
 use crate::site::{DepositedGlycan, Site};
 
 /// Core of an N-glycan: the chitobiose and the beta-mannose.
@@ -33,7 +33,7 @@ pub fn recovery(
     let mut pairs: Vec<(String, f64)> = Vec::new();
     for (i, xi) in x.iter().enumerate().take(problem.n_atoms) {
         let path = &problem.glycan.res_paths[i];
-        if path == "agl" {
+        if !problem.keep[i] {
             continue;
         }
         if let Some(r) = deposited
@@ -136,5 +136,60 @@ pub fn deposited_score(
         terms,
         matched_atoms: matched,
         scored_atoms: scored,
+    }
+}
+
+/// The deposited glycan as a pose of `problem` (evaluation only): torsions measured on the deposit
+/// wherever it has all four atoms (others, such as hydroxyl rotamers, from `fallback`), the
+/// attachment angles measured on it, and the pucker template closest to it in place.
+pub fn deposited_pose(problem: &SiteProblem, deposited: &DepositedGlycan, fallback: &Pose) -> Pose {
+    let at = |i: usize| {
+        deposited.atoms.get(&(
+            problem.glycan.res_paths[i].clone(),
+            problem.glycan.atom_names[i].clone(),
+        ))
+    };
+    let tau: Vec<f64> = problem
+        .glycan
+        .topology
+        .quads
+        .iter()
+        .zip(&fallback.tau)
+        .map(|(q, &t)| match (at(q[0]), at(q[1]), at(q[2]), at(q[3])) {
+            (Some(a), Some(b), Some(c), Some(d)) => dihedral(*a, *b, *c, *d),
+            _ => t,
+        })
+        .collect();
+    let (psi, phi) = match (at(problem.c1), at(problem.o5)) {
+        (Some(c1), Some(o5)) => {
+            let [a, b, l] = problem.anchor;
+            (dihedral(a, b, l, *c1), dihedral(b, l, *c1, *o5))
+        }
+        _ => (fallback.psi, fallback.phi),
+    };
+    let msd = |template: usize| {
+        let x = problem.place(&Pose {
+            tau: tau.clone(),
+            psi,
+            phi,
+            template,
+        });
+        let (mut s, mut n) = (0.0, 0usize);
+        for (i, xi) in x.iter().enumerate().take(problem.n_atoms) {
+            if let (true, Some(r)) = (problem.keep[i], at(i)) {
+                s += (0..3).map(|k| (xi[k] - r[k]).powi(2)).sum::<f64>();
+                n += 1;
+            }
+        }
+        s / n.max(1) as f64
+    };
+    let template = (0..problem.templates.len())
+        .min_by(|&a, &b| msd(a).total_cmp(&msd(b)))
+        .unwrap_or(0);
+    Pose {
+        tau,
+        psi,
+        phi,
+        template,
     }
 }

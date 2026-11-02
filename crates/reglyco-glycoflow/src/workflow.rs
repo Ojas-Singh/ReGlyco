@@ -7,7 +7,9 @@ use web_time::Instant;
 use glycoflow_core::sampler::Sampler;
 use glysys::{ResidueId, Structure};
 use reglyco_density::{DensityMap, DensityScoreOptions, DensityScorer, DensityTarget};
-use reglyco_validate::{ValidationOptions, ValidationReport, validate_with_density};
+use reglyco_validate::{
+    ValidationOptions, ValidationReport, validate_with_density, validate_with_options,
+};
 use serde_json::{Value, json};
 
 use crate::error::{Result, invalid, write_file};
@@ -19,9 +21,9 @@ use crate::output::{
 };
 use crate::pipeline::{
     FitConfig, FitOutcome, PriorConfig, SigmaCalibration, build_prior, calibrate_sigma,
-    density_problem, fit_site,
+    density_problem, fit_site, reselect,
 };
-use crate::problem::{ProblemOptions, SiteProblem, V3};
+use crate::problem::{Pose, ProblemOptions, SiteProblem, V3};
 use crate::site::{CrystalInput, Site, SiteOptions, deposited_glycan, load_site};
 use crate::symmetry::{UnitCell, parse_cryst1, parse_resolution};
 
@@ -45,6 +47,16 @@ pub struct WorkflowOptions {
     pub resolution: Option<f64>,
     /// watches every fit (progress, search trajectories); none by default
     pub observer: crate::observer::Observer,
+    /// also weight the retained basins into a maximum-entropy ensemble (`maxent`): a description
+    /// of the site next to the single pose, which stays the model; off by default
+    pub maxent: bool,
+    /// evaluation only: also start a basin at the deposited glycan's pose
+    /// (`evaluation::deposited_pose`), so the fit reports the best pose the pipeline reaches from
+    /// the deposit; off by default
+    pub seed_deposit: bool,
+    /// inference: fit every candidate even when the map does not support the candidates' shared
+    /// reducing-end residue on its own (`infer::glycan_from_density`); off by default
+    pub infer_without_root_check: bool,
 }
 
 pub struct WorkflowInput<'a> {
@@ -71,6 +83,8 @@ pub struct SiteFit {
     pub preparation_seconds: f64,
     pub prior_seconds: f64,
     pub prior_network_evaluations: usize,
+    /// the retained basins as a weighted ensemble (with `WorkflowOptions::maxent`)
+    pub maxent: Option<crate::maxent::MaxEntEnsemble>,
 }
 
 pub struct WorkflowResult {
@@ -111,6 +125,9 @@ pub fn crystal_input(text: Option<&str>, map: &DensityMap) -> CrystalInput {
 }
 
 /// Fit one site.
+/// Alternatives tried when the selected pose fails validation (`fit_one`).
+pub const VALID_ALTERNATIVES: usize = 5;
+
 pub fn fit_one(
     input: &WorkflowInput,
     request: &SiteRequest,
@@ -162,8 +179,55 @@ pub fn fit_one(
         prior_network_evaluations = options.prior.n_samples * options.prior.steps;
     }
     let prior_seconds = t1.elapsed().as_secs_f64();
-    let outcome = fit_site(&mut problem, &sampler, &options.fit)?;
+    let mut fit_config = options.fit.clone();
+    if options.seed_deposit {
+        if let Some(dep) = site.deposited.as_ref() {
+            let fallback = Pose {
+                tau: vec![std::f64::consts::PI; problem.n_torsions],
+                psi: problem.link_torsion.start(),
+                phi: 0.0,
+                template: 0,
+            };
+            fit_config
+                .extra_starts
+                .push(crate::evaluation::deposited_pose(&problem, dep, &fallback));
+        }
+    }
+    let mut outcome = fit_site(&mut problem, &sampler, &fit_config)?;
     let naming = residue_naming(&problem, &site, protein)?;
+    // a selected pose that fails validation (a hard overlap the contact energies left) gives way to
+    // the best alternative that passes: alternatives lie within `alt_margin` of it, so the map
+    // cannot tell them apart
+    let passes = |x: &[[f64; 3]]| -> Result<bool> {
+        let placed = PlacedGlycan {
+            problem: &problem,
+            site: &site,
+            naming: &naming,
+            x,
+        };
+        let structure = fitted_structure(protein, &[placed])?;
+        let options = ValidationOptions {
+            focus_sites: vec![site.residue.clone()],
+            ..ValidationOptions::default()
+        };
+        Ok(validate_with_options(&structure, &options).valid)
+    };
+    if !passes(&outcome.basins[outcome.best].x)? {
+        let best = outcome.best;
+        let candidates: Vec<usize> = outcome
+            .alternatives
+            .iter()
+            .copied()
+            .filter(|&i| i != best)
+            .take(VALID_ALTERNATIVES)
+            .collect();
+        for i in candidates {
+            if passes(&outcome.basins[i].x)? {
+                reselect(&problem, &sampler, &fit_config, &mut outcome, i)?;
+                break;
+            }
+        }
+    }
     let recovery = site.deposited.as_ref().map(|dep| {
         let claimed: Vec<String> = std::iter::once("r".to_string())
             .chain(
@@ -176,7 +240,21 @@ pub fn fit_one(
             .collect();
         recovery(&problem, dep, &outcome.basins[outcome.best].x, &claimed)
     });
+    let maxent = if options.maxent && outcome.basins.len() >= 2 {
+        if let Some(o) = options.observer.get() {
+            o.stage("max-ent");
+        }
+        let members: Vec<Vec<[f64; 3]>> = outcome.basins.iter().map(|b| b.x.clone()).collect();
+        Some(crate::maxent::maxent_ensemble(
+            &problem,
+            &members,
+            (0..members.len()).collect(),
+        )?)
+    } else {
+        None
+    };
     Ok(SiteFit {
+        maxent,
         site,
         problem,
         outcome,
@@ -308,6 +386,17 @@ pub fn site_report(f: &SiteFit, input: &WorkflowInput) -> Value {
             "prior_seconds": f.prior_seconds,
             "device": input.model.device,
         },
+        "maxent": f.maxent.as_ref().map(|m| json!({
+            "note": "the retained basins weighted to maximise loglik(w) - theta KL(w || uniform); read at half the members' effective sample size. A description next to the single pose, not a better model of it; the gain is in-sample.",
+            "weights": m.at_half.weights,
+            "effective_sample_size": m.at_half.ess,
+            "theta": m.at_half.theta,
+            "loglik": m.at_half.mixture.loglik,
+            "best_pose_loglik": m.best_pose_loglik,
+            "flat_average_loglik": m.flat.loglik,
+            "gain_ratio": m.gain_ratio,
+            "curve": m.curve.iter().map(|p| json!({"theta": p.theta, "ess": p.ess, "loglik": p.mixture.loglik, "kl": p.kl})).collect::<Vec<_>>(),
+        })),
         "evaluation": f.recovery.as_ref().map(|r| json!({
             "note": "in-place RMSD to the deposited glycan (evaluation only; never used by the fit)",
             "recovery": r,

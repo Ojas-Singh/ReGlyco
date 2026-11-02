@@ -31,6 +31,17 @@ pub struct ModelConfig {
     pub rbf_max: f64,
     pub ff_mult: usize,
     pub torsion_freqs: usize,
+    /// Whether the checkpoint also generates ring shapes (`head_pucker`, a velocity on each ring's
+    /// Cremer-Pople vector). Defaults to false so the fixed-ring checkpoints keep deserialising.
+    ///
+    /// This field exists so a ring-head checkpoint cannot load here by accident. Weights are looked
+    /// up by name out of a `HashMap` and unknown config keys are ignored, so before it was added a
+    /// ring-head model loaded with no error at all: `head_pucker.*` and `"pucker": true` were simply
+    /// never read, and the engine ran it on library pucker templates -- a regime whose torsion head
+    /// was trained against rings interpolating noise to data at every t. The only symptom was
+    /// quietly worse output. `TorsionFlowNet::load` now refuses that checkpoint outright.
+    #[serde(default)]
+    pub pucker: bool,
 }
 
 /// `weights/glycoflow.json` written by `scripts/export_rust_fixtures.py`.
@@ -45,14 +56,17 @@ pub struct ModelMeta {
 impl ModelMeta {
     pub fn from_json_str(s: &str) -> Result<Self> {
         let m: ModelMeta = serde_json::from_str(s)?;
-        if !m.elements.is_empty()
-            && m.elements
+        // The checkpoint's table has to agree with ours position by position, but may be shorter:
+        // a heavy-atom checkpoint predates the H entry, and an element it never saw is one it is
+        // never asked about. A longer or reordered table is a different vocabulary.
+        if m.elements.len() > ELEMENTS.len()
+            || m.elements
                 .iter()
-                .map(String::as_str)
-                .ne(ELEMENTS.iter().copied())
+                .zip(ELEMENTS)
+                .any(|(a, b)| a.as_str() != b)
         {
             return Err(Error::Invalid(format!(
-                "checkpoint element table {:?} differs from {:?}",
+                "checkpoint element table {:?} is not a prefix of {:?}",
                 m.elements, ELEMENTS
             )));
         }
@@ -304,6 +318,15 @@ pub struct GraphBatch {
     pub has_padding: bool,
     pub n_atoms: usize,
     pub n_torsions: usize,
+    /// rings per graph (0 when no graph in the batch has a ring)
+    pub n_rings: usize,
+    /// 4 x [bg,R,N]: the ring-atom pooling of the pucker head, with the Cremer-Pople weights folded
+    /// into the selection matrix. Row `r` of channel `c` holds `w_c[j]` at the atom in slot `j` of
+    /// ring `r`, so `pool_c = ring_pool[c] @ h` is `(hr * w_c).sum(slots)` in one matmul. The four
+    /// channels are the slot mean, cos, sin and alternating modes, in the order the head reads them.
+    /// Padded rings and padded slots carry no weight, so nothing has to be masked afterwards.
+    ring_pool: Vec<Tensor>,
+    ring_valid: Option<Tensor>, // [bg,R,1]: 0 for a ring row a graph does not have
     tokens: Tensor,     // [bg,N,5] u32
     topo: Tensor,       // [bg,N,N] u32 (clamped to TOPO_BINS-1)
     sel: Vec<Tensor>,   // 4 x [bg,T,N] one-hot of quad column
@@ -371,6 +394,28 @@ impl GraphBatch {
                 }
             }
         }
+        // ring-atom pooling weights of the pucker head (`model.TorsionFlowNet.forward`)
+        let r = graphs
+            .iter()
+            .map(|g| g.topology.rings.len())
+            .max()
+            .unwrap();
+        let mut ring_pool = vec![vec![0f32; bg * r.max(1) * n]; 4];
+        let mut ring_valid = vec![0f32; bg * r.max(1)];
+        for (gi, g) in graphs.iter().enumerate() {
+            for (ri, ring) in g.topology.rings.iter().enumerate() {
+                ring_valid[gi * r + ri] = 1.0;
+                let (cb, sb, ab) = crate::pucker::cp_basis(ring.len());
+                let mean = 1.0 / ring.len() as f32;
+                for (j, &atom) in ring.atoms.iter().enumerate() {
+                    let at = (gi * r + ri) * n + atom;
+                    ring_pool[0][at] += mean;
+                    ring_pool[1][at] += cb[j] as f32;
+                    ring_pool[2][at] += sb[j] as f32;
+                    ring_pool[3][at] += ab[j] as f32;
+                }
+            }
+        }
         let sel_t: Vec<Tensor> = [1usize, 2]
             .iter()
             .map(|&col| {
@@ -390,6 +435,20 @@ impl GraphBatch {
             has_padding: graphs.iter().any(|g| g.topology.n_atoms < n),
             n_atoms: n,
             n_torsions: t,
+            n_rings: r,
+            ring_pool: if r == 0 {
+                Vec::new()
+            } else {
+                ring_pool
+                    .into_iter()
+                    .map(|s| Tensor::from_vec(s, (bg, r, n), device))
+                    .collect::<candle_core::Result<_>>()?
+            },
+            ring_valid: if r == 0 {
+                None
+            } else {
+                Some(Tensor::from_vec(ring_valid, (bg, r, 1), device)?)
+            },
             tokens: Tensor::from_vec(tokens, (bg, n, 5), device)?,
             topo: Tensor::from_vec(topo, (bg, n, n), device)?,
             sel: sel
@@ -437,6 +496,8 @@ pub struct TorsionFlowNet {
     head0: Linear,
     head2: Linear,
     head4: Linear,
+    /// `head_pucker.{0,2,4}`: the ring-shape velocity head, present only in a ring-head checkpoint
+    pucker: Option<[Linear; 3]>,
     force_value: Linear,
     force_mix: Linear,
     pair_params: PairParams,
@@ -472,6 +533,29 @@ impl TorsionFlowNet {
     ) -> Result<Self> {
         let p = precision;
         let lin = |name: &str| Linear::load(w, name, p);
+        // Whether this checkpoint generates ring shapes is read from the weights, not only from the
+        // config: a ring-head checkpoint whose `"pucker"` flag was stripped would otherwise load as
+        // a fixed-ring model and run silently on library ring templates (see `ModelConfig::pucker`).
+        // The reverse -- the flag set with no head in the file -- is a broken export, not a model.
+        let has_head = w.keys().any(|k| k.starts_with("head_pucker."));
+        if cfg.pucker && !has_head {
+            return Err(Error::Invalid(
+                "the config says this checkpoint generates ring shapes (\"pucker\": true) but it \
+                 carries no head_pucker weights"
+                    .into(),
+            ));
+        }
+        let mut cfg = cfg;
+        cfg.pucker = has_head;
+        let pucker = if has_head {
+            Some([
+                lin("head_pucker.0")?,
+                lin("head_pucker.2")?,
+                lin("head_pucker.4")?,
+            ])
+        } else {
+            None
+        };
         let blocks = (0..cfg.depth)
             .map(|i| {
                 Ok(Block {
@@ -544,6 +628,7 @@ impl TorsionFlowNet {
             head0: lin("head_inv.0")?,
             head2: lin("head_inv.2")?,
             head4: lin("head_inv.4")?,
+            pucker,
             force_value: lin("force_value")?,
             force_mix: lin("force_mix")?,
             rbf_centers: Tensor::from_vec(centers, bins, device)?,
@@ -559,6 +644,11 @@ impl TorsionFlowNet {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Whether this checkpoint generates ring shapes as well as torsions.
+    pub fn has_pucker(&self) -> bool {
+        self.pucker.is_some()
     }
 
     /// Token and topology embeddings of a graph batch (computed once per glycan).
@@ -585,8 +675,14 @@ impl TorsionFlowNet {
             .forward(&self.time0.forward_act(&x, Act::Silu, self.ops)?, self.ops)
     }
 
-    /// Velocities [B,T] for conformers `coords` [B,N,3], current torsions `tors` [B,T] and times
-    /// `t` [B] (all f32 on the model device). `prep.graph.bg` must be 1 or B.
+    /// Torsion velocities [B,T] for conformers `coords` [B,N,3], current torsions `tors` [B,T] and
+    /// times `t` [B] (all f32 on the model device). `prep.graph.bg` must be 1 or B.
+    ///
+    /// The ring-shape velocity of a ring-head checkpoint is not computed here. That costs nothing in
+    /// accuracy: `pucker` feeds the ring head alone, and the torsion head reads ring geometry from
+    /// `coords`, so the torsion velocity of a ring-head model is independent of it (measured: 0.0 %
+    /// difference between `pucker = q` and `pucker = 0` over six glycans). Use
+    /// [`TorsionFlowNet::forward_joint`] to generate ring shapes too.
     pub fn forward(
         &self,
         prep: &Prepared,
@@ -594,6 +690,21 @@ impl TorsionFlowNet {
         tors: &Tensor,
         t: &Tensor,
     ) -> Result<Tensor> {
+        Ok(self.forward_joint(prep, coords, tors, t, None)?.0)
+    }
+
+    /// Torsion velocities [B,T] and, for a ring-head checkpoint given the current ring shapes
+    /// `pucker` [B,R,3] (in units of [`crate::pucker::PUCKER_SCALE`]), the ring-shape velocities
+    /// [B,R,3] in the same units. `pucker` is ignored by a fixed-ring checkpoint, and a ring-head
+    /// checkpoint called with `None` reads the ring state as zero, as the reference does.
+    pub fn forward_joint(
+        &self,
+        prep: &Prepared,
+        coords: &Tensor,
+        tors: &Tensor,
+        t: &Tensor,
+        pucker: Option<&Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let g = &prep.graph;
         let (b, n, _) = coords.dims3()?;
         let tt = tors.dim(1)?;
@@ -750,6 +861,51 @@ impl TorsionFlowNet {
         let torque = torque.div(&((jnorm2.clamp(0f32, f32::INFINITY)? + 1.0)?.sqrt()?))?;
 
         let v = (v_inv + gate.mul(&torque)?)?;
-        Ok(v.broadcast_mul(&g.tmask)?)
+        let v = v.broadcast_mul(&g.tmask)?;
+
+        // ring head: the ring's atom features pooled in the Cremer-Pople basis -- the basis its
+        // shape is measured in -- concatenated with the shape it currently has.
+        let Some(head) = &self.pucker else {
+            return Ok((v, None));
+        };
+        if g.n_rings == 0 {
+            return Ok((v, None));
+        }
+        let mut parts = g
+            .ring_pool
+            .iter()
+            .map(|p| Ok(p.broadcast_matmul(&h)?))
+            .collect::<Result<Vec<Tensor>>>()?;
+        parts.push(match pucker {
+            Some(q) => {
+                let want = (b, g.n_rings, crate::pucker::PUCKER_DIM);
+                if q.dims3()? != want {
+                    return Err(Error::Invalid(format!(
+                        "pucker has shape {:?}, expected {want:?}",
+                        q.dims3()?
+                    )));
+                }
+                q.clone()
+            }
+            None => Tensor::zeros(
+                (b, g.n_rings, crate::pucker::PUCKER_DIM),
+                v.dtype(),
+                &self.device,
+            )?,
+        });
+        let ring_in = Tensor::cat(&parts, D::Minus1)?;
+        let vq = head[2].forward(
+            &head[1].forward_act(
+                &head[0].forward_act(&ring_in, Act::Silu, ops)?,
+                Act::Silu,
+                ops,
+            )?,
+            ops,
+        )?;
+        let vq = match &g.ring_valid {
+            Some(mask) => vq.broadcast_mul(mask)?,
+            None => vq,
+        };
+        Ok((v, Some(vq)))
     }
 }

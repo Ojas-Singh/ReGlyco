@@ -112,8 +112,15 @@ impl Fixture {
     }
 }
 
+/// The residue library the weights were exported with (`weights/residue_library.json`: the model and
+/// its library are a matched pair), else the GlycoFlow checkout's packaged one.
 pub fn library() -> ResidueLibrary {
-    let path = rust_dir().join("../glycoflow/resources/residue_library.json");
+    let beside = rust_dir().join("weights/residue_library.json");
+    let path = if beside.exists() {
+        beside
+    } else {
+        rust_dir().join("../glycoflow/resources/residue_library.json")
+    };
     ResidueLibrary::from_json_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 

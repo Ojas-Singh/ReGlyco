@@ -22,6 +22,8 @@ pub struct BackendGraph<'a> {
     pub quads: &'a [[usize; 4]],
     /// atoms moved by each torsion
     pub distal: &'a [Vec<usize>],
+    /// sugar rings in canonical order (the ring head pools each ring's atoms in this order)
+    pub rings: &'a [crate::pucker::Ring],
 }
 
 pub trait NetworkBackend: Send + Sync {
@@ -30,6 +32,19 @@ pub trait NetworkBackend: Send + Sync {
     /// Velocities [B*T] for conformers `coords` [B*N], torsions `tau` [B*T] and times `t` [B];
     /// None to fall back to candle for this call.
     fn velocity(&self, glycan: u32, coords: &[P3], tau: &[f32], t: &[f32]) -> Option<Vec<f32>>;
+    /// Torsion velocities [B*T] and ring-shape velocities [B*R*3] of a ring-head model, given the
+    /// ring state `q` [B*R*3] (`TorsionFlowNet::forward_joint`); None (the default) to leave ring
+    /// generation to candle.
+    fn velocity_joint(
+        &self,
+        _glycan: u32,
+        _coords: &[P3],
+        _tau: &[f32],
+        _t: &[f32],
+        _q: &[f32],
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        None
+    }
     /// The glycan is no longer needed.
     fn release(&self, _glycan: u32) {}
 }
@@ -68,6 +83,7 @@ pub(crate) fn register(topology: &Topology, tokens: &[[u32; 5]]) -> Option<Regis
         topo_cap: TOPO_DIST_CAP,
         quads: &topology.quads,
         distal: &topology.distal,
+        rings: &topology.rings,
     };
     let glycan = backend.register(&graph)?;
     Some(Registration { backend, glycan })

@@ -73,6 +73,8 @@ pub fn subtree_support(
     let full = obs.evaluate(x, None, None).log_likelihood;
     let paths = &problem.glycan.res_paths;
     let distal = &problem.glycan.topology.distal;
+    // a hydroxyl rotamer moves no scored atom: the allowance counts the torsions heavy atoms define
+    let heavy = problem.heavy_torsions();
     let mut out: Vec<SubtreeSupport> = residue_tree(problem)
         .into_par_iter()
         .filter(|(root, _)| root != "r")
@@ -89,7 +91,8 @@ pub fn subtree_support(
             // distal side starts at the parent's linking oxygen), unlike in `torsions_moving_only`
             let n_torsions = distal
                 .iter()
-                .filter(|d| !d.is_empty() && d.iter().all(|&i| sel[i]))
+                .zip(&heavy)
+                .filter(|(d, h)| **h && !d.is_empty() && d.iter().all(|&i| sel[i]))
                 .count();
             let gain = full - without;
             let threshold = base + per_torsion * n_torsions as f64;
@@ -224,8 +227,7 @@ fn clash_gradient(problem: &SiteProblem, pose: &Pose) -> Vec<f64> {
     let x = problem.place(pose);
     let mut gx = vec![[0.0; 3]; problem.n_atoms];
     problem.clash_terms(&x, Some(&mut gx));
-    let topo = &problem.glycan.topology;
-    glycoflow_core::geometry::torsion_gradient(&x, &topo.quads, &topo.distal, &gx)
+    problem.torsion_gradient(&x, &gx)
 }
 
 /// A prior-driven completion of the unsupported subtrees.

@@ -21,20 +21,20 @@ use sha2::{Digest, Sha256};
 /// Hugging Face repository of the model.
 const REPOSITORY: &str = "Ojas-Singh/glycoflow";
 /// Repository revision that is downloaded: this engine is tested against this model.
-const REVISION: &str = "398b97e42caf6eeb45387c195fae07423f01c514";
+const REVISION: &str = "365e37e771f01cd39f271ccb871c24521250b71e";
 /// Model files and their SHA-256 at `REVISION`.
 const FILES: [(&str, &str); 3] = [
     (
         "glycoflow.safetensors",
-        "4a10254347f645afdaaa032dd02243633c4acee10294cbb2ad4c72d6111ebf48",
+        "c04246039c7836f55465c490a6681198c751ef7c57c3957d4dc8672d12ed0953",
     ),
     (
         "glycoflow.json",
-        "ff6996fed93b316abbd63fbbefb9502c6a99c528725785952ed680c3febab8ec",
+        "68c5c2136da6d34743580b2661af6ce3bbdc980be32f5d611429bd246e592678",
     ),
     (
         "residue_library.json",
-        "800dbe6d0ff62f93d5e39d748c1fb036932c87f15b5e8897c6e958fcf5a356c9",
+        "01ccdc501c958d92d913ffc36228f87ddd28665e407e5df70902c8571271adfe",
     ),
 ];
 const LICENSE_URL: &str = "https://huggingface.co/Ojas-Singh/glycoflow/blob/main/LICENSE";

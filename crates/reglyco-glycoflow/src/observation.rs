@@ -107,6 +107,7 @@ pub fn glycan_z(element: &str) -> Option<f64> {
         "O" => Some(8.0),
         "S" => Some(16.0),
         "P" => Some(15.0),
+        "H" => Some(1.0),
         _ => None,
     }
 }

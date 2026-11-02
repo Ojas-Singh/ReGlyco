@@ -29,7 +29,6 @@
 
 use std::collections::BTreeSet;
 
-use glycoflow_core::geometry::torsion_gradient;
 use glycoflow_core::guidance::clash_energy_grad;
 use glycoflow_core::sampler::Sampler;
 use rayon::prelude::*;
@@ -332,7 +331,6 @@ pub fn relax(
     lr: f64,
 ) -> Pose {
     let nt = pose.tau.len();
-    let topo = &problem.glycan.topology;
     let mut delta = vec![0.0; nt];
     let mut adam = Adam::new(nt, lr);
     let mut best = (f64::INFINITY, pose.tau.clone());
@@ -358,7 +356,7 @@ pub fn relax(
         if best.0 <= 0.0 {
             break;
         }
-        let g = torsion_gradient(&x, &topo.quads, &topo.distal, &gx);
+        let g = problem.torsion_gradient(&x, &gx);
         let grad: Vec<f64> = (0..nt).map(|t| if free[t] { g[t] } else { 0.0 }).collect();
         adam.step(&mut delta, &grad);
     }

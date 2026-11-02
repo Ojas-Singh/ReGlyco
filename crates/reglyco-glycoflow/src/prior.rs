@@ -42,6 +42,9 @@ pub struct MarginalPrior {
     pub kappa: f64,
     pub log_norm: f64,
     pub bandwidth_deg: f64,
+    /// [T] torsions the energy sums over (`MarginalPrior.tmask`): every torsion by default;
+    /// `with_torsions` restricts it, e.g. to those heavy atoms define
+    pub on: Vec<bool>,
 }
 
 impl MarginalPrior {
@@ -57,7 +60,15 @@ impl MarginalPrior {
             kappa,
             log_norm,
             bandwidth_deg,
+            on: vec![true; n_torsions],
         }
+    }
+
+    /// The same prior summed over the torsions `on` selects only.
+    pub fn with_torsions(mut self, on: Vec<bool>) -> Self {
+        assert_eq!(on.len(), self.n_torsions);
+        self.on = on;
+        self
     }
 
     /// `-log p(tau)` (same constant for every candidate) and, on request, its gradient.
@@ -69,7 +80,7 @@ impl MarginalPrior {
         let ln_s = (s as f64).ln();
         let mut total = 0.0;
         let mut logits = vec![0.0; s];
-        for k in 0..t {
+        for k in (0..t).filter(|&k| self.on[k]) {
             let mut m = f64::MIN;
             for (j, logit) in logits.iter_mut().enumerate() {
                 *logit = self.kappa * (tau[k] - self.samples[j * t + k]).cos();
@@ -147,9 +158,49 @@ pub struct PriorDeviation {
     pub e_prior: f64,
     pub rare_torsions: Vec<RareTorsion>,
     pub n_torsions: usize,
+    /// rarity in [0, 1] of the whole conformation within the prior's free-glycan ensemble: the
+    /// fraction of GlycoFlow's samples in a more populated region, by a kNN density over all
+    /// torsions jointly (`glycoflow_core::landscape`, the estimator validated against MD). Unlike
+    /// the per-torsion percentiles it sees correlated torsions; like them it describes the free
+    /// glycan, so a bound conformation may be rare for good reason.
+    pub rarity: f64,
 }
 
 impl MarginalPrior {
+    /// The marginal energy summed over the torsions `on` selects (`energy` over a subset).
+    pub fn energy_on(&self, tau: &[f64], on: &[bool]) -> f64 {
+        let t = self.n_torsions;
+        let cols: Vec<usize> = (0..t).filter(|&k| on[k]).collect();
+        let sub = MarginalPrior {
+            samples: (0..self.n_samples)
+                .flat_map(|j| cols.iter().map(move |&k| self.samples[j * t + k]))
+                .collect(),
+            n_samples: self.n_samples,
+            n_torsions: cols.len(),
+            kappa: self.kappa,
+            log_norm: self.log_norm,
+            bandwidth_deg: self.bandwidth_deg,
+            on: vec![true; cols.len()],
+        };
+        sub.energy(&cols.iter().map(|&k| tau[k]).collect::<Vec<_>>(), None)
+    }
+
+    /// Rarity in [0, 1] of a conformation among the prior's samples over the torsions `on` selects
+    /// (see [`PriorDeviation::rarity`]).
+    pub fn rarity_on(&self, tau: &[f64], on: &[bool]) -> f64 {
+        let t = self.n_torsions;
+        let cols: Vec<usize> = (0..t).filter(|&k| on[k]).collect();
+        let cloud: Vec<f32> = (0..self.n_samples)
+            .flat_map(|j| cols.iter().map(move |&k| self.samples[j * t + k] as f32))
+            .collect();
+        let query: Vec<f32> = cols.iter().map(|&k| tau[k] as f32).collect();
+        glycoflow_core::landscape::Rarity::new(&cloud, cols.len())
+            .rarity(&query)
+            .first()
+            .copied()
+            .unwrap_or(f64::NAN)
+    }
+
     fn density(&self, k: usize, v: f64) -> f64 {
         let t = self.n_torsions;
         (0..self.n_samples)

@@ -365,19 +365,29 @@ impl SiteLikelihood {
         }
         let (origin, dims) = Self::box_geometry(center, &options);
         let mut observed = SiteBox::zeros(origin, options.spacing_angstrom, dims);
+        // A site near the edge of a boxed (cryo-EM) map: the box points past the edge carry no
+        // data and take the map mean (z = 0). Refused only when most of the scored region is off
+        // the map.
+        let r2max = options.radius_angstrom * options.radius_angstrom;
+        let (mut region, mut region_outside) = (0usize, 0usize);
         for i in 0..dims[0] {
             for j in 0..dims[1] {
                 for k in 0..dims[2] {
                     let p = observed.position(i, j, k);
-                    let v = map.value_at_cartesian(p, options.periodic).ok_or_else(|| {
-                        DensityError::Geometry(format!(
-                            "site box point {p:?} lies outside the map; use a periodic full-cell map or a larger map"
-                        ))
-                    })?;
+                    let value = map.value_at_cartesian(p, options.periodic);
+                    if (0..3).map(|a| (p[a] - center[a]).powi(2)).sum::<f64>() < r2max {
+                        region += 1;
+                        region_outside += usize::from(value.is_none());
+                    }
                     let idx = observed.index(i, j, k);
-                    observed.data[idx] = ((v - mean) / std) as f32;
+                    observed.data[idx] = value.map_or(0.0, |v| ((v - mean) / std) as f32);
                 }
             }
+        }
+        if 2 * region_outside > region {
+            return Err(DensityError::Geometry(format!(
+                "most of the site's region ({region_outside} of {region} points) lies outside the map; use a larger map"
+            )));
         }
         Self::from_observed_box(observed, center, environment, options)
     }
@@ -663,6 +673,56 @@ impl SiteLikelihood {
         let e = go - (self.theta[0] * g1 + self.theta[1] * gp + self.theta[2] * gs);
         let c = (gg - (0..3).map(|i| q[i] * g0q[i]).sum::<f64>()).max(1e-12);
         (e, c)
+    }
+
+    /// What a weighted mixture of glycans needs from each member: the projection `e` on the residual
+    /// and `q = (<g,1>, <g,prot>, <g,solv>)`, so that `e(w) = sum w_i e_i` and
+    /// `c(w) = w^T G w - q(w)^T G0^-1 q(w)` with `G` the cross-member overlap
+    /// ([`SiteLikelihood::overlap`]). One member alone gives back [`SiteLikelihood::projection_terms`].
+    pub fn mixture_parts(&self, positions: &[[f64; 3]], atomic_numbers: &[f64]) -> (f64, [f64; 3]) {
+        let (mut go, mut gp, mut gs, mut g1) = (0.0, 0.0, 0.0, 0.0);
+        for (p, z) in positions.iter().zip(atomic_numbers) {
+            if *z == 0.0 {
+                continue;
+            }
+            go += z * self.obs_blur.sample(*p).0;
+            gp += z * self.prot_blur.sample(*p).0;
+            gs += z * self.solv_blur.as_ref().map_or(0.0, |b| b.sample(*p).0);
+            g1 += z;
+        }
+        let e = go - (self.theta[0] * g1 + self.theta[1] * gp + self.theta[2] * gs);
+        (e, [g1, gp, gs])
+    }
+
+    /// `<rho_a, rho_b>` of two glycans: the analytic overlap of their Gaussian atoms (the `<g,g>`
+    /// of [`SiteLikelihood::evaluate`] when `a == b`).
+    pub fn overlap(&self, a: &[[f64; 3]], b: &[[f64; 3]], atomic_numbers: &[f64]) -> f64 {
+        let s2 = 2.0 * self.sigma * self.sigma;
+        let norm0 = 1.0 / (2.0 * std::f64::consts::PI * s2).powf(1.5);
+        let mut out = 0.0;
+        for (pa, za) in a.iter().zip(atomic_numbers) {
+            if *za == 0.0 {
+                continue;
+            }
+            for (pb, zb) in b.iter().zip(atomic_numbers) {
+                if *zb == 0.0 {
+                    continue;
+                }
+                let r2 = (0..3).map(|i| (pa[i] - pb[i]).powi(2)).sum::<f64>();
+                out += za * zb * (-r2 / (2.0 * s2)).exp();
+            }
+        }
+        out * norm0
+    }
+
+    /// The environment's normal-equation inverse `G0^-1` (3 x 3).
+    pub fn environment_inverse(&self) -> [[f64; 3]; 3] {
+        self.g0_inverse
+    }
+
+    /// Gain to log-likelihood: `1 / (2 noise_variance independent_volume inflation)`.
+    pub fn loglik_per_gain(&self) -> f64 {
+        1.0 / (2.0 * self.noise_variance * self.independent_volume * self.inflation)
     }
 
     /// Standardised projection `e / sqrt(c noise_variance independent_volume)`:
