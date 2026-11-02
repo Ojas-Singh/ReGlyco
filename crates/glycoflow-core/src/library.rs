@@ -20,6 +20,11 @@ pub struct ResidueTemplate {
     pub virtual_ox: Option<[f64; 3]>,
     #[serde(default)]
     pub virtual_cx: Option<[f64; 3]>,
+    /// For an aglycone carrying a heavy atom of its own (a methyl glycoside): the angle, in degrees,
+    /// that atom makes at the glycosidic oxygen with the anomeric carbon. Without it the aglycone is
+    /// only translated into place and the extra atom lands wherever the template happened to lie.
+    #[serde(default)]
+    pub anchor_angle: Option<f64>,
 }
 
 impl ResidueTemplate {

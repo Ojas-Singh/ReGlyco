@@ -261,3 +261,54 @@ fn jacobian_matches_finite_differences() {
         println!("{name:20} T={nt:2}: |dx/dtau - FD| {worst:.1e} A/rad (f32 Jacobian {worst32:.1e}), dE/dtau rel. error {worst_rel:.1e}");
     }
 }
+
+/// A methyl glycoside: the aglycone carries a heavy atom, so the builder must place it at a real
+/// bond angle instead of only translating the template (which lands the methyl on top of C1).
+/// The reference numbers are the Python builder's, which was validated against the deposited ligands.
+#[test]
+fn methyl_aglycone_sits_at_a_real_bond_angle() {
+    use glycoflow_core::library::ResidueTemplate;
+    let mut lib = {
+        let path = std::path::PathBuf::from(
+            std::env::var("GLYCOFLOW_RUST_DIR").unwrap_or_else(|_| String::from("missing")),
+        );
+        if !path.join("weights/residue_library.json").exists() {
+            eprintln!("skipped: needs GLYCOFLOW_RUST_DIR");
+            return;
+        }
+        library()
+    };
+    // the OME template as reference/ome builds it from GLYCAM: O1-CH3 1.399 A at 111.6 deg
+    lib.templates.insert(
+        String::from("OME"),
+        ResidueTemplate {
+            atoms: vec![String::from("O1"), String::from("CH3")],
+            elements: vec![String::from("O"), String::from("C")],
+            coords: vec![[0.0, 0.0, 0.0], [1.399, 0.0, 0.0]],
+            bonds: vec![[0, 1]],
+            anchor: None,
+            virtual_ox: None,
+            virtual_cx: None,
+            anchor_angle: Some(111.6),
+        },
+    );
+    let built = lib.build("LFucpa1-OME", None).unwrap();
+    let index = |name: &str| built.atom_names.iter().position(|a| a == name).unwrap();
+    let (c1, o1, ch3) = (index("C1"), index("O1"), index("CH3"));
+    let d = |a: usize, b: usize| {
+        let (p, q) = (built.coords[a], built.coords[b]);
+        ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
+    };
+    let (p, q) = (built.coords[c1], built.coords[ch3]);
+    let o = built.coords[o1];
+    let (u, v) = (
+        [p[0] - o[0], p[1] - o[1], p[2] - o[2]],
+        [q[0] - o[0], q[1] - o[1], q[2] - o[2]],
+    );
+    let dot = u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    let angle = (dot / (d(c1, o1) * d(o1, ch3))).acos().to_degrees();
+    assert!((d(o1, ch3) - 1.399).abs() < 1.0e-6, "O1-CH3 {}", d(o1, ch3));
+    assert!((angle - 111.6).abs() < 0.05, "C1-O1-CH3 angle {angle}");
+    // the whole point: the methyl is a bond away from the anomeric carbon, not on top of it
+    assert!(d(c1, ch3) > 2.2, "C1-CH3 {} (unoriented gives ~0.97)", d(c1, ch3));
+}

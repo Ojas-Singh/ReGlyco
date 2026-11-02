@@ -425,6 +425,82 @@ impl ResidueLibrary {
                 ]
             })
             .collect();
+        // An aglycone with a heavy atom of its own (a methyl glycoside) needs that atom at a real bond
+        // angle: the translation above only places the oxygen, and the rest would keep the template's
+        // own orientation, which for OME lands the methyl on top of C1. The torsion about C1-O is
+        // rotatable and the sampler sets it, so only the angle is built here; the azimuth is arbitrary.
+        // ROH declares no angle and is untouched.
+        let agl_xyz: Vec<V3> = match agl_tpl.anchor_angle {
+            None => agl_xyz,
+            Some(degrees) => {
+                let anomeric = red_tpl
+                    .anchor
+                    .as_deref()
+                    .and_then(|a| red_tpl.atom_index(a))
+                    .map(|i| red_tpl.coords[i])
+                    .ok_or_else(|| {
+                        Error::Library(format!("template {root_code} has no anchor atom"))
+                    })?;
+                let mut axis = [
+                    anomeric[0] - v_ox[0],
+                    anomeric[1] - v_ox[1],
+                    anomeric[2] - v_ox[2],
+                ];
+                let norm = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+                if norm < 1.0e-9 {
+                    return Err(Error::Library(format!(
+                        "template {root_code} puts its anchor on the parent oxygen"
+                    )));
+                }
+                axis = [axis[0] / norm, axis[1] / norm, axis[2] / norm];
+                let cross = |a: V3, b: V3| {
+                    [
+                        a[1] * b[2] - a[2] * b[1],
+                        a[2] * b[0] - a[0] * b[2],
+                        a[0] * b[1] - a[1] * b[0],
+                    ]
+                };
+                let mut perpendicular = cross(axis, [0.0, 0.0, 1.0]);
+                let mut p_norm = (perpendicular[0].powi(2)
+                    + perpendicular[1].powi(2)
+                    + perpendicular[2].powi(2))
+                .sqrt();
+                if p_norm < 1.0e-6 {
+                    perpendicular = cross(axis, [0.0, 1.0, 0.0]);
+                    p_norm = (perpendicular[0].powi(2)
+                        + perpendicular[1].powi(2)
+                        + perpendicular[2].powi(2))
+                    .sqrt();
+                }
+                perpendicular = [
+                    perpendicular[0] / p_norm,
+                    perpendicular[1] / p_norm,
+                    perpendicular[2] / p_norm,
+                ];
+                let angle = degrees.to_radians();
+                let (c, sn) = (angle.cos(), angle.sin());
+                agl_xyz
+                    .iter()
+                    .enumerate()
+                    .map(|(k, p)| {
+                        if k == o_k {
+                            return *p;
+                        }
+                        let t = agl_tpl.coords[k];
+                        let o0 = agl_tpl.coords[o_k];
+                        let bond = ((t[0] - o0[0]).powi(2)
+                            + (t[1] - o0[1]).powi(2)
+                            + (t[2] - o0[2]).powi(2))
+                        .sqrt();
+                        [
+                            v_ox[0] + bond * (c * axis[0] + sn * perpendicular[0]),
+                            v_ox[1] + bond * (c * axis[1] + sn * perpendicular[1]),
+                            v_ox[2] + bond * (c * axis[2] + sn * perpendicular[2]),
+                        ]
+                    })
+                    .collect()
+            }
+        };
         let agl = asm.add_residue(&aglycone, &aglycone, agl_state, agl_tpl, &agl_xyz, "agl");
         let red_name = format!("{}{}", asm.prefix(root), root_code);
         let red = asm.add_residue(
