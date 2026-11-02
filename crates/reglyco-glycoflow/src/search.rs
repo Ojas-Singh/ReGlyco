@@ -33,7 +33,12 @@ pub fn attach_search(
     problem: &SiteProblem,
     conformers: &[(Vec<f64>, usize)],
 ) -> Vec<(f64, f64, f64)> {
-    let grid = attachment_grid(&problem.link_torsion.grid(), 36);
+    let psis = if problem.full_psi_grid {
+        crate::anchor::LinkTorsion::Free.grid()
+    } else {
+        problem.link_torsion.grid()
+    };
+    let grid = attachment_grid(&psis, 36);
     problem.counter.add_objective(conformers.len() * grid.len());
     conformers
         .par_iter()
@@ -101,6 +106,13 @@ impl Guidance for ObjectiveGuidance<'_> {
             }
         }
         let problem = self.problem;
+        let n_heavy = problem
+            .heavy_torsions()
+            .iter()
+            .filter(|h| **h)
+            .count()
+            .max(1);
+        let link_turn = problem.link_turn();
         let results: Vec<(Vec<f32>, f64, f64)> = (0..b)
             .into_par_iter()
             .map(|s| {
@@ -111,13 +123,23 @@ impl Guidance for ObjectiveGuidance<'_> {
                     template: self.templates[s],
                 };
                 let g = problem.evaluate(&pose, true).grad.expect("gradient");
-                let norm =
-                    g.tau.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-6) / (nt as f64).sqrt();
-                let corr = g
+                // rms over the torsions the objective can move (`SiteProblem::heavy_torsions`), with
+                // the turn about the link bond (dE/dphi) in the norm: a pose pushed mainly as a whole
+                // about the link takes a smaller torsion step and is turned by the attachment step
+                let norm = (g.tau.iter().map(|v| v * v).sum::<f64>() + g.phi * g.phi)
+                    .sqrt()
+                    .max(1e-6)
+                    / (n_heavy as f64).sqrt();
+                let mut corr: Vec<f32> = g
                     .tau
                     .iter()
                     .map(|v| (-self.scale * v / norm) as f32)
                     .collect();
+                // the flow's own aglycone torsion follows the turn about the link bond, so the
+                // sample the network conditions on turns with the attachment
+                if let Some(k) = link_turn {
+                    corr[k] = (-self.scale * g.phi / norm) as f32;
+                }
                 let gn = (g.psi * g.psi + g.phi * g.phi).sqrt().max(1e-6);
                 (
                     corr,
@@ -388,7 +410,8 @@ pub fn refine(problem: &SiteProblem, poses: &[Pose], steps: usize, lr: f64) -> V
 pub fn rmsd(problem: &SiteProblem, a: &[V3], b: &[V3]) -> f64 {
     let mut s = 0.0;
     let mut n = 0usize;
-    for i in (0..problem.n_atoms).filter(|&i| problem.keep[i]) {
+    let scored = |i: usize| problem.score_only.as_ref().is_none_or(|m| m[i]);
+    for i in (0..problem.n_atoms).filter(|&i| problem.keep[i] && scored(i)) {
         s += (0..3).map(|k| (a[i][k] - b[i][k]).powi(2)).sum::<f64>();
         n += 1;
     }
@@ -448,6 +471,8 @@ pub fn method_b(
     scale: f64,
     start: f64,
     seed: u64,
+    pre_refine: usize,
+    pre_refine_steps: usize,
 ) -> Result<MethodB> {
     let c = &problem.counter;
     let observer = problem.observer.get();
@@ -482,12 +507,29 @@ pub fn method_b(
     if let Some(o) = observer {
         o.samples(&chosen, &energies);
     }
+    // Optionally refine the best few candidates briefly first: a sample near the right basin with a
+    // contact still to resolve ranks low unrefined and would never be kept.
+    let (candidates, energies, index): (Vec<Pose>, Vec<f64>, Vec<usize>) = if pre_refine > 0 {
+        let mut order: Vec<usize> = (0..chosen.len()).collect();
+        order.sort_by(|&a, &b| energies[a].total_cmp(&energies[b]));
+        order.truncate((pre_refine * n_basins).min(chosen.len()));
+        let top: Vec<Pose> = order.iter().map(|&i| chosen[i].clone()).collect();
+        let refined = refine(problem, &top, pre_refine_steps, refine_lr);
+        let (p, e): (Vec<Pose>, Vec<f64>) = refined.into_iter().unzip();
+        (p, e, order)
+    } else {
+        let n = chosen.len();
+        (chosen, energies, (0..n).collect())
+    };
+    let chosen = candidates;
     let x: Vec<Vec<V3>> = chosen.par_iter().map(|p| problem.place(p)).collect();
-    let sel = distinct(problem, &x, &energies, n_basins, 1.5);
+    let local = distinct(problem, &x, &energies, n_basins, 1.5);
+    // `sel` indexes the guided samples (for replays); `local` the candidates
+    let sel: Vec<usize> = local.iter().map(|&i| index[i]).collect();
     c.add_stage("select", t0);
     let t0 = Instant::now();
-    let starts: Vec<Pose> = sel.iter().map(|&i| chosen[i].clone()).collect();
-    let unrefined: Vec<f64> = sel.iter().map(|&i| energies[i]).collect();
+    let starts: Vec<Pose> = local.iter().map(|&i| chosen[i].clone()).collect();
+    let unrefined: Vec<f64> = local.iter().map(|&i| energies[i]).collect();
     if let Some(o) = observer {
         o.basins("select", &sel, &starts, &unrefined);
         o.stage("refine");
@@ -505,4 +547,474 @@ pub fn method_b(
         unrefined,
         sources: sel,
     })
+}
+
+/// Re-generate around the best `basins` poses (SDEdit): each one's torsions are taken back to time
+/// `t` on the straight path from fresh noise, `wrap(tau0 + t wrap(tau - tau0))`, and integrated to
+/// t = 1 again under the objective's guidance, `per_basin` times; the results get the attachment
+/// grid and the same refinement as the search's basins. The model proposes local alternatives (a
+/// branch turned, a linkage in its other basin) that a gradient step from the pose cannot reach.
+#[allow(clippy::too_many_arguments)]
+pub fn renoise(
+    problem: &SiteProblem,
+    sampler: &Sampler,
+    poses: &[Pose],
+    energies: &[f64],
+    basins: usize,
+    per_basin: usize,
+    t: f64,
+    steps: usize,
+    scale: f64,
+    start: f64,
+    refine_steps: usize,
+    refine_lr: f64,
+    seed: u64,
+) -> Result<(Vec<Pose>, Vec<f64>)> {
+    let nt = problem.n_torsions;
+    let mut order: Vec<usize> = (0..poses.len()).collect();
+    order.sort_by(|&a, &b| energies[a].total_cmp(&energies[b]));
+    order.truncate(basins.min(poses.len()));
+    let n = order.len() * per_basin;
+    if n == 0 || nt == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let k = ((t * steps as f64).round() as usize).min(steps.saturating_sub(1));
+    let tk = k as f64 / steps as f64;
+    let noise = initial_torsions(seed ^ 0x5D3D_17A5, n, nt);
+    let mut tau_t = Vec::with_capacity(n * nt);
+    let mut templates = Vec::with_capacity(n);
+    let mut psi = Vec::with_capacity(n);
+    let mut phi = Vec::with_capacity(n);
+    for (j, &b) in order.iter().enumerate() {
+        for r in 0..per_basin {
+            let s = j * per_basin + r;
+            for (a, &x0) in poses[b].tau.iter().zip(&noise[s * nt..(s + 1) * nt]) {
+                let x0 = x0 as f64;
+                tau_t.push(wrap(x0 + tk * wrap(a - x0)) as f32);
+            }
+            templates.push(poses[b].template);
+            psi.push(poses[b].psi);
+            phi.push(poses[b].phi);
+        }
+    }
+    let opts = SampleOptions {
+        steps,
+        method: Method::Heun,
+    };
+    let mut out = Vec::with_capacity(n);
+    let mut s0 = 0;
+    while s0 < n {
+        let m = problem.batch.unwrap_or(GUIDED_CHUNK).min(n - s0);
+        let tpl: Vec<usize> = templates[s0..s0 + m].to_vec();
+        let mut guidance = ObjectiveGuidance {
+            problem,
+            templates: tpl.clone(),
+            psi: psi[s0..s0 + m].to_vec(),
+            phi: phi[s0..s0 + m].to_vec(),
+            scale,
+            start,
+            attach_every: 4,
+            attach_step: 0.05,
+        };
+        let (_, tau) = sampler.sample_from(
+            &templates_for(problem, &tpl),
+            &tau_t[s0 * nt..(s0 + m) * nt],
+            k,
+            opts,
+            Some(&mut guidance),
+        )?;
+        problem
+            .counter
+            .add_nfe(m * (2 * (steps - k)).saturating_sub(1));
+        for s in 0..m {
+            out.push(Pose {
+                tau: tau[s * nt..(s + 1) * nt]
+                    .iter()
+                    .map(|&v| v as f64)
+                    .collect(),
+                psi: guidance.psi[s],
+                phi: guidance.phi[s],
+                template: tpl[s],
+            });
+        }
+        s0 += m;
+    }
+    // the attachment grid, as for the guided samples, then the search's refinement
+    let conformers: Vec<(Vec<f64>, usize)> =
+        out.iter().map(|p| (p.tau.clone(), p.template)).collect();
+    let grid = attach_search(problem, &conformers);
+    let starts: Vec<Pose> = out
+        .into_iter()
+        .zip(grid)
+        .map(|(p, (psi, phi, e_grid))| {
+            let e_now = problem.evaluate(&p, false).terms.total;
+            if e_grid < e_now {
+                Pose { psi, phi, ..p }
+            } else {
+                p
+            }
+        })
+        .collect();
+    let refined = refine(problem, &starts, refine_steps, refine_lr);
+    Ok(refined.into_iter().unzip())
+}
+
+/// Inpainting under the objective's guidance: the `free` torsions of each conformer are generated
+/// from noise with the map's guidance, the others follow the straight path from their noise to the
+/// base pose's value and end on it exactly (as `support::complete_on_templates` pins them). The
+/// attachment angles stay the base pose's: with the held torsions they place the part of the
+/// glycan that is kept, and a grid search over half-generated branches would move it.
+struct InpaintGuidance<'p> {
+    inner: ObjectiveGuidance<'p>,
+    /// [B*T]
+    free: Vec<bool>,
+    /// straight-path velocity of the pinned torsions [B*T]
+    delta_pin: Vec<f32>,
+    /// the base poses' attachment angles [B]
+    psi: Vec<f64>,
+    phi: Vec<f64>,
+}
+
+impl Guidance for InpaintGuidance<'_> {
+    fn correction(&mut self, ctx: &GuidanceContext) -> glycoflow_core::Result<Option<Vec<f32>>> {
+        let mut c = self
+            .inner
+            .correction(ctx)?
+            .unwrap_or_else(|| vec![0.0; ctx.v.len()]);
+        for (i, ci) in c.iter_mut().enumerate() {
+            if !self.free[i] {
+                *ci = self.delta_pin[i] - ctx.v[i];
+            }
+        }
+        self.inner.psi.clone_from(&self.psi);
+        self.inner.phi.clone_from(&self.phi);
+        Ok(Some(c))
+    }
+}
+
+/// Generate the `free[s]` torsions of `bases[s]` again under the map's guidance, the rest held
+/// (`InpaintGuidance`); the results get the attachment grid and the search's refinement.
+#[allow(clippy::too_many_arguments)]
+pub fn inpaint(
+    problem: &SiteProblem,
+    sampler: &Sampler,
+    bases: &[Pose],
+    free: &[Vec<bool>],
+    steps: usize,
+    scale: f64,
+    start: f64,
+    refine_steps: usize,
+    refine_lr: f64,
+    seed: u64,
+) -> Result<(Vec<Pose>, Vec<f64>)> {
+    let nt = problem.n_torsions;
+    let n = bases.len();
+    if n == 0 || nt == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let tau0 = initial_torsions(seed ^ 0x1A9A_1A7E, n, nt);
+    let opts = SampleOptions {
+        steps,
+        method: Method::Heun,
+    };
+    let mut out = Vec::with_capacity(n);
+    let mut s0 = 0;
+    while s0 < n {
+        let m = problem.batch.unwrap_or(GUIDED_CHUNK).min(n - s0);
+        let chunk = &bases[s0..s0 + m];
+        let templates: Vec<usize> = chunk.iter().map(|p| p.template).collect();
+        let start_tau = &tau0[s0 * nt..(s0 + m) * nt];
+        let mut mask = Vec::with_capacity(m * nt);
+        let mut delta_pin = Vec::with_capacity(m * nt);
+        for (j, base) in chunk.iter().enumerate() {
+            mask.extend_from_slice(&free[s0 + j]);
+            for t in 0..nt {
+                delta_pin.push(wrap(base.tau[t] as f32 - start_tau[j * nt + t]));
+            }
+        }
+        let mut guidance = InpaintGuidance {
+            inner: ObjectiveGuidance {
+                problem,
+                templates: templates.clone(),
+                psi: chunk.iter().map(|p| p.psi).collect(),
+                phi: chunk.iter().map(|p| p.phi).collect(),
+                scale,
+                start,
+                attach_every: 4,
+                attach_step: 0.05,
+            },
+            free: mask,
+            delta_pin,
+            psi: chunk.iter().map(|p| p.psi).collect(),
+            phi: chunk.iter().map(|p| p.phi).collect(),
+        };
+        let (_, tau) = sampler.sample(
+            &templates_for(problem, &templates),
+            start_tau,
+            opts,
+            Some(&mut guidance),
+        )?;
+        problem.counter.add_nfe(m * opts.nfe());
+        for (j, base) in chunk.iter().enumerate() {
+            out.push(Pose {
+                tau: (0..nt)
+                    .map(|t| {
+                        if free[s0 + j][t] {
+                            tau[j * nt + t] as f64
+                        } else {
+                            base.tau[t]
+                        }
+                    })
+                    .collect(),
+                psi: base.psi,
+                phi: base.phi,
+                template: base.template,
+            });
+        }
+        s0 += m;
+    }
+    let refined = refine(problem, &out, refine_steps, refine_lr);
+    Ok(refined.into_iter().unzip())
+}
+
+/// Refinement steps of every core-first sample on the core's objective before the cores are ranked.
+pub const CORE_REFINE_STEPS: usize = 50;
+
+/// Residues of the core: the root and the two residues above it on any path (an N-glycan's
+/// chitobiose and beta-mannose).
+pub fn core_atoms(problem: &SiteProblem) -> Vec<bool> {
+    problem
+        .glycan
+        .res_paths
+        .iter()
+        .map(|p| p != "agl" && p.matches('/').count() <= 2)
+        .collect()
+}
+
+/// Core-first search: guided samples scored on the core's atoms only, so the map places the core
+/// without the branches pulling it; the `cores` best distinct ones (by core RMSD) then have
+/// everything beyond the core generated again under the full objective, `per_core` times
+/// (`inpaint`). Empty when the glycan is no larger than its core.
+#[allow(clippy::too_many_arguments)]
+pub fn core_first(
+    problem: &mut SiteProblem,
+    sampler: &Sampler,
+    n_samples: usize,
+    cores: usize,
+    per_core: usize,
+    contact_weight: f64,
+    steps: usize,
+    scale: f64,
+    start: f64,
+    refine_steps: usize,
+    refine_lr: f64,
+    seed: u64,
+) -> Result<(Vec<Pose>, Vec<f64>)> {
+    let core = core_atoms(problem);
+    let beyond: Vec<bool> = problem
+        .glycan
+        .res_paths
+        .iter()
+        .zip(&core)
+        .map(|(p, c)| p != "agl" && !c)
+        .collect();
+    let topology = &problem.glycan.topology;
+    let free = crate::support::torsions_moving_only(&topology.quads, &topology.distal, &beyond);
+    if !free.iter().any(|f| *f) || n_samples == 0 || cores == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // the core on its own: score its atoms only, at the final objective's contact weight (a
+    // wrong core in contact looks better at the search's), with psi searched on the whole circle
+    // (here and in the completions below)
+    let search_weights = (problem.w_env, problem.w_self);
+    // the observer follows the search's own guided samples; these would mix into their trace
+    let observer = std::mem::take(&mut problem.observer);
+    problem.score_only = Some(core);
+    problem.full_psi_grid = true;
+    (problem.w_env, problem.w_self) = (contact_weight, contact_weight);
+    let picked = (|| -> Result<Vec<Pose>> {
+        let problem: &SiteProblem = problem;
+        let poses = guided_sample(
+            problem,
+            sampler,
+            n_samples,
+            steps,
+            scale,
+            start,
+            seed ^ 0xC07E,
+        )?;
+        let conformers: Vec<(Vec<f64>, usize)> =
+            poses.iter().map(|p| (p.tau.clone(), p.template)).collect();
+        let grid = attach_search(problem, &conformers);
+        let chosen: Vec<Pose> = poses
+            .into_iter()
+            .zip(grid)
+            .map(|(p, (psi, phi, e_grid))| {
+                if e_grid < problem.evaluate(&p, false).terms.total {
+                    Pose { psi, phi, ..p }
+                } else {
+                    p
+                }
+            })
+            .collect();
+        // refined on the core's own objective first: a sample a couple of angstroms off the
+        // right core ranks below a wrong core that happens to fit, and is never kept unrefined
+        let refined = refine(problem, &chosen, CORE_REFINE_STEPS, refine_lr);
+        let chosen: Vec<Pose> = refined.iter().map(|(p, _)| p.clone()).collect();
+        // ranked without the link energy: this step looks for where the map puts the core; the
+        // full objective, link energy included, judges the completed poses
+        let energies: Vec<f64> = refined
+            .par_iter()
+            .map(|(p, e)| e - problem.evaluate(p, false).terms.e_att)
+            .collect();
+        let x: Vec<Vec<V3>> = chosen.par_iter().map(|p| problem.place(p)).collect();
+        let keep = distinct(problem, &x, &energies, cores, 1.0);
+        let picked: Vec<Pose> = keep.iter().map(|&i| chosen[i].clone()).collect();
+        if let Some(o) = problem.observer.get() {
+            let e: Vec<f64> = keep.iter().map(|&i| energies[i]).collect();
+            o.basins("core first", &vec![usize::MAX; picked.len()], &picked, &e);
+        }
+        Ok(picked)
+    })();
+    problem.score_only = None;
+    (problem.w_env, problem.w_self) = search_weights;
+    problem.observer = observer;
+    let completed = picked.and_then(|picked| {
+        let bases: Vec<Pose> = picked
+            .iter()
+            .flat_map(|p| std::iter::repeat_n(p.clone(), per_core))
+            .collect();
+        let masks = vec![free; bases.len()];
+        let (poses, energies) = inpaint(
+            problem,
+            sampler,
+            &bases,
+            &masks,
+            steps,
+            scale,
+            start,
+            refine_steps,
+            refine_lr,
+            seed,
+        )?;
+        // the best completions of every core, never a global best few: a right core still paying
+        // for a strained link or poor branches ranks below wrong ones here, and the final
+        // objective must get to see it
+        let mut out = (Vec::new(), Vec::new());
+        for group in (0..poses.len()).collect::<Vec<_>>().chunks(per_core.max(1)) {
+            let mut g = group.to_vec();
+            g.sort_by(|&a, &b| energies[a].total_cmp(&energies[b]));
+            for &i in g.iter().take(COMPLETIONS_KEPT) {
+                out.0.push(poses[i].clone());
+                out.1.push(energies[i]);
+            }
+        }
+        if let Some(o) = problem.observer.get() {
+            o.basins(
+                "core completions",
+                &vec![usize::MAX; out.0.len()],
+                &out.0,
+                &out.1,
+            );
+        }
+        Ok(out)
+    });
+    problem.full_psi_grid = false;
+    completed
+}
+
+/// Completions kept per core in the core-first search (`core_first`).
+pub const COMPLETIONS_KEPT: usize = 2;
+
+/// The `k` lowest-energy poses at least `min_rmsd` apart over the core's atoms ([`core_atoms`]).
+pub fn distinct_cores(
+    problem: &SiteProblem,
+    poses: &[Pose],
+    energies: &[f64],
+    k: usize,
+    min_rmsd: f64,
+) -> Vec<usize> {
+    let core = core_atoms(problem);
+    let x: Vec<Vec<V3>> = poses.par_iter().map(|p| problem.place(p)).collect();
+    let d = |a: &[V3], b: &[V3]| {
+        let (mut s, mut n) = (0.0, 0usize);
+        for i in (0..problem.n_atoms).filter(|&i| problem.keep[i] && core[i]) {
+            s += (0..3).map(|j| (a[i][j] - b[i][j]).powi(2)).sum::<f64>();
+            n += 1;
+        }
+        (s / n.max(1) as f64).sqrt()
+    };
+    let mut order: Vec<usize> = (0..poses.len()).collect();
+    order.sort_by(|&a, &b| energies[a].total_cmp(&energies[b]));
+    let mut keep: Vec<usize> = Vec::new();
+    for i in order {
+        if energies[i].is_finite() && keep.iter().all(|&j| d(&x[i], &x[j]) >= min_rmsd) {
+            keep.push(i);
+        }
+        if keep.len() >= k {
+            break;
+        }
+    }
+    keep
+}
+
+/// Branch re-noising: for each of the best `basins` poses with distinct cores and each subtree off the root (a residue
+/// and everything above it), that subtree's torsions are generated again from noise under the
+/// map's guidance with the rest of the pose held, `per_branch` times (`inpaint`). Whole-pose
+/// re-noising (`renoise`) moves every torsion a little; this moves one branch as far as it likes.
+#[allow(clippy::too_many_arguments)]
+pub fn branch_renoise(
+    problem: &SiteProblem,
+    sampler: &Sampler,
+    poses: &[Pose],
+    energies: &[f64],
+    basins: usize,
+    per_branch: usize,
+    steps: usize,
+    scale: f64,
+    start: f64,
+    refine_steps: usize,
+    refine_lr: f64,
+    seed: u64,
+) -> Result<(Vec<Pose>, Vec<f64>)> {
+    let topology = &problem.glycan.topology;
+    let masks: Vec<Vec<bool>> = crate::support::residue_tree(problem)
+        .into_iter()
+        .filter(|(root, _)| root != "r")
+        .map(|(_, members)| {
+            let atoms: Vec<bool> = problem
+                .glycan
+                .res_paths
+                .iter()
+                .map(|p| members.contains(p))
+                .collect();
+            crate::support::torsions_moving_only(&topology.quads, &topology.distal, &atoms)
+        })
+        .filter(|m| m.iter().any(|f| *f))
+        .collect();
+    // the best poses with distinct cores: a right core losing on its branches still gets them
+    // generated again
+    let order = distinct_cores(problem, poses, energies, basins, 1.0);
+    let mut bases = Vec::new();
+    let mut free = Vec::new();
+    for &b in order.iter() {
+        for m in &masks {
+            for _ in 0..per_branch {
+                bases.push(poses[b].clone());
+                free.push(m.clone());
+            }
+        }
+    }
+    inpaint(
+        problem,
+        sampler,
+        &bases,
+        &free,
+        steps,
+        scale,
+        start,
+        refine_steps,
+        refine_lr,
+        seed,
+    )
 }

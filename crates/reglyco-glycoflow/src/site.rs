@@ -546,13 +546,18 @@ fn anchor_of(structure: &Structure, residue: &ResidueId) -> Result<AnchorInfo> {
     Ok((site_residue.name.clone(), names, anchor))
 }
 
+/// Longest bond (A) that joins a deposited sugar to the link atom or to its parent: deposits
+/// stretch links to ~1.8 A at times, and no non-bonded C-N/C-O pair comes near 1.9 A (the fit
+/// page's site finder uses the same limit).
+pub const MAX_LINK_BOND: f64 = 1.9;
+
 /// The deposited glycan attached at a site (None when the site carries no glycan).
 pub fn deposited_glycan(
     structure: &Structure,
     residue: &ResidueId,
 ) -> Result<Option<DepositedGlycan>> {
     let (_, _, anchor) = anchor_of(structure, residue)?;
-    let tree = sugar_tree(structure, anchor[2], 1.75)?;
+    let tree = sugar_tree(structure, anchor[2], MAX_LINK_BOND)?;
     Ok(match tree {
         Some(tree) => {
             let mut atoms = BTreeMap::new();
@@ -580,6 +585,25 @@ pub fn deposited_glycan(
         }
         None => None,
     })
+}
+
+/// A residue outside the library bonded to the link atom by its C1 or C2 ("FUB B:1": a glycan
+/// GlycoFlow cannot build), for a clear message instead of "no glycan".
+fn unknown_attached(structure: &Structure, link: [f64; 3]) -> Option<String> {
+    let residues = structure.residues();
+    structure
+        .atoms()
+        .iter()
+        .filter(|a| {
+            (a.name == "C1" || a.name == "C2") && dist(v3(a.position), link) < MAX_LINK_BOND
+        })
+        .find_map(|a| {
+            let r = residues.iter().find(|r| r.id == a.residue)?;
+            // no amino acid has atoms named C1/C2
+            glycam_of(&r.name)
+                .is_none()
+                .then(|| format!("{} {}:{}", r.name, r.id.chain, r.id.number))
+        })
 }
 
 /// Extract a site from a model. `crystal` describes the model/map crystal records.
@@ -615,11 +639,15 @@ pub fn load_site(
     let (sequence, source) = if let Some(s) = &options.sequence {
         (s.clone(), "requested".to_string())
     } else {
-        let tree = tree.as_ref().ok_or_else(|| {
-            invalid(format!(
+        let tree = tree.as_ref().ok_or_else(|| match unknown_attached(structure, anchor[2]) {
+            Some(name) => invalid(format!(
+                "{name} is attached at {}:{}, but it is not in GlycoFlow's residue library, so this glycan cannot be fitted",
+                residue.chain, residue.number
+            )),
+            None => invalid(format!(
                 "no glycan is attached at {}:{}; give the GLYCAM sequence to fit",
                 residue.chain, residue.number
-            ))
+            )),
         })?;
         match &crab {
             Some(s) if same_tree(s, tree) => (s.clone(), "crabwurcs write_glycam".to_string()),

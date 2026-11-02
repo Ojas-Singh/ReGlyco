@@ -108,7 +108,15 @@ impl Restraints {
         let n = problem.n_atoms;
         let topo = &problem.glycan.topology.topo_dist;
         let nt = problem.glycan.topology.n_atoms;
-        let refx = &problem.templates[template];
+        // Bonds, angles and chirality are restrained to the template's geometry. A generated ring
+        // shape is written by displacing ring atoms along the mean-plane normal, which stretches
+        // ring bonds by up to ~0.1 A; those templates take their covalent geometry from the
+        // library's majority build instead (template 0), which bonds and angles do not depend on.
+        let refx = if problem.generated_rings {
+            &problem.templates[0]
+        } else {
+            &problem.templates[template]
+        };
         let mut pairs = Vec::new();
         for i in 0..n {
             for j in i + 1..n {
@@ -282,7 +290,8 @@ pub fn cartesian_refine_traced(
     let observer = problem.observer.get().zip(trace);
     let r = Restraints::new(problem, template, options);
     let n = problem.n_atoms;
-    let free: Vec<bool> = problem.keep[..n].to_vec();
+    // the aglycone atom stays on the protein; hydrogens move with their bond restraints
+    let free: Vec<bool> = problem.movable[..n].to_vec();
     let mut p: Vec<f64> = x0.iter().flat_map(|v| v.iter().copied()).collect();
     let mut adam = Adam::new(p.len(), lr);
     let to_x = |p: &[f64]| -> Vec<V3> { p.chunks(3).map(|c| [c[0], c[1], c[2]]).collect() };

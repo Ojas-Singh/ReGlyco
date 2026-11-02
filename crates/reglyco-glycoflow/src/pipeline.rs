@@ -78,6 +78,32 @@ pub struct FitConfig {
     /// escalate the contact weight in torsion space too (re-ranking every basin under it)
     pub torsion_escalation: bool,
     pub cartesian_escalation: Escalation,
+    /// before choosing basins, briefly refine this many times `n_basins` of the best guided samples
+    /// and choose among the refined ones (0: choose among the unrefined samples)
+    pub pre_refine: usize,
+    pub pre_refine_steps: usize,
+    /// re-generate around the best `renoise_basins` basins after the search (SDEdit): each one's
+    /// torsions are taken back to `renoise_t` on the path from fresh noise and integrated again with
+    /// the map's guidance, `renoise_per_basin` times (0 basins: off); repeated `renoise_rounds`
+    /// times, each round from the best poses so far
+    pub renoise_basins: usize,
+    pub renoise_per_basin: usize,
+    pub renoise_t: f64,
+    pub renoise_rounds: usize,
+    /// core-first search (`search::core_first`): `core_first_fraction * n_samples` guided samples
+    /// scored on the core only, the best `core_first_cores` distinct cores completed
+    /// `core_first_per_core` times each under the full objective (0: off)
+    pub core_first_fraction: f64,
+    pub core_first_cores: usize,
+    pub core_first_per_core: usize,
+    /// branch re-noising (`search::branch_renoise`) of the best `branch_basins` poses after the
+    /// re-noise rounds, `branch_per_branch` times per subtree (0 basins: off)
+    pub branch_basins: usize,
+    pub branch_per_branch: usize,
+    /// evaluation only: poses added to the basins after the search (refined like them), e.g. the
+    /// deposited glycan's (`evaluation::deposited_pose`), to measure the best the pipeline reaches
+    #[serde(skip)]
+    pub extra_starts: Vec<Pose>,
 }
 
 /// Contact-weight escalation of the Cartesian stage.
@@ -122,6 +148,18 @@ impl Default for FitConfig {
             restraints: RestraintOptions::default(),
             torsion_escalation: false,
             cartesian_escalation: Escalation::Selected,
+            pre_refine: 0,
+            pre_refine_steps: 30,
+            renoise_basins: 4,
+            renoise_per_basin: 8,
+            renoise_t: 0.5,
+            renoise_rounds: 3,
+            core_first_fraction: 2.0 / 3.0,
+            core_first_cores: 8,
+            core_first_per_core: 4,
+            branch_basins: 4,
+            branch_per_branch: 2,
+            extra_starts: Vec::new(),
         }
     }
 }
@@ -229,6 +267,10 @@ pub fn density_problem(
         options.n_templates,
         options.template_seed,
     )?;
+    let generated = options.ring_source.generates(model);
+    if generated {
+        crate::problem::generate_ring_templates(&mut glycan, model, 16, options.template_seed)?;
+    }
     // C-mannose: 1C4 in crystals, 4C1 in GlycoFlow's library; odd templates take the other chair
     if crate::anchor::anchor(&site.residue_name).is_some_and(|a| a.both_chairs) {
         crate::ring::flip_root_chair(&mut glycan, |t| t % 2 == 1);
@@ -253,7 +295,7 @@ pub fn density_problem(
         likelihood.obs_blur.dims,
     );
     let observation: Box<dyn Observation> = Box::new(DensityObservation::new(likelihood));
-    SiteProblem::new(
+    let mut problem = SiteProblem::new(
         site,
         glycan,
         &model.meta.vocab,
@@ -261,7 +303,9 @@ pub fn density_problem(
         grid_box,
         radius,
         options,
-    )
+    )?;
+    problem.generated_rings = generated;
+    Ok(problem)
 }
 
 /// Candidate-independent constants of a density problem (box, protein-only fit, noise).
@@ -312,11 +356,11 @@ pub fn build_prior(
         Method::Euler,
         config.seed,
     )?;
-    Ok(MarginalPrior::new(
-        taus.concat(),
-        problem.n_torsions,
-        config.bandwidth_deg,
-    ))
+    // over the torsions the structure determines (`SiteProblem::heavy_torsions`)
+    Ok(
+        MarginalPrior::new(taus.concat(), problem.n_torsions, config.bandwidth_deg)
+            .with_torsions(problem.heavy_torsions()),
+    )
 }
 
 /// One retained basin.
@@ -359,11 +403,14 @@ pub fn prior_deviation(problem: &SiteProblem, x: &[V3]) -> Option<PriorDeviation
         .map(|q| crate::problem::dihedral(x[q[0]], x[q[1]], x[q[2]], x[q[3]]))
         .collect();
     let pct = prior.percentiles(&tau);
+    // torsions the structure determines: a hydroxyl rotamer (an all-atom model's polar hydrogen)
+    // is invisible to the map and absent from deposits, so it is left out of every diagnostic
+    let heavy = problem.heavy_torsions();
     let names = &problem.glycan.atom_names;
     let rare_torsions = quads
         .iter()
         .enumerate()
-        .filter(|(t, _)| pct[*t] < RARE_PERCENTILE)
+        .filter(|(t, _)| heavy[*t] && pct[*t] < RARE_PERCENTILE)
         .map(|(t, q)| RareTorsion {
             torsion: format!(
                 "{}:{}",
@@ -378,7 +425,8 @@ pub fn prior_deviation(problem: &SiteProblem, x: &[V3]) -> Option<PriorDeviation
         })
         .collect();
     Some(PriorDeviation {
-        e_prior: prior.energy(&tau, None),
+        e_prior: prior.energy_on(&tau, &heavy),
+        rarity: prior.rarity_on(&tau, &heavy),
         rare_torsions,
         n_torsions: tau.len(),
     })
@@ -401,6 +449,35 @@ pub fn fit_site(
     problem.w_self = config.search_clash_weight;
     let observer = problem.observer.clone();
     let observer = observer.get();
+    // the core placed on its own, then completed (needs the problem mutably: it scores the core's
+    // atoms only while it samples)
+    let core_samples = (config.core_first_fraction * config.n_samples as f64).round() as usize;
+    let core_first = if core_samples > 0 {
+        let t0 = Instant::now();
+        if let Some(o) = observer {
+            o.stage("core first");
+        }
+        let r = crate::search::core_first(
+            problem,
+            sampler,
+            core_samples,
+            config.core_first_cores,
+            config.core_first_per_core,
+            config
+                .final_clash_weight
+                .unwrap_or(config.search_clash_weight),
+            config.flow_steps,
+            config.guidance_scale,
+            config.guidance_start,
+            config.refine_steps,
+            config.refine_lr,
+            config.seed,
+        )?;
+        problem.counter.add_stage("core first", t0);
+        r
+    } else {
+        (Vec::new(), Vec::new())
+    };
     // search on the (smoother) search weights
     let (mut poses, mut energies, unrefined, sources) = {
         let problem: &SiteProblem = problem;
@@ -416,9 +493,103 @@ pub fn fit_site(
             config.guidance_scale,
             config.guidance_start,
             config.seed,
+            config.pre_refine,
+            config.pre_refine_steps,
         )?;
         let mut poses = r.poses;
         let mut energies = r.energies;
+        let mut sources = r.sources;
+        // new poses join the basins beside them, never in place of one (see the re-noise rounds)
+        let add = |poses: &mut Vec<Pose>,
+                   energies: &mut Vec<f64>,
+                   sources: &mut Vec<usize>,
+                   (p, e): (Vec<Pose>, Vec<f64>),
+                   k: usize| {
+            let x: Vec<Vec<V3>> = p.par_iter().map(|p| problem.place(p)).collect();
+            let keep = crate::search::distinct(problem, &x, &e, k, 0.5);
+            poses.extend(keep.iter().map(|&i| p[i].clone()));
+            energies.extend(keep.iter().map(|&i| e[i]));
+            sources.resize(poses.len(), usize::MAX);
+        };
+        if !core_first.0.is_empty() {
+            add(
+                &mut poses,
+                &mut energies,
+                &mut sources,
+                core_first,
+                2 * config.core_first_cores,
+            );
+        }
+        for round in 0..if config.renoise_basins > 0 {
+            config.renoise_rounds
+        } else {
+            0
+        } {
+            let t0 = Instant::now();
+            if let Some(o) = observer {
+                o.stage("re-noise");
+            }
+            let (p, e) = crate::search::renoise(
+                problem,
+                sampler,
+                &poses,
+                &energies,
+                config.renoise_basins,
+                config.renoise_per_basin,
+                config.renoise_t,
+                config.flow_steps,
+                config.guidance_scale,
+                config.guidance_start,
+                config.refine_steps,
+                config.refine_lr,
+                config.seed.wrapping_add(round as u64),
+            )?;
+            // add the best new poses beside every basin, never in place of one: the final
+            // objective ranks differently from the search energy, so a re-noised pose that wins
+            // here can refine to a worse optimum than the basin it would displace. A pose may sit
+            // in a basin it came from (a second start there); a re-noised basin has no guided
+            // sample of its own to replay.
+            let x: Vec<Vec<V3>> = p.par_iter().map(|p| problem.place(p)).collect();
+            let keep = crate::search::distinct(problem, &x, &e, 2 * config.renoise_basins, 0.5);
+            poses.extend(keep.iter().map(|&i| p[i].clone()));
+            energies.extend(keep.iter().map(|&i| e[i]));
+            sources.resize(poses.len(), usize::MAX);
+            c.add_stage("re-noise", t0);
+        }
+        if config.branch_basins > 0 {
+            let t0 = Instant::now();
+            if let Some(o) = observer {
+                o.stage("branch re-noise");
+            }
+            let r = crate::search::branch_renoise(
+                problem,
+                sampler,
+                &poses,
+                &energies,
+                config.branch_basins,
+                config.branch_per_branch,
+                config.flow_steps,
+                config.guidance_scale,
+                config.guidance_start,
+                config.refine_steps,
+                config.refine_lr,
+                config.seed.wrapping_add(0xB2A9),
+            )?;
+            add(&mut poses, &mut energies, &mut sources, r, 8);
+            c.add_stage("branch re-noise", t0);
+        }
+        if !config.extra_starts.is_empty() {
+            for (pose, e) in refine(
+                problem,
+                &config.extra_starts,
+                config.refine_steps,
+                config.refine_lr,
+            ) {
+                poses.push(pose);
+                energies.push(e);
+            }
+            sources.resize(poses.len(), usize::MAX);
+        }
         let t0 = Instant::now();
         if let Some(o) = observer {
             o.stage("polish");
@@ -433,9 +604,11 @@ pub fn fit_site(
         );
         c.add_stage("polish", t0);
         if let Some(o) = observer {
-            o.basins("polish", &r.sources, &poses, &energies);
+            o.basins("polish", &sources, &poses, &energies);
         }
-        (poses, energies, r.unrefined, r.sources)
+        let mut unrefined = r.unrefined;
+        unrefined.resize(poses.len(), f64::NAN);
+        (poses, energies, unrefined, sources)
     };
     // final objective: re-score every basin, refine the best few under it; escalate the contact
     // weight while the selected pose still violates the contact floors
@@ -644,6 +817,37 @@ pub fn fit_site(
     let mut order: Vec<usize> = (0..energies.len()).collect();
     order.sort_by(|&a, &b| energies[a].total_cmp(&energies[b]));
     let best = order[0];
+    let mut outcome = FitOutcome {
+        basins,
+        order,
+        best,
+        support: Vec::new(),
+        free_torsions: Vec::new(),
+        completions: Vec::new(),
+        alternatives: Vec::new(),
+        counters: c.snapshot(),
+        wall_seconds: 0.0,
+        final_contact_weight,
+        prior_deviation: None,
+    };
+    reselect(problem, sampler, config, &mut outcome, best)?;
+    c.add_stage("support+complete", t0);
+    outcome.counters = c.snapshot();
+    outcome.wall_seconds = started.elapsed().as_secs_f64();
+    Ok(outcome)
+}
+
+/// Make basin `best` the selected one: its support, prior completions, prior deviation and the
+/// alternatives within `alt_margin` of it (`fit_site` calls this for the lowest-objective basin;
+/// the workflow again when that one fails validation and an alternative passes).
+pub fn reselect(
+    problem: &SiteProblem,
+    sampler: &Sampler,
+    config: &FitConfig,
+    outcome: &mut FitOutcome,
+    best: usize,
+) -> Result<()> {
+    let basins = &outcome.basins;
     let support = subtree_support(
         problem,
         &basins[best].x,
@@ -665,26 +869,20 @@ pub fn fit_site(
     } else {
         Vec::new()
     };
-    c.add_stage("support+complete", t0);
-    let alternatives = order
+    let energy = |i: usize| basins[i].terms.total + basins[i].e_restraint;
+    let alternatives = outcome
+        .order
         .iter()
         .copied()
-        .filter(|&i| energies[i] - energies[best] <= config.alt_margin)
+        .filter(|&i| i == best || energy(i) - energy(best) <= config.alt_margin)
         .collect();
-    let deviation = prior_deviation(problem, &basins[best].x);
-    Ok(FitOutcome {
-        basins,
-        order,
-        best,
-        support,
-        free_torsions: free,
-        completions,
-        alternatives,
-        counters: c.snapshot(),
-        wall_seconds: started.elapsed().as_secs_f64(),
-        final_contact_weight,
-        prior_deviation: deviation,
-    })
+    outcome.prior_deviation = prior_deviation(problem, &basins[best].x);
+    outcome.best = best;
+    outcome.support = support;
+    outcome.free_torsions = free;
+    outcome.completions = completions;
+    outcome.alternatives = alternatives;
+    Ok(())
 }
 
 /// Refine the `top` lowest-objective poses (Adam) and keep improvements.

@@ -1445,16 +1445,19 @@ fn ideal_bond_length_for_atoms(left: &glysys::StructureAtom, right: &glysys::Str
     // models included) was reported as a 0.2 Å bond-length error.
     let pair =
         |a: &str, b: &str| names.iter().any(|name| name == a) && names.iter().any(|name| name == b);
-    let carbohydrate = |atom: &glysys::StructureAtom| {
-        matches!(
-            atom.residue_name.trim().to_ascii_uppercase().as_str(),
-            "NAG" | "NDG" | "NGA" | "A2G" | "SIA" | "SLB" | "NGC" | "NGE"
-        )
+    // The carbonyl's atom names depend on the component: C7=O7 in the HexNAcs, C10=O10 in the
+    // sialic acids, whose C7-O7 is an ordinary side-chain C-OH (1.43 Å).
+    let component = |names: &[&str]| {
+        [left, right]
+            .iter()
+            .all(|atom| names.contains(&atom.residue_name.trim().to_ascii_uppercase().as_str()))
     };
-    let ccd_acetyl = carbohydrate(left) && carbohydrate(right);
+    let hexnac = component(&["NAG", "NDG", "NGA", "A2G"]);
+    let sialic = component(&["SIA", "SLB", "NGC", "NGE"]);
     if pair("C2N", "O2N")
         || pair("C5N", "O5N")
-        || (ccd_acetyl && (pair("C7", "O7") || pair("C10", "O10")))
+        || (hexnac && pair("C7", "O7"))
+        || (sialic && pair("C10", "O10"))
     {
         1.21
     // The amide N--C(acetyl) bond is shorter than the generic C--N fallback
@@ -1462,7 +1465,8 @@ fn ideal_bond_length_for_atoms(left: &glysys::StructureAtom, right: &glysys::Str
     // trigger a false source-asset bond-length error.
     } else if pair("N5", "C5N")
         || pair("N2", "C2N")
-        || (ccd_acetyl && (pair("N2", "C7") || pair("N5", "C10")))
+        || (hexnac && pair("N2", "C7"))
+        || (sialic && pair("N5", "C10"))
     {
         1.33
     } else {
@@ -1870,6 +1874,24 @@ mod tests {
             finding.code == "geometry.glycan_bond_deviation"
                 && finding.atom.as_deref() == Some("C5N")
         }));
+    }
+
+    #[test]
+    fn sialic_side_chain_c7_o7_is_a_single_bond() {
+        // PDB-named Neu5Ac: C10=O10 is the N-acetyl carbonyl, C7-O7 a side-chain C-OH
+        let structure = read_pdb_str(
+            "HETATM    1  C7  SIA B   1       0.000   0.000   0.000  1.00  0.00           C\nHETATM    2  O7  SIA B   1       1.430   0.000   0.000  1.00  0.00           O\nHETATM    3  N5  SIA B   1       0.000   3.000   0.000  1.00  0.00           N\nHETATM    4  C10 SIA B   1       1.330   3.000   0.000  1.00  0.00           C\nHETATM    5  O10 SIA B   1       2.540   3.000   0.000  1.00  0.00           O\nCONECT    1    2\nCONECT    3    4\nCONECT    4    3    5\nEND\n",
+            &BuildOptions::default(),
+        )
+        .unwrap();
+        let report = validate(&structure);
+        let flagged: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.code == "geometry.glycan_bond_deviation")
+            .filter_map(|f| f.atom.clone())
+            .collect();
+        assert!(flagged.is_empty(), "flagged {flagged:?}");
     }
 
     #[test]

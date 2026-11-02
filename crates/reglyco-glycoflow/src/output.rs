@@ -118,7 +118,8 @@ fn glycan_records(
                 .iter()
                 .map(|(pdb, gly)| (*gly, *pdb))
                 .collect();
-            for i in (0..p.n_atoms).filter(|&i| p.glycan.res_paths[i] == n.path) {
+            // heavy atoms, as deposited (`keep`)
+            for i in (0..p.n_atoms).filter(|&i| p.glycan.res_paths[i] == n.path && p.keep[i]) {
                 let gname = p.glycan.atom_names[i].as_str();
                 let name = back
                     .iter()
@@ -158,10 +159,16 @@ fn glycan_records(
         put(17, &format!("{:>3}", g.site.residue_name));
         put(21, &g.site.residue.chain);
         put(22, &format!("{:>4}", g.site.residue.number));
+        if let Some(code) = g.site.residue.insertion_code {
+            put(26, &code.to_string());
+        }
         put(42, &format!("{:>4}", "C1"));
         put(47, &format!("{:>3}", root.ccd));
         put(51, &root.chain);
         put(52, &format!("{:>4}", root.number));
+        if let Some(code) = root.insertion_code {
+            put(56, &code.to_string());
+        }
         let link = g.site.anchor[2];
         let c1 = g.x[p.c1];
         let d = ((link[0] - c1[0]).powi(2) + (link[1] - c1[1]).powi(2) + (link[2] - c1[2]).powi(2))

@@ -38,7 +38,7 @@
 // Tolerances: the reference evaluates in float32 on the GPU. With the bulk-solvent regressor the
 // density projection e = <g,obs> - theta.q is a difference of larger numbers, so absolute errors of
 // ~1e-3 log-likelihood units appear; floors are set to the magnitude of the differenced quantities
-// (poses: 2 loglik, 4 gain, 0.05 partial correlation; subtree support gains: 3, 2e-3 relative;
+// (poses: 2 loglik, 4 gain or 2 loglik units of it, 0.05 partial correlation; subtree support gains: 3, 2e-3 relative;
 // attachment objective: 10). One-residue glycans at sigma 0.6 set the pose floors: their poses
 // outside the density have log-likelihoods below 1 with the same ~1e-3 absolute error.
 use std::path::PathBuf;
@@ -139,7 +139,9 @@ fn check_vec_floor(label: &str, rust: &[f64], python: &[f64], tol: f64, floor: f
     println!(
         "  {label:<28} |rust| {nr:>14.6} |python| {np:>14.6} cos {cos:.7} rel.diff {reln:.2e}"
     );
-    if !(cos > 0.999 && reln < tol) {
+    // under the floor the direction is float32 noise (a glycan whose torsions only turn hydroxyl
+    // hydrogens: its dE/dtau is zero up to rounding), so only the difference counts
+    if !((cos > 0.999 || np < floor) && reln < tol) {
         fail(format!("{label}: cosine {cos}, relative difference {reln}"));
     }
 }
@@ -477,7 +479,9 @@ fn parity(name: &str) {
         .iter()
         .flat_map(vec_f)
         .collect();
-    let prior = MarginalPrior::new(samples, problem.n_torsions, f(&pr["bandwidth_deg"]));
+    // over the torsions heavy atoms define, as the pipeline and `MarginalPrior.from_model`
+    let prior = MarginalPrior::new(samples, problem.n_torsions, f(&pr["bandwidth_deg"]))
+        .with_torsions(problem.heavy_torsions());
     check("prior kappa", prior.kappa, f(&pr["kappa"]), 1e-12, 1.0);
     check(
         "prior log normaliser",
@@ -520,11 +524,19 @@ fn parity(name: &str) {
             + 10.0 * (f(&t["e_env"]).abs() + f(&t["e_self"]).abs())
             + f(&t["e_att"]).abs()
             + f(&t["e_prior"]).abs();
+        // the gain is the log-likelihood times a site constant (44.8 for 5KZC at sigma 1.0), so it
+        // inherits the loglik floor in its own units
+        let gain_per_loglik = f(&t["gain"]) / f(&t["loglik"]);
+        let gain_floor = if gain_per_loglik.is_finite() {
+            (2.0 * gain_per_loglik.abs()).max(4.0)
+        } else {
+            4.0
+        };
         for (label, rust, floor) in [
             ("total", terms.total, scale),
             ("loglik", terms.loglik, 2.0),
             ("partial_cc", terms.partial_cc, 0.05),
-            ("gain", terms.gain, 4.0),
+            ("gain", terms.gain, gain_floor),
             ("e_env", terms.e_env, 1e-2),
             ("e_att", terms.e_att, 1e-3),
             ("e_prior", terms.e_prior, 1e-2),
@@ -866,11 +878,10 @@ fn controlled_fit(name: &str) {
         .iter()
         .flat_map(vec_f)
         .collect();
-    problem.prior = Some(MarginalPrior::new(
-        samples,
-        problem.n_torsions,
-        f(&pr["bandwidth_deg"]),
-    ));
+    problem.prior = Some(
+        MarginalPrior::new(samples, problem.n_torsions, f(&pr["bandwidth_deg"]))
+            .with_torsions(problem.heavy_torsions()),
+    );
     let sampler = Sampler::for_glycan(&model.net, &problem.glycan, &model.meta.vocab).unwrap();
     for seed in 0..3u64 {
         let config = reglyco_glycoflow::FitConfig {

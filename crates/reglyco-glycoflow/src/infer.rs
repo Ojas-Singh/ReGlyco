@@ -21,6 +21,7 @@ use glysys::{ResidueId, Structure};
 use crate::error::Result;
 use reglyco_density::DensityMap;
 
+use crate::observation::{Observation, ObservationValue, ObservedAtoms};
 use crate::pipeline::FitOutcome;
 use crate::problem::{SiteProblem, V3, build_glycan, decoy_poses, max_span};
 use crate::site::{DepositedGlycan, glycam_of, sequence_paths};
@@ -648,6 +649,57 @@ impl Inference {
     }
 }
 
+/// Ranking of candidates: penalised density gain, then the smaller supported tree.
+fn ranks_below(a: &CandidateFit, b: &CandidateFit) -> bool {
+    (a.score, -(a.supported.len() as i64))
+        .partial_cmp(&(b.score, -(b.supported.len() as i64)))
+        .unwrap_or(std::cmp::Ordering::Equal)
+        != std::cmp::Ordering::Greater
+}
+
+/// Adds a gated candidate and frees the maps of the one that is no longer the best: every
+/// candidate holds a full site problem (density box, clash grids; ~100 MB for an N-glycan's
+/// scoring region), and only the chosen one is evaluated again. Ties go to the later candidate.
+fn keep_best(fits: &mut Vec<CandidateFit>, best: &mut usize, candidate: CandidateFit) {
+    fits.push(candidate);
+    let new = fits.len() - 1;
+    if new == 0 {
+        return;
+    }
+    let loser = if ranks_below(&fits[*best], &fits[new]) {
+        std::mem::replace(best, new)
+    } else {
+        new
+    };
+    release_maps(&mut fits[loser].fit.problem);
+}
+
+/// The observation of a candidate that lost the inference: its data were freed.
+struct Released;
+
+impl Observation for Released {
+    fn kind(&self) -> &'static str {
+        "released"
+    }
+    fn prepare(&mut self, _atoms: &ObservedAtoms) -> Result<()> {
+        Ok(())
+    }
+    fn evaluate(
+        &self,
+        _x: &[[f64; 3]],
+        _active: Option<&[bool]>,
+        _grad: Option<&mut [[f64; 3]]>,
+    ) -> ObservationValue {
+        panic!("a candidate that lost the inference was evaluated after its maps were freed")
+    }
+}
+
+fn release_maps(problem: &mut SiteProblem) {
+    problem.observation = Box::new(Released);
+    problem.grids.carbon = Vec::new();
+    problem.grids.polar = Vec::new();
+}
+
 /// Infer the glycan at `residue` from the density. `protein` is the model without any target
 /// glycan; `input.sites` is ignored.
 pub fn glycan_from_density(
@@ -672,6 +724,7 @@ pub fn glycan_from_density(
     let region_radius = options.problem.region_radius.unwrap_or(reach + 2.5);
     options.problem.region_radius = Some(region_radius);
     let mut fits: Vec<CandidateFit> = Vec::new();
+    let mut best = 0;
     let sub = |options: &crate::workflow::WorkflowOptions| WorkflowInput {
         structure: input.structure,
         structure_text: input.structure_text,
@@ -682,6 +735,40 @@ pub fn glycan_from_density(
     };
     // density levels of the site (candidate independent): from the first fit's site
     let mut levels: Option<DensityLevels> = None;
+    // Root check: the candidates share their reducing-end residue. When the map does not support
+    // even that residue fitted on its own, the site carries no glycan density and the large fits
+    // are skipped (an empty sequon costs one small fit instead of one per candidate). The check
+    // leaves the atom width to the first candidate, so a glycosylated site's inference is unchanged.
+    let roots = candidates
+        .iter()
+        .map(|(_, s)| pruned_sequence(s, &BTreeSet::from(["r".to_string()])).map(|(r, _)| r))
+        .collect::<Result<BTreeSet<String>>>()?;
+    if !input.options.infer_without_root_check && roots.len() == 1 {
+        let root = roots.into_iter().next().unwrap_or_default();
+        let name = "reducing-end residue alone (root check)";
+        if let Some(o) = options.observer.get() {
+            o.stage(&format!("candidate {name}"));
+        }
+        let stat = fit_candidate(&sub(&options), residue, protein, name, &root)?;
+        let env: Vec<V3> = stat
+            .fit
+            .site
+            .environment
+            .iter()
+            .map(|a| a.position)
+            .collect();
+        levels = DensityLevels::new(input.map, &stat.fit.problem, &env);
+        let check = gate(&sub(&options), levels.as_ref(), stat)?;
+        if check.supported.is_empty() {
+            return Ok(Inference {
+                levels,
+                sigma: check.fit.sigma.selected,
+                candidates: vec![check],
+                best: 0,
+                region_radius,
+            });
+        }
+    }
     for (name, seq) in candidates {
         if let Some(o) = options.observer.get() {
             o.stage(&format!("candidate {name}"));
@@ -699,7 +786,11 @@ pub fn glycan_from_density(
                 .collect();
             levels = DensityLevels::new(input.map, &stat.fit.problem, &env);
         }
-        fits.push(gate(&sub(&options), levels.as_ref(), stat)?);
+        keep_best(
+            &mut fits,
+            &mut best,
+            gate(&sub(&options), levels.as_ref(), stat)?,
+        );
     }
     let run = |options: &crate::workflow::WorkflowOptions, name: &str, seq: &str| {
         if let Some(o) = options.observer.get() {
@@ -720,16 +811,9 @@ pub fn glycan_from_density(
             }
             let name = format!("{} (pruned, refitted)", fits[k].name);
             let f = run(&options, &name, &p)?;
-            fits.push(f);
+            keep_best(&mut fits, &mut best, f);
         }
     }
-    let best = (0..fits.len())
-        .max_by(|&a, &b| {
-            (fits[a].score, -(fits[a].supported.len() as i64))
-                .partial_cmp(&(fits[b].score, -(fits[b].supported.len() as i64)))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .unwrap_or(0);
     Ok(Inference {
         levels,
         sigma: options.sigma.unwrap_or(f64::NAN),
