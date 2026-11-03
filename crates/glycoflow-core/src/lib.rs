@@ -36,6 +36,7 @@ pub mod rng;
 pub mod sampler;
 pub mod sequence;
 pub mod topology;
+pub mod vmath;
 
 pub use builder::BuiltGlycan;
 pub use error::{Error, Result};
