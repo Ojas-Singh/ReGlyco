@@ -7,6 +7,9 @@
 
 use candle_core::{CpuStorage, CustomOp2, CustomOp3, Layout, Result, Shape, Tensor};
 
+// Activations: scalar forms in `crate::vmath` (bit-identical four-lane versions on wasm32 simd128).
+use crate::vmath::{exp_inplace, gelu_inplace, silu_inplace};
+
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -50,16 +53,19 @@ fn for_chunks(out: &mut [f32], chunk: usize, f: impl Fn(usize, &mut [f32]) + Syn
     out.chunks_mut(chunk).enumerate().for_each(|(i, c)| f(i, c));
 }
 
-#[inline]
-fn silu(v: f32) -> f32 {
-    v / (1.0 + (-v).exp())
+/// Run `f(i)` for i in 0..count, in parallel with rayon when enabled.
+fn for_rows(count: usize, f: impl Fn(usize) + Sync + Send) {
+    #[cfg(feature = "parallel")]
+    (0..count).into_par_iter().for_each(f);
+    #[cfg(not(feature = "parallel"))]
+    (0..count).for_each(f);
 }
 
-#[inline]
-fn gelu_cpu(v: f32) -> f32 {
-    // candle's CPU gelu_erf formula
-    (candle_core::cpu::erf::erf_f32(v * std::f32::consts::FRAC_1_SQRT_2) + 1.) * 0.5 * v
-}
+/// A raw output pointer shared by rows that write disjoint elements.
+struct SendPtr(*mut f32);
+// SAFETY: used only for disjoint writes from `for_rows` (see `PairBias::run_cpu`)
+unsafe impl Sync for SendPtr {}
+unsafe impl Send for SendPtr {}
 
 // ------------------------------------------------------------------------------------------------
 // CUDA source (NVRTC)
@@ -354,13 +360,16 @@ impl CustomOp2 for BiasAct {
         let rows = 4096usize.div_ceil(c).max(1) * c;
         for_chunks(&mut y, rows, |ci, out| {
             let xs = &x[ci * rows..ci * rows + out.len()];
-            for (k, (o, v)) in out.iter_mut().zip(xs).enumerate() {
-                let v = v + b[k % c];
-                *o = match act {
-                    Act::None => v,
-                    Act::Silu => silu(v),
-                    Act::Gelu => gelu_cpu(v),
-                };
+            // `rows` is a multiple of c, so every chunk starts on a row
+            for (orow, xrow) in out.chunks_mut(c).zip(xs.chunks(c)) {
+                for ((o, v), bk) in orow.iter_mut().zip(xrow).zip(b) {
+                    *o = v + bk;
+                }
+            }
+            match act {
+                Act::None => {}
+                Act::Silu => silu_inplace(out),
+                Act::Gelu => gelu_inplace(out),
             }
         });
         Ok((CpuStorage::F32(y), l1.shape().clone()))
@@ -487,6 +496,39 @@ struct LnMod {
     mode: i32,
 }
 
+/// Rows handled together by the row-reduction kernels (layer norm, softmax).
+const ROWS4: usize = 4;
+
+/// Per-row sums of `f(row, x)` over up to four rows of `len` (`xs` = rows * len), each row summed
+/// in ascending order starting from -0.0 -- exactly `row.iter().map(..).sum::<f32>()` -- but with
+/// the rows' additions interleaved so they do not wait on each other. Unused rows give -0.0.
+#[inline(always)]
+fn interleaved_sums(xs: &[f32], len: usize, f: impl Fn(usize, f32) -> f32) -> [f32; ROWS4] {
+    let rows = xs.len() / len.max(1);
+    let mut s = [-0.0f32; ROWS4];
+    if rows == ROWS4 {
+        let (a, b, c, d) = (
+            &xs[..len],
+            &xs[len..2 * len],
+            &xs[2 * len..3 * len],
+            &xs[3 * len..4 * len],
+        );
+        for k in 0..len {
+            s[0] += f(0, a[k]);
+            s[1] += f(1, b[k]);
+            s[2] += f(2, c[k]);
+            s[3] += f(3, d[k]);
+        }
+    } else {
+        for (r, row) in xs.chunks(len.max(1)).enumerate() {
+            for &v in row {
+                s[r] += f(r, v);
+            }
+        }
+    }
+    s
+}
+
 impl LnMod {
     #[allow(clippy::too_many_arguments)]
     fn run_cpu(
@@ -499,25 +541,36 @@ impl LnMod {
         bb: &[f32],
     ) -> Vec<f32> {
         let mut y = vec![0f32; x.len()];
-        for_chunks(&mut y, d, |row, out| {
-            let xr = &x[row * d..(row + 1) * d];
-            let mean = xr.iter().sum::<f32>() / d as f32;
-            let var = xr.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
-            let rstd = 1.0 / (var + 1e-5).sqrt();
-            let ar = if self.mode & 1 != 0 {
-                &ada[(row / self.rows_per_batch) * ada_stride..]
-            } else {
-                &[][..]
-            };
-            for k in 0..d {
-                let mut t = (xr[k] - mean) * rstd;
-                if self.mode & 1 != 0 {
-                    t = t * (1.0 + ar[self.scale_off + k]) + ar[self.shift_off + k];
+        // Four rows per chunk: their mean and variance sums run interleaved (each row still adds
+        // its elements in order, from -0.0 as `Iterator::sum` does), which hides the latency of
+        // the dependent additions.
+        for_chunks(&mut y, ROWS4 * d, |blk, out| {
+            let row0 = blk * ROWS4;
+            let rows = out.len() / d;
+            let xs = &x[row0 * d..(row0 + rows) * d];
+            let mean = interleaved_sums(xs, d, |_, v| v).map(|s| s / d as f32);
+            let var =
+                interleaved_sums(xs, d, |r, v| (v - mean[r]) * (v - mean[r])).map(|s| s / d as f32);
+            for r in 0..rows {
+                let row = row0 + r;
+                let (xr, out) = (&xs[r * d..(r + 1) * d], &mut out[r * d..(r + 1) * d]);
+                let (mean, var) = (mean[r], var[r]);
+                let rstd = 1.0 / (var + 1e-5).sqrt();
+                let ar = if self.mode & 1 != 0 {
+                    &ada[(row / self.rows_per_batch) * ada_stride..]
+                } else {
+                    &[][..]
+                };
+                for k in 0..d {
+                    let mut t = (xr[k] - mean) * rstd;
+                    if self.mode & 1 != 0 {
+                        t = t * (1.0 + ar[self.scale_off + k]) + ar[self.shift_off + k];
+                    }
+                    if self.mode & 2 != 0 {
+                        t = t * w[k] + bb[k];
+                    }
+                    out[k] = t;
                 }
-                if self.mode & 2 != 0 {
-                    t = t * w[k] + bb[k];
-                }
-                out[k] = t;
             }
         });
         y
@@ -741,21 +794,33 @@ impl CustomOp2 for ScaleBiasSoftmax {
         let n = *l1.shape().dims().last().unwrap();
         let mut y = vec![0f32; x.len()];
         let (scale, div) = (self.scale, self.div);
-        for_chunks(&mut y, n, |row, out| {
-            let (xr, br) = (&x[row * n..(row + 1) * n], &bias[row * n..(row + 1) * n]);
-            let mut m = f32::NEG_INFINITY;
-            for j in 0..n {
-                let v = (if div { xr[j] / scale } else { xr[j] * scale }) + br[j];
-                out[j] = v;
-                m = m.max(v);
+        for_chunks(&mut y, ROWS4 * n, |blk, out| {
+            let row0 = blk * ROWS4;
+            for (r, out) in out.chunks_mut(n).enumerate() {
+                let row = row0 + r;
+                let (xr, br) = (&x[row * n..(row + 1) * n], &bias[row * n..(row + 1) * n]);
+                for j in 0..n {
+                    out[j] = (if div { xr[j] / scale } else { xr[j] * scale }) + br[j];
+                }
+                // the maximum is the same whatever order it is taken in (a zero's sign is lost
+                // in x - m), so it is taken four-wide
+                let mut m4 = [f32::NEG_INFINITY; 4];
+                for (j, &v) in out.iter().enumerate() {
+                    m4[j % 4] = m4[j % 4].max(v);
+                }
+                let m = m4[0].max(m4[1]).max(m4[2].max(m4[3]));
+                for o in out.iter_mut() {
+                    *o -= m;
+                }
+                exp_inplace(out);
             }
-            let mut s = 0f32;
-            for o in out.iter_mut() {
-                *o = (*o - m).exp();
-                s += *o;
-            }
-            for o in out.iter_mut() {
-                *o /= s;
+            // each row's sum in ascending order, the rows interleaved (from -0.0 rather than the
+            // former 0.0: the terms are exp() >= +0, so every partial sum is the same)
+            let s = interleaved_sums(out, n, |_, v| v);
+            for (r, out) in out.chunks_mut(n).enumerate() {
+                for o in out.iter_mut() {
+                    *o /= s[r];
+                }
             }
         });
         Ok((CpuStorage::F32(y), l1.shape().clone()))
@@ -831,6 +896,49 @@ fn madd(a: f32, b: f32, c: f32) -> f32 {
     }
 }
 
+/// `out[o] = sum_k x[k] wt[k * O + o]` (O = out.len()), accumulated from 0 in ascending k with
+/// `acc = madd(x, w, acc)`. On wasm32 simd128 the accumulators of a 32- or 64-wide output stay in
+/// registers (four outputs per lane group); each output still sees the same operations in the
+/// same order, so the result is bit-identical to the scalar loop.
+#[inline(always)]
+fn matvec(x: &[f32], wt: &[f32], out: &mut [f32]) {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    match out.len() {
+        32 => return matvec_lanes::<8>(x, wt, out),
+        64 => return matvec_lanes::<16>(x, wt, out),
+        _ => {}
+    }
+    let o = out.len();
+    out.iter_mut().for_each(|v| *v = 0.0);
+    for (k, &xk) in x.iter().enumerate() {
+        for (acc, wv) in out.iter_mut().zip(&wt[k * o..(k + 1) * o]) {
+            *acc = madd(xk, *wv, *acc);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+fn matvec_lanes<const V: usize>(x: &[f32], wt: &[f32], out: &mut [f32]) {
+    use core::arch::wasm32::*;
+    let o = 4 * V;
+    assert!(out.len() == o && wt.len() >= x.len() * o);
+    let mut acc = [f32x4_splat(0.0); V];
+    for (k, &xk) in x.iter().enumerate() {
+        let xs = f32x4_splat(xk);
+        let w = &wt[k * o..(k + 1) * o];
+        for (v, a) in acc.iter_mut().enumerate() {
+            // SAFETY: w has o = 4V floats, so lanes 4v..4v+4 are in bounds (unaligned load is allowed)
+            let wv = unsafe { v128_load(w.as_ptr().add(4 * v) as *const v128) };
+            *a = f32x4_add(f32x4_mul(xs, wv), *a);
+        }
+    }
+    for (v, a) in acc.iter().enumerate() {
+        // SAFETY: out has 4V floats
+        unsafe { v128_store(out.as_mut_ptr().add(4 * v) as *mut v128, *a) };
+    }
+}
+
 impl PairBias<'_> {
     fn run_cpu(&self, dist: &[f32], topo: &[u32], p: &[f32], b: usize, n: usize) -> Vec<f32> {
         let (r, pd, c, h) = (self.prm.r, self.prm.p, self.prm.c, self.prm.heads);
@@ -859,9 +967,18 @@ impl PairBias<'_> {
             tr(&w2[..pd * pd], pd, pd),
             tr(&wb[..c * pd], c, pd),
         );
-        // rows (b, i) computed in parallel into a [B*N, C, N] scratch, then scattered layer-major
-        let mut tmp = vec![0f32; b * n * c * n];
-        for_chunks(&mut tmp, c * n, |row, out| {
+        // Rows (b, i) in parallel, each pair's C values written straight to their places in the
+        // layer-major [L, B, H, N, N] output (no scratch copy): pair (b, i, j), channel
+        // cc = layer * H + head goes to ((layer * B + b) * H + head) * N * N + i * N + j.
+        let len = b * n * c * n;
+        let mut out: Vec<f32> = Vec::with_capacity(len);
+        let dst = SendPtr(out.as_mut_ptr());
+        let plane = n * n;
+        let channel: Vec<usize> = (0..c)
+            .map(|cc| ((cc / h) * b * h + cc % h) * plane)
+            .collect();
+        for_rows(b * n, |row| {
+            let dst = &dst;
             let bi = row / n;
             let i = row % n;
             let mut rbf = vec![0f32; r];
@@ -872,60 +989,35 @@ impl PairBias<'_> {
                 let d = dist[(bi * n + i) * n + j];
                 for k in 0..r {
                     let t = (d - centers[k]) / width;
-                    rbf[k] = (-(t * t)).exp();
+                    rbf[k] = -(t * t);
                 }
-                h1.iter_mut().for_each(|v| *v = 0.0);
-                for k in 0..r {
-                    let (x, w) = (rbf[k], &w0t[k * pd..(k + 1) * pd]);
-                    for (acc, wv) in h1.iter_mut().zip(w) {
-                        *acc = madd(x, *wv, *acc);
-                    }
-                }
+                exp_inplace(&mut rbf);
+                matvec(&rbf, &w0t, &mut h1);
                 for o in 0..pd {
-                    h1[o] = silu(h1[o] + b0[o]);
+                    h1[o] += b0[o];
                 }
+                silu_inplace(&mut h1);
                 let tp = topo[if self.topo_batched {
                     (bi * n + i) * n + j
                 } else {
                     i * n + j
                 }] as usize;
                 let e = &emb[tp * pd..(tp + 1) * pd];
-                h2.iter_mut().for_each(|v| *v = 0.0);
-                for k in 0..pd {
-                    let (x, w) = (h1[k], &w2t[k * pd..(k + 1) * pd]);
-                    for (acc, wv) in h2.iter_mut().zip(w) {
-                        *acc = madd(x, *wv, *acc);
-                    }
-                }
+                matvec(&h1, &w2t, &mut h2);
                 for o in 0..pd {
                     h2[o] = (h2[o] + b2[o]) + e[o];
                 }
-                o3.iter_mut().for_each(|v| *v = 0.0);
-                for k in 0..pd {
-                    let (x, w) = (h2[k], &wbt[k * c..(k + 1) * c]);
-                    for (acc, wv) in o3.iter_mut().zip(w) {
-                        *acc = madd(x, *wv, *acc);
-                    }
-                }
+                matvec(&h2, &wbt, &mut o3);
+                let at = bi * h * plane + i * n + j;
                 for cc in 0..c {
-                    out[cc * n + j] = o3[cc] + bb[cc];
+                    // SAFETY: at + channel[cc] < len, and every (row, j, cc) is a different element,
+                    // so no two rows write the same place
+                    unsafe { *dst.0.add(at + channel[cc]) = o3[cc] + bb[cc] };
                 }
             }
         });
-        let l = c / h;
-        let mut out = vec![0f32; b * n * c * n];
-        for_chunks(&mut out, n * n, |blk, o| {
-            // blk = (layer * B + b) * H + head
-            let head = blk % h;
-            let bi = (blk / h) % b;
-            let layer = blk / (h * b);
-            let cc = layer * h + head;
-            for i in 0..n {
-                let src = &tmp[((bi * n + i) * c + cc) * n..((bi * n + i) * c + cc + 1) * n];
-                o[i * n..(i + 1) * n].copy_from_slice(src);
-            }
-        });
-        let _ = l;
+        // SAFETY: the B*N rows wrote all N*C elements each, so all `len` are initialised
+        unsafe { out.set_len(len) };
         out
     }
 }

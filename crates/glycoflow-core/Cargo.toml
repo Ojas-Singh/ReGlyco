@@ -34,3 +34,8 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
 safetensors = "0.7"
+
+# wasm32: the module scripts/perf/vmath_check.mjs loads (exhaustive check of src/vmath.rs)
+[[example]]
+name = "vmath_check"
+crate-type = ["cdylib"]
