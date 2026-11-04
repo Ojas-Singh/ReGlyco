@@ -464,17 +464,7 @@ where
     let context = if config.scoring_mode == SearchScoringMode::StericPrior {
         None
     } else {
-        let reference = vec![
-            Gene {
-                conformer: 0,
-                phi: 0.,
-                psi: 0.,
-                rotamer: None
-            };
-            sites.len()
-        ];
-        let system =
-            builder.prepare_structure(&build_state(protein, sites, &reference, builder)?)?;
+        let system = prepare_topology(protein, sites, &prepared, builder)?;
         Some(EnergySearchContext {
             system,
             evaluator: OnceLock::new(),

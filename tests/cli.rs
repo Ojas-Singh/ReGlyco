@@ -500,3 +500,50 @@ fn cli_scan_attaches_glcnac_to_every_sequon() {
     assert!(directory.path().join("search.json").is_file());
     assert!(directory.path().join("report.json").is_file());
 }
+
+/// Energy scoring parameterizes the glycoprotein once, from a reference state.
+/// That state used to be conformer 0 at phi = psi = 0, which on this protein
+/// puts the GlcNAc's C6 1.6 A from a glycine: GlySys read the contact as a
+/// bond and refused the PDB-named residue ("C6 is bonded to another residue").
+/// Both bundle formats must build in both energy modes.
+#[test]
+fn energy_build_prepares_its_topology_without_glycan_contacts() {
+    for glycan in ["tests/fixtures/pdb-bundle", "tests/fixtures/glycan.pdb"] {
+        for mode in ["--interact", "--energy"] {
+            let directory = tempfile::tempdir().unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+                .args([
+                    "build",
+                    "--protein",
+                    "tests/fixtures/blocked-asn-protein.pdb",
+                    "--attach",
+                    &format!("A:1={glycan}"),
+                    mode,
+                    "--population",
+                    "4",
+                    "--generations",
+                    "1",
+                    "--no-system",
+                    "--quiet",
+                    "--output",
+                ])
+                .arg(directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{glycan} {mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let search: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(directory.path().join("search.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                search["energy_diagnostics"]["topology_parameterizations"], 1,
+                "{glycan} {mode}"
+            );
+            assert!(directory.path().join("glycoprotein.pdb").is_file());
+        }
+    }
+}
