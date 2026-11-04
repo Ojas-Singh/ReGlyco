@@ -2606,6 +2606,22 @@ pub async fn execute_with_control(
     } else {
         parsed
     };
+    // Energy scoring and post-relax map every frame onto one GlySys topology,
+    // which needs every heavy atom GlySys adds to a deposited structure
+    // (truncated side chains, a missing OXT): build from the completed
+    // receptor.  Steric runs keep the input as given.
+    if matches!(
+        request.workflow,
+        WorkflowId::Uniprot
+            | WorkflowId::NScan
+            | WorkflowId::SiteBuild
+            | WorkflowId::Ensemble
+            | WorkflowId::Refine
+    ) && (request.options.scoring_mode != SearchScoringMode::StericPrior
+        || request.options.post_relax)
+    {
+        protein = reglyco_ensemble::complete_receptor_for_energy(&protein, &builder)?;
+    }
     let mut warnings = Vec::new();
     let mut status = WorkflowStatus::Succeeded;
     let mut workflow_sites = Vec::new();

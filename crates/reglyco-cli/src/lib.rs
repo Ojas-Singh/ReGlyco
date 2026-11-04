@@ -21,8 +21,9 @@ use reglyco_density::rcsb::{RcsbMapAcquisition, fetch_2fo_fc_map};
 use reglyco_density::{DensityMap, DensityScoreOptions, DensityScorer, DensityTarget};
 use reglyco_ensemble::{
     CachingProvider, EnsembleProvider, GlycoShapeProvider, LocalBundleProvider, SearchPhase,
-    SearchProgress, build_from_outcome, calculate_sasa, configure_threads, resolve_search_budget,
-    sample_attached_ensemble, search, search_with_progress, steric_site_scores,
+    SearchProgress, build_from_outcome, calculate_sasa, complete_receptor_for_energy,
+    configure_threads, resolve_search_budget, sample_attached_ensemble, search,
+    search_with_progress, steric_site_scores,
 };
 use reglyco_refine::{RefineProgress, RefineRequest, refine_with_progress};
 use reglyco_relax::{MovableSelection, RelaxOptions, RelaxProgress, relax_with_progress};
@@ -714,6 +715,7 @@ fn run_build(arguments: BuildArgs) -> anyhow::Result<()> {
     if config.scoring_mode == SearchScoringMode::StericPrior {
         config.selection_policy = SearchSelectionPolicy::JointPriorV1;
     }
+    let protein = energy_receptor(protein, &config, &search_builder)?;
     let outcome = search_with_progress(&protein, &sites, &config, &search_builder, |event| {
         print_search_progress(event, arguments.quiet)
     })?;
@@ -848,6 +850,7 @@ fn run_ensemble(arguments: EnsembleArgs) -> anyhow::Result<()> {
             mh_thinning_accepted: arguments.thinning_accepted,
             ..energy_search_config(&arguments.energy)?
         };
+        let protein = energy_receptor(protein, &config, &builder)?;
         let (frames, diagnostics) =
             sample_attached_ensemble(&protein, &sites, arguments.frames, &config, &builder)?;
         if !arguments.quiet {
@@ -2210,6 +2213,7 @@ fn load_search_with_anomers(
         scan_rotamers: arguments.rotamers,
         ..energy_search_config(&arguments.energy)?
     };
+    let protein = energy_receptor(protein, &config, &builder)?;
     Ok((protein, sites, builder, config))
 }
 
@@ -2695,6 +2699,19 @@ fn relax_options(arguments: &RelaxCommon) -> RelaxOptions {
     options.lbfgs.max_iterations = arguments.max_iterations;
     options.obc2 = arguments.obc2.then(Default::default);
     options
+}
+
+/// Energy modes build their frames and output from the receptor completed
+/// with the heavy atoms GlySys adds; steric mode keeps it as given.
+fn energy_receptor(
+    protein: glysys::Structure,
+    config: &SearchConfig,
+    builder: &SystemBuilder,
+) -> anyhow::Result<glysys::Structure> {
+    if config.scoring_mode == SearchScoringMode::StericPrior {
+        return Ok(protein);
+    }
+    Ok(complete_receptor_for_energy(&protein, builder)?)
 }
 
 fn energy_search_config(arguments: &EnergyArgs) -> anyhow::Result<SearchConfig> {
