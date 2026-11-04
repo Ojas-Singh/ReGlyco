@@ -33,6 +33,8 @@ struct Pose {
     /// PDB reader discards protein hydrogens, so none sits on the link atom.
     c1_atom: usize,
     o5_atom: usize,
+    /// Atoms other than hydrogen, in `coordinates` order.
+    heavy: Vec<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -715,6 +717,48 @@ impl PreparedAttachmentContext {
         })
     }
 
+    /// The heavy atoms of one site's glycan for `gene` (unturned side chain),
+    /// without the atom bonded to the protein.
+    pub(crate) fn site_heavy_coordinates(
+        &self,
+        site_index: usize,
+        gene: &Gene,
+    ) -> Result<Vec<Vec3>, ReGlycoError> {
+        let pose = self
+            .sites
+            .get(site_index)
+            .and_then(|site| site.poses.first())
+            .and_then(|conformers| conformers.get(gene.conformer))
+            .ok_or(ReGlycoError::InvalidGeometry)?;
+        Ok(transform_pose(pose, gene.phi, gene.psi)?
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| *index != pose.c1_atom && pose.heavy[*index])
+            .map(|(_, position)| position)
+            .collect())
+    }
+
+    /// Protein atoms (all heavy: the protein set has no hydrogens) closer
+    /// than `distance` to any of `coordinates`.
+    pub(crate) fn protein_contacts(&self, coordinates: &[Vec3], distance: f64) -> usize {
+        let threshold2 = distance * distance;
+        let cell_radius = (distance / GRID_CELL).ceil().max(1.0) as i32;
+        let mut candidates = Vec::with_capacity(64);
+        let mut contacts = 0;
+        for position in coordinates {
+            candidates.clear();
+            self.static_grid
+                .append_candidates(*position, cell_radius, &mut candidates);
+            contacts += candidates
+                .iter()
+                .filter(|&&index| {
+                    squared_distance(*position, self.protein_coordinates[index]) < threshold2
+                })
+                .count();
+        }
+        contacts
+    }
+
     #[cfg(test)]
     pub(crate) fn site_coordinates(&self, state: &[Gene]) -> Result<Vec<Vec<Vec3>>, ReGlycoError> {
         state
@@ -817,6 +861,16 @@ fn make_conformer_pose_from_reference(
     )?;
     let c1_atom = oriented.c1_index;
     let o5_atom = oriented.o5_index;
+    let heavy = oriented
+        .atoms
+        .iter()
+        .map(|(id, _)| {
+            conformer
+                .structure
+                .atom(*id)
+                .is_none_or(|atom| !matches!(atom.element.trim(), "H" | "D"))
+        })
+        .collect::<Vec<_>>();
     let mut coordinates = oriented
         .atoms
         .iter()
@@ -843,6 +897,7 @@ fn make_conformer_pose_from_reference(
         c1_atom,
         o5_atom,
         psi_base,
+        heavy,
     })
 }
 

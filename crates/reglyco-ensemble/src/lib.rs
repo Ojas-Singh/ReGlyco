@@ -6584,6 +6584,12 @@ pub fn prepare_frame_topology(
 /// across the glycosidic bond, so any linkage geometry can pass.
 const TOPOLOGY_CONTACT_DISTANCE: f64 = 1.9;
 
+/// Heavy-atom distance, in Å, below which two atoms of different residues
+/// may be read as bonded: above the largest C/N/O limit (1.77 Å) and the C-S,
+/// N-S and O-S limits (up to 2.06 Å), below the 2.2-2.5 Å that heavy atoms
+/// keep across the glycosidic bond to the protein (O5 or C2 to ND2).
+const TOPOLOGY_BOND_DISTANCE: f64 = 2.1;
+
 /// Parameterize the glycoprotein from a state in which no glycan touches the
 /// protein or another glycan.
 ///
@@ -6605,11 +6611,17 @@ fn prepare_topology(
     Ok(builder.prepare_structure(&build_state(protein, sites, &reference, builder)?)?)
 }
 
-/// A state for [`prepare_topology`]: site by site, the first candidate of
-/// [`topology_reference_candidates`] that keeps
-/// [`TOPOLOGY_CONTACT_DISTANCE`] from the protein and from the glycans already
-/// placed.  A site where no candidate does keeps its first protein-compatible
-/// candidate, or else its first candidate.
+/// A state for [`prepare_topology`], chosen site by site from
+/// [`topology_reference_candidates`]:
+///
+/// 1. the first candidate whose atoms all keep [`TOPOLOGY_CONTACT_DISTANCE`]
+///    from the protein and from the glycans already placed;
+/// 2. at a crowded site where none does, the candidate with the fewest
+///    heavy-atom pairs closer than [`TOPOLOGY_BOND_DISTANCE`] (hydrogens do not
+///    take part in GlySys's bond reading, and a clash is no bond).
+///
+/// The first candidate is kept only when every candidate would be read with
+/// bonds.
 fn topology_reference_state(
     protein: &Structure,
     sites: &[SearchSite],
@@ -6617,38 +6629,59 @@ fn topology_reference_state(
 ) -> Result<Vec<Gene>> {
     let mut state = Vec::with_capacity(sites.len());
     let mut placed = Vec::<PreparedSitePose>::with_capacity(sites.len());
+    let mut placed_heavy = Vec::<Vec<Vec3>>::with_capacity(sites.len());
+    let bonding_pairs = |heavy: &[Vec3], placed_heavy: &[Vec<Vec3>]| {
+        let threshold2 = TOPOLOGY_BOND_DISTANCE * TOPOLOGY_BOND_DISTANCE;
+        prepared.protein_contacts(heavy, TOPOLOGY_BOND_DISTANCE)
+            + placed_heavy
+                .iter()
+                .flatten()
+                .map(|other| {
+                    heavy
+                        .iter()
+                        .filter(|atom| squared_distance(**atom, *other) < threshold2)
+                        .count()
+                })
+                .sum::<usize>()
+    };
     for (site_index, site) in sites.iter().enumerate() {
         let candidates = topology_reference_candidates(protein, site);
         let mut chosen = None;
-        let mut protein_compatible = None;
         for gene in &candidates {
             let Some(pose) =
                 prepared.prepare_site_pose(site_index, gene, TOPOLOGY_CONTACT_DISTANCE)?
             else {
                 continue;
             };
-            if placed.iter().all(|other| {
+            if !placed.iter().all(|other| {
                 prepared.site_poses_compatible(&pose, other, TOPOLOGY_CONTACT_DISTANCE)
             }) {
-                chosen = Some((gene.clone(), pose));
+                continue;
+            }
+            let heavy = prepared.site_heavy_coordinates(site_index, gene)?;
+            if bonding_pairs(&heavy, &placed_heavy) == 0 {
+                placed.push(pose);
+                chosen = Some((gene.clone(), heavy));
                 break;
             }
-            if protein_compatible.is_none() {
-                protein_compatible = Some((gene.clone(), pose));
+        }
+        if chosen.is_none() {
+            let mut fewest = usize::MAX;
+            for gene in &candidates {
+                let heavy = prepared.site_heavy_coordinates(site_index, gene)?;
+                let pairs = bonding_pairs(&heavy, &placed_heavy);
+                if pairs < fewest {
+                    fewest = pairs;
+                    chosen = Some((gene.clone(), heavy));
+                    if pairs == 0 {
+                        break;
+                    }
+                }
             }
         }
-        match chosen.or(protein_compatible) {
-            Some((gene, pose)) => {
-                state.push(gene);
-                placed.push(pose);
-            }
-            None => state.push(
-                candidates
-                    .first()
-                    .cloned()
-                    .ok_or(EnsembleError::EmptyEnsemble)?,
-            ),
-        }
+        let (gene, heavy) = chosen.ok_or(EnsembleError::EmptyEnsemble)?;
+        state.push(gene);
+        placed_heavy.push(heavy);
     }
     Ok(state)
 }
@@ -8077,6 +8110,50 @@ mod tests {
     const PDB_BUNDLE: &str = include_str!("../../../tests/fixtures/pdb-bundle/ensemble.pdb");
     /// An ASN with a glycine where its glycan lies at phi = psi = 0.
     const BLOCKED_PROTEIN: &str = include_str!("../../../tests/fixtures/blocked-asn-protein.pdb");
+
+    /// 7P5B ASN 67 with GS00931 (Man3 core plus one Man): every attachment
+    /// pose touches the protein, so the reference falls back to the pose with
+    /// no heavy-atom pair GlySys could read as a bond.  The first candidate
+    /// buried the BMA in PHE 96 ("C3 is bonded to another residue").
+    #[test]
+    fn energy_topology_at_a_crowded_site_avoids_heavy_atom_bonds() {
+        let query = GlycanQuery {
+            source: GlycanSource::LocalBundle(PathBuf::from("crowded-bundle")),
+            anomer: Anomer::Beta,
+            format: "PDB".into(),
+            level: "1".into(),
+        };
+        let bundle = include_str!("../../../tests/fixtures/crowded-bundle/ensemble.pdb");
+        let sites = vec![SearchSite {
+            site: reglyco_core::GlycosylationSite::new("A", 67),
+            ensemble: ensemble_from_pdb(bundle, None, query, "crowded-bundle").unwrap(),
+        }];
+        let protein = read_pdb_str(
+            include_str!("../../../tests/fixtures/crowded-sequon-protein.pdb"),
+            &dry_options(),
+        )
+        .unwrap();
+        let builder = glysys::SystemBuilder::new(dry_options()).unwrap();
+        let protein = complete_receptor_for_energy(&protein, &builder).unwrap();
+        let prepared = PreparedAttachmentContext::new(&protein, &sites, false).unwrap();
+        let candidates = topology_reference_candidates(&protein, &sites[0]);
+        assert!(candidates.iter().all(|gene| {
+            prepared
+                .prepare_site_pose(0, gene, TOPOLOGY_CONTACT_DISTANCE)
+                .unwrap()
+                .is_none()
+        }));
+        let first = prepared.site_heavy_coordinates(0, &candidates[0]).unwrap();
+        assert!(prepared.protein_contacts(&first, TOPOLOGY_BOND_DISTANCE) > 0);
+        let reference = topology_reference_state(&protein, &sites, &prepared).unwrap();
+        let heavy = prepared.site_heavy_coordinates(0, &reference[0]).unwrap();
+        assert_eq!(
+            prepared.protein_contacts(&heavy, TOPOLOGY_BOND_DISTANCE),
+            0,
+            "{reference:?}"
+        );
+        prepare_frame_topology(&protein, &sites, &builder).unwrap();
+    }
 
     #[test]
     fn energy_topology_is_prepared_from_a_state_without_glycan_contacts() {
