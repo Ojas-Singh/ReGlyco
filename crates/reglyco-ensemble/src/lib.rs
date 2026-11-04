@@ -6438,6 +6438,130 @@ where
     Ok((accepted, diagnostics))
 }
 
+/// The receptor with the heavy atoms GlySys adds when it parameterizes it
+/// (truncated side chains, a missing terminal OXT), at the positions GlySys
+/// builds them.
+///
+/// Energy scoring maps every frame onto one GlySys topology, and that mapping
+/// needs every heavy atom of the topology in the frame.  A deposited structure
+/// usually lacks some, so energy modes (and post-relax) build their frames,
+/// and write their output, from this completed receptor.  A receptor that
+/// needs nothing is returned unchanged; steric mode never calls this.
+/// Hydrogens are left to the topology, as for any frame.
+pub fn complete_receptor_for_energy(
+    protein: &Structure,
+    builder: &glysys::SystemBuilder,
+) -> Result<Structure> {
+    let options = BuildOptions {
+        add_water: false,
+        add_ions: false,
+        ..builder.options().clone()
+    };
+    let system = glysys::SystemBuilder::new(options.clone())?.prepare_structure(protein)?;
+    let mut residues = HashMap::<ResidueId, HashSet<String>>::new();
+    for atom in protein.iter_atoms() {
+        residues
+            .entry(atom.residue.clone())
+            .or_default()
+            .insert(atom.name.to_string());
+    }
+    let mut added = HashMap::<ResidueId, Vec<(String, &'static str, Vec3)>>::new();
+    for residue in system.residues() {
+        let id = ResidueId {
+            chain: residue.chain().to_string(),
+            number: residue.number(),
+            insertion_code: residue.insertion_code(),
+        };
+        let Some(existing) = residues.get(&id) else {
+            continue;
+        };
+        for atom in &system.atoms()[residue.atom_range()] {
+            let element = match atom.element() {
+                1 => continue,
+                6 => "C",
+                7 => "N",
+                8 => "O",
+                15 => "P",
+                16 => "S",
+                34 => "SE",
+                other => {
+                    return Err(EnsembleError::Metadata(format!(
+                        "GlySys added an atom of element {other} to {id}"
+                    )));
+                }
+            };
+            if !existing.contains(atom.name()) {
+                added.entry(id.clone()).or_default().push((
+                    atom.name().to_string(),
+                    element,
+                    atom.position(),
+                ));
+            }
+        }
+    }
+    if added.is_empty() {
+        return Ok(protein.clone());
+    }
+    // GlySys has no public call that adds heavy atoms to a `Structure`, so
+    // the atoms go in through its own PDB writer and reader, each after the
+    // last atom of its residue.
+    let text = glysys::write_pdb_string(protein);
+    let mut serial = protein
+        .iter_atoms()
+        .map(|atom| atom.id.0)
+        .max()
+        .unwrap_or(0);
+    let mut output = String::with_capacity(text.len() + 81 * added.len() * 4);
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        output.push_str(line);
+        output.push('\n');
+        let Some(id) = atom_line_residue(line) else {
+            continue;
+        };
+        if lines
+            .peek()
+            .and_then(|next| atom_line_residue(next))
+            .is_some_and(|next| next == id)
+        {
+            continue;
+        }
+        for (name, element, position) in added.remove(&id).unwrap_or_default() {
+            serial += 1;
+            output.push_str(&format!(
+                "{}{serial:>5} {name:<4}{}   {:>8.3}{:>8.3}{:>8.3}{:>6.2}{:>6.2}          {element:>2}\n",
+                &line[..6],
+                &line[16..27],
+                position.x,
+                position.y,
+                position.z,
+                1.0,
+                0.0,
+            ));
+        }
+    }
+    if !added.is_empty() {
+        return Err(EnsembleError::Metadata(
+            "could not place the atoms GlySys added to the receptor".into(),
+        ));
+    }
+    let mut completed = read_pdb_str(&output, &options)?;
+    *completed.metadata_mut() = protein.metadata().clone();
+    Ok(completed)
+}
+
+/// The residue of an ATOM/HETATM record as `glysys::write_pdb_string` writes it.
+fn atom_line_residue(line: &str) -> Option<ResidueId> {
+    if !(line.starts_with("ATOM  ") || line.starts_with("HETATM")) || line.len() < 27 {
+        return None;
+    }
+    Some(ResidueId {
+        chain: line[21..22].trim().to_string(),
+        number: line[22..26].trim().parse().ok()?,
+        insertion_code: line[26..27].chars().next().filter(|code| *code != ' '),
+    })
+}
+
 /// Prepare chemistry once from original assets, never from a hydrogen-enriched
 /// optimized output. Coordinate updates do not imply re-parameterization.
 pub fn prepare_frame_topology(

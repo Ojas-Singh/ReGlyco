@@ -547,3 +547,90 @@ fn energy_build_prepares_its_topology_without_glycan_contacts() {
         }
     }
 }
+
+/// A deposited receptor usually lacks heavy atoms (here ASP 295 is cut at CB
+/// and THR 299 has no OXT). GlySys rebuilds them when it prepares the energy
+/// topology, so the frames must carry them too: energy modes build from the
+/// receptor completed with GlySys's atoms and write them out.
+#[test]
+fn energy_build_completes_a_receptor_with_missing_heavy_atoms() {
+    for mode in ["--interact", "--energy"] {
+        let directory = tempfile::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+            .args([
+                "build",
+                "--protein",
+                "tests/fixtures/truncated-sequon-protein.pdb",
+                "--attach",
+                "B:297=tests/fixtures/pdb-bundle",
+                mode,
+                "--population",
+                "4",
+                "--generations",
+                "1",
+                "--no-system",
+                "--quiet",
+                "--output",
+            ])
+            .arg(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pdb = std::fs::read_to_string(directory.path().join("glycoprotein.pdb")).unwrap();
+        let atom = |name: &str, residue: &str| {
+            pdb.lines().any(|line| {
+                line.starts_with("ATOM")
+                    && line[12..16].trim() == name
+                    && line[17..26]
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        == residue
+            })
+        };
+        for (name, residue) in [
+            ("CG", "ASP B 295"),
+            ("OD1", "ASP B 295"),
+            ("OD2", "ASP B 295"),
+            ("OXT", "THR B 299"),
+        ] {
+            assert!(atom(name, residue), "{mode}: {residue} {name} missing");
+        }
+    }
+}
+
+/// Steric mode (the default) leaves the receptor as given.
+#[test]
+fn steric_build_keeps_a_receptor_with_missing_heavy_atoms_as_given() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args([
+            "build",
+            "--protein",
+            "tests/fixtures/truncated-sequon-protein.pdb",
+            "--attach",
+            "B:297=tests/fixtures/pdb-bundle",
+            "--population",
+            "4",
+            "--generations",
+            "1",
+            "--no-system",
+            "--quiet",
+            "--output",
+        ])
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pdb = std::fs::read_to_string(directory.path().join("glycoprotein.pdb")).unwrap();
+    assert!(!pdb.contains("OXT"));
+    assert!(!pdb.lines().any(|line| line.contains("CG   ASP B 295")));
+}
