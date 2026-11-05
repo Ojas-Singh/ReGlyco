@@ -83,10 +83,10 @@ nalgebra = { version = "0.35", default-features = false, features = ["std"] }
 # crabWURCS comes from its tagged repository, the same source GlySys uses, so
 # the workspace holds one copy and needs no sibling checkout. crates.io 0.3.3
 # is the same code; `cargo publish` substitutes it.
-crabwurcs-iupac = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.3", version = "0.3.3" }
-crabwurcs-core = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.3", version = "0.3.3" }
-crabwurcs-pdb = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.3", version = "0.3.3" }
-crabwurcs-snfg = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.3", version = "0.3.3" }
+crabwurcs-iupac = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.4.0", version = "0.4.0" }
+crabwurcs-core = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.4.0", version = "0.4.0" }
+crabwurcs-pdb = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.4.0", version = "0.4.0" }
+crabwurcs-snfg = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.4.0", version = "0.4.0" }
 contour = "0.13.1"
 flate2 = "1"
 glysys = { version = "0.1.2", path = "../GlySys" }

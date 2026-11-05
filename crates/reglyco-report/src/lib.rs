@@ -2872,6 +2872,7 @@ fn snfg_bond_svg(glycan: &GlycanSummary, torsion: &LinkageTorsion) -> Option<Str
         font_family: "Arial, Helvetica, sans-serif".into(),
         scale: 0.7,
         source_notation: None,
+        ..RenderOptions::default()
     };
     let mut selection = HighlightSelection::default();
     selection.node_indices.extend([donor_node, acceptor_node]);
