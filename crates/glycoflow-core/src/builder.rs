@@ -357,8 +357,15 @@ impl<'l, 'c, 'd> Assembly<'l, 'c, 'd> {
                 }
                 Item::Mod(m) => {
                     let resname = self.lib.mod_codes[m].clone();
+                    // a substituent's template is under its full name (ACX and PCX would share "CX");
+                    // libraries before 2026-11 used resname[1..]
+                    let code = if self.lib.templates.contains_key(&resname) {
+                        resname.clone()
+                    } else {
+                        resname[1..].to_string()
+                    };
                     (
-                        resname[1..].to_string(),
+                        code,
                         resname,
                         format!("{path}/m{ppos}"),
                         None,
