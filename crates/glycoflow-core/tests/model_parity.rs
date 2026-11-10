@@ -164,8 +164,11 @@ fn guided_sampling_matches_python() {
             println!("[{dev_name}] {name:20} guided heun32: torsions {e_tau:.2e} rad, coords {e_x:.2e} A");
             worst = worst.max(e_tau);
         }
+        // Guided trajectories of a large glycan are chaotic at the fp32 noise scale: with the
+        // release model, Python re-running sialyl_biantennary lands up to 1.5e-2 rad from its own
+        // fixture (thread count), and a 1e-7 rad change of tau0 moves an endpoint by 7e-3 rad.
         assert!(
-            worst < 1e-2,
+            worst < 3e-2,
             "[{dev_name}] guided torsions differ by {worst} rad"
         );
     }
