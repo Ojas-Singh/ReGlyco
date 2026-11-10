@@ -29,7 +29,9 @@ use reglyco_glycoflow::site::deposited_glycan;
 use reglyco_glycoflow::workflow::{
     SiteRequest, extend_one, extension_models, extension_report, fit_one, site_report,
 };
-use reglyco_glycoflow::{ComputeDevice, GlycoflowModel, WorkflowInput, WorkflowOptions};
+use reglyco_glycoflow::{
+    ComputeDevice, GlycoflowModel, PriorCache, WorkflowInput, WorkflowOptions,
+};
 use serde_json::{Value, json};
 
 type Error = Box<dyn std::error::Error>;
@@ -55,6 +57,7 @@ fn fit_site(
     dir: &Path,
     seed: u64,
     members: usize,
+    priors: &PriorCache,
 ) -> Result<Value, Error> {
     let field = |k: &str| site[k].as_str().ok_or(format!("site has no {k}"));
     let (name, pdb) = (field("name")?, field("pdb")?);
@@ -69,6 +72,7 @@ fn fit_site(
     let residue = residue_id(field("site")?)?;
     let mut options = WorkflowOptions::default();
     options.fit.seed = seed;
+    options.prior.cache = Some(priors.clone());
     let deposited = deposited_glycan(&structure, &residue)?;
     let deposited_sequence = deposited
         .as_ref()
@@ -203,6 +207,8 @@ fn main() -> Result<(), Error> {
         .append(true)
         .open(&results)?;
     let model = GlycoflowModel::load(Path::new(&a[1]), device, Precision::F32)?;
+    // sites repeat a few glycans; the samples of the free glycan are drawn once for each
+    let priors = PriorCache::default();
     let manifest = std::io::BufReader::new(std::fs::File::open(&a[2])?);
     let (mut fitted, mut failed) = (0usize, 0usize);
     let start = Instant::now();
@@ -222,7 +228,8 @@ fn main() -> Result<(), Error> {
             }
             let t = Instant::now();
             let outcome = catch_unwind(AssertUnwindSafe(|| {
-                fit_site(&model, site, &out.join(id), seed, members).map_err(|e| e.to_string())
+                fit_site(&model, site, &out.join(id), seed, members, &priors)
+                    .map_err(|e| e.to_string())
             }))
             .unwrap_or_else(|_| Err("panic".to_string()));
             let mut row = json!({

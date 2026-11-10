@@ -172,6 +172,34 @@ pub struct PriorConfig {
     pub steps: usize,
     pub bandwidth_deg: f64,
     pub seed: u64,
+    /// samples of glycans already drawn, shared between fits (a batch of sites repeats a few
+    /// glycans): the free glycan's samples depend on the glycan and these settings only
+    #[serde(skip)]
+    pub cache: Option<PriorCache>,
+}
+
+/// Free-glycan torsion samples by glycan and sampling settings (`PriorConfig::cache`).
+pub type PriorCache = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<Vec<u32>, std::sync::Arc<Vec<Vec<f64>>>>>,
+>;
+
+/// Everything `sample_free` reads: the glycan's tokens, torsions and local geometries, and the
+/// sampling settings.
+fn prior_key(problem: &SiteProblem, sampler: &Sampler, config: &PriorConfig) -> Vec<u32> {
+    let mut key = vec![
+        config.n_samples as u32,
+        config.steps as u32,
+        config.seed as u32,
+        (config.seed >> 32) as u32,
+        problem.batch.map_or(0, |b| b as u32 + 1),
+        sampler.tokens.len() as u32,
+    ];
+    key.extend(sampler.tokens.iter().flatten());
+    key.extend(sampler.topology.quads.iter().flatten().map(|&i| i as u32));
+    for template in &problem.glycan.templates {
+        key.extend(template.iter().flatten().map(|v| v.to_bits()));
+    }
+    key
 }
 
 impl Default for PriorConfig {
@@ -182,6 +210,7 @@ impl Default for PriorConfig {
             steps: 16,
             bandwidth_deg: 12.0,
             seed: 1234,
+            cache: None,
         }
     }
 }
@@ -348,14 +377,31 @@ pub fn build_prior(
     sampler: &Sampler,
     config: &PriorConfig,
 ) -> Result<MarginalPrior> {
-    let taus = sample_free(
-        problem,
-        sampler,
-        config.n_samples,
-        config.steps,
-        Method::Euler,
-        config.seed,
-    )?;
+    let draw = || {
+        sample_free(
+            problem,
+            sampler,
+            config.n_samples,
+            config.steps,
+            Method::Euler,
+            config.seed,
+        )
+    };
+    let taus = match &config.cache {
+        Some(cache) => {
+            let key = prior_key(problem, sampler, config);
+            let hit = cache.lock().unwrap().get(&key).cloned();
+            match hit {
+                Some(taus) => taus,
+                None => {
+                    let taus = std::sync::Arc::new(draw()?);
+                    cache.lock().unwrap().insert(key, taus.clone());
+                    taus
+                }
+            }
+        }
+        None => std::sync::Arc::new(draw()?),
+    };
     // over the torsions the structure determines (`SiteProblem::heavy_torsions`)
     Ok(
         MarginalPrior::new(taus.concat(), problem.n_torsions, config.bandwidth_deg)

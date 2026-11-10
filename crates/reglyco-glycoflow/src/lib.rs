@@ -45,7 +45,7 @@ pub use glycoflow_core;
 pub use model::{ComputeDevice, GlycoflowModel};
 pub use observation::{DensityObservation, Observation, ObservationValue};
 pub use observer::{CartesianStep, FitObserver, GuidedStep, Observer};
-pub use pipeline::{FitConfig, FitOutcome, PriorConfig, fit_site};
+pub use pipeline::{FitConfig, FitOutcome, PriorCache, PriorConfig, fit_site};
 pub use problem::{Pose, ProblemOptions, RingSource, SiteProblem, Terms};
 pub use site::{Site, SiteOptions, SymmetryMode, load_site};
 pub use workflow::{SiteRequest, WorkflowInput, WorkflowOptions, WorkflowResult};
