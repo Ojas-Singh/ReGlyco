@@ -665,13 +665,17 @@ pub fn order_parameter(x: &[Vec<V3>], idx: &[usize], z: &[f64], sigma: f64) -> f
         s
     };
     let pairs: Vec<(usize, usize)> = (0..m).flat_map(|a| (a..m).map(move |b| (a, b))).collect();
-    let (cross_sum, self_sum) = pairs
-        .par_iter()
-        .map(|&(a, b)| {
-            let o = overlap(&x[a], &x[b]);
-            if a == b { (o, o) } else { (2.0 * o, 0.0) }
-        })
-        .reduce(|| (0.0, 0.0), |u, v| (u.0 + v.0, u.1 + v.1));
+    // summed in pair order, so the value does not depend on how the threads split the work
+    let overlaps: Vec<f64> = pairs.par_iter().map(|&(a, b)| overlap(&x[a], &x[b])).collect();
+    let (mut cross_sum, mut self_sum) = (0.0, 0.0);
+    for (&(a, b), &o) in pairs.iter().zip(&overlaps) {
+        if a == b {
+            cross_sum += o;
+            self_sum += o;
+        } else {
+            cross_sum += 2.0 * o;
+        }
+    }
     (cross_sum / (m * m) as f64) / (self_sum / m as f64)
 }
 
