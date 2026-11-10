@@ -27,6 +27,9 @@ pub fn attachment_grid(psis: &[f64], n_phi: usize) -> Vec<(f64, f64)> {
     grid
 }
 
+/// Relative slack of the quick grid scores of `attach_search`, far above their rounding error.
+const RIGID_SLACK: f64 = 1e-6;
+
 /// Best attachment (psi_N, phi_N, objective) per conformer on the grid (`methods.attach_search`).
 /// The torsions are set once per conformer; every grid point is a rigid placement.
 pub fn attach_search(
@@ -45,11 +48,38 @@ pub fn attach_search(
         .map(|(tau, tpl)| {
             let local = problem.local(tau, *tpl);
             let e_prior = problem.prior_energy(tau, None);
-            let mut best = (0.0, 0.0, f64::INFINITY);
-            for &(psi, phi) in &grid {
+            let exact = |psi: f64, phi: f64| {
                 let x = problem.attach(&local, psi, phi);
                 let (terms, _) = problem.placed_terms(&x, psi, None);
-                let e = terms.total + problem.w_prior * e_prior;
+                terms.total + problem.w_prior * e_prior
+            };
+            // every grid point is the same conformer moved as a rigid body, so the part of the
+            // observation such a motion leaves unchanged is computed once; it differs from the
+            // per-placement value in the last bits only, and the grid points within reach of the
+            // lowest are scored again in full, which keeps the choice and its energy exact
+            let rigid = problem
+                .observation
+                .rigid_term(&local, problem.score_only.as_deref());
+            let quick: Option<Vec<f64>> = rigid.map(|rigid| {
+                grid.iter()
+                    .map(|&(psi, phi)| {
+                        let x = problem.attach(&local, psi, phi);
+                        problem.placed_terms_rigid(&x, psi, rigid).total + problem.w_prior * e_prior
+                    })
+                    .collect()
+            });
+            let low = quick
+                .as_ref()
+                .map(|q| q.iter().copied().fold(f64::INFINITY, f64::min));
+            let mut best = (0.0, 0.0, f64::INFINITY);
+            for (k, &(psi, phi)) in grid.iter().enumerate() {
+                if let (Some(quick), Some(low)) = (&quick, low)
+                    && low.is_finite()
+                    && quick[k] > low + RIGID_SLACK * (1.0 + low.abs())
+                {
+                    continue;
+                }
+                let e = exact(psi, phi);
                 if e < best.2 {
                     best = (psi, phi, e);
                 }

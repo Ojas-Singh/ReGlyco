@@ -102,6 +102,31 @@ impl SiteBox {
         ]
     }
 
+    /// The value of [`SiteBox::sample`] alone.
+    pub fn value(&self, p: [f64; 3]) -> f64 {
+        let mut base = [0usize; 3];
+        let mut frac = [0f64; 3];
+        for a in 0..3 {
+            let g = ((p[a] - self.origin[a]) / self.spacing).clamp(0.0, (self.dims[a] - 1) as f64);
+            let f = g.floor().min((self.dims[a] - 2) as f64);
+            base[a] = f as usize;
+            frac[a] = g - f;
+        }
+        let mut value = 0.0;
+        for dx in 0..2 {
+            for dy in 0..2 {
+                for dz in 0..2 {
+                    let v = self.data[self.index(base[0] + dx, base[1] + dy, base[2] + dz)] as f64;
+                    let wx = if dx == 0 { 1.0 - frac[0] } else { frac[0] };
+                    let wy = if dy == 0 { 1.0 - frac[1] } else { frac[1] };
+                    let wz = if dz == 0 { 1.0 - frac[2] } else { frac[2] };
+                    value += v * wx * wy * wz;
+                }
+            }
+        }
+        value
+    }
+
     /// Trilinear value and Cartesian gradient; positions outside the box are
     /// clamped to the border (the scoring ball lies well inside the box).
     pub fn sample(&self, p: [f64; 3]) -> (f64, [f64; 3]) {
@@ -551,6 +576,10 @@ impl SiteLikelihood {
         atomic_numbers: &[f64],
         gradient: Option<&mut [[f64; 3]]>,
     ) -> SiteLikelihoodScore {
+        if gradient.is_none() {
+            let gg = self.self_overlap(positions, atomic_numbers);
+            return self.evaluate_with_overlap(positions, atomic_numbers, gg);
+        }
         let n = positions.len();
         let s2 = 2.0 * self.sigma * self.sigma;
         let mut go = 0.0;
@@ -627,6 +656,72 @@ impl SiteLikelihood {
                 }
             }
         }
+        SiteLikelihoodScore {
+            gain,
+            log_likelihood: gain * scale_ll,
+            partial_correlation: (gain / self.sse0).sqrt(),
+            scale: e / c,
+        }
+    }
+
+    /// `<g, g>` of a glycan with itself, as [`SiteLikelihood::evaluate`] sums it. A rigid motion
+    /// of the glycan leaves it unchanged up to rounding, so a search over placements of one
+    /// conformer can compute it once and score with [`SiteLikelihood::evaluate_with_overlap`].
+    pub fn self_overlap(&self, positions: &[[f64; 3]], atomic_numbers: &[f64]) -> f64 {
+        let n = positions.len();
+        let s2 = 2.0 * self.sigma * self.sigma;
+        let norm0 = 1.0 / (2.0 * std::f64::consts::PI * s2).powf(1.5);
+        let mut gg = 0.0;
+        for a in 0..n {
+            let za = atomic_numbers[a];
+            if za == 0.0 {
+                continue;
+            }
+            gg += za * za * norm0;
+            for b in a + 1..n {
+                let zb = atomic_numbers[b];
+                if zb == 0.0 {
+                    continue;
+                }
+                let d = [0, 1, 2].map(|i| positions[a][i] - positions[b][i]);
+                let r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                let k = za * zb * (-r2 / (2.0 * s2)).exp() * norm0;
+                gg += 2.0 * k;
+            }
+        }
+        gg
+    }
+
+    /// The score of [`SiteLikelihood::evaluate`] (no gradient) with `<g, g>` supplied: the same
+    /// value when `gg` is [`SiteLikelihood::self_overlap`] of these positions.
+    pub fn evaluate_with_overlap(
+        &self,
+        positions: &[[f64; 3]],
+        atomic_numbers: &[f64],
+        gg: f64,
+    ) -> SiteLikelihoodScore {
+        let mut go = 0.0;
+        let mut gp = 0.0;
+        let mut gs = 0.0;
+        let mut g1 = 0.0;
+        for (p, &z) in positions.iter().zip(atomic_numbers) {
+            if z == 0.0 {
+                continue;
+            }
+            go += z * self.obs_blur.value(*p);
+            gp += z * self.prot_blur.value(*p);
+            g1 += z;
+            if let Some(sb) = &self.solv_blur {
+                gs += z * sb.value(*p);
+            }
+        }
+        let gi = &self.g0_inverse;
+        let q = [g1, gp, gs];
+        let g0q: [f64; 3] = [0, 1, 2].map(|i| (0..3).map(|j| gi[i][j] * q[j]).sum());
+        let e = go - (self.theta[0] * g1 + self.theta[1] * gp + self.theta[2] * gs);
+        let c = (gg - (0..3).map(|i| q[i] * g0q[i]).sum::<f64>()).max(1e-12);
+        let gain = if e > 0.0 { e * e / c } else { 0.0 };
+        let scale_ll = 1.0 / (2.0 * self.noise_variance * self.independent_volume * self.inflation);
         SiteLikelihoodScore {
             gain,
             log_likelihood: gain * scale_ll,

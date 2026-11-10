@@ -797,6 +797,25 @@ impl SiteProblem {
                 .observation
                 .evaluate(x, self.score_only.as_deref(), None),
         };
+        self.terms_with(obs, x, psi, gx)
+    }
+
+    /// `placed_terms` without gradient, given the observation's `rigid_term` of this conformer:
+    /// the same terms up to rounding, for searches over rigid placements of one conformer.
+    pub fn placed_terms_rigid(&self, x: &[V3], psi: f64, rigid: f64) -> Terms {
+        let obs = self
+            .observation
+            .evaluate_rigid(x, self.score_only.as_deref(), rigid);
+        self.terms_with(obs, x, psi, None).0
+    }
+
+    fn terms_with(
+        &self,
+        obs: crate::observation::ObservationValue,
+        x: &[V3],
+        psi: f64,
+        gx: Option<&mut [V3]>,
+    ) -> (Terms, f64) {
         let (e_env, e_self) = self.clash_terms(x, gx);
         let (e_att, d_att) = self.link_torsion.energy(psi, self.amide_kappa);
         let total = obs.energy + self.w_env * e_env + self.w_self * e_self + e_att;
