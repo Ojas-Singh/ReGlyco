@@ -1,9 +1,10 @@
-//! GLYCAM sequence -> heavy-atom 3D template (`builder.ResidueLibrary.build`).
+//! GLYCAM sequence -> 3D template (`builder.ResidueLibrary.build`): the library's atoms, less the
+//! hydrogen of every oxygen that carries a link or a substituent.
 //!
 //! Coordinates are assembled in f64 exactly as the numpy reference and returned in f64; the
 //! Python builder casts them to f32 at the end ([`BuiltGlycan::coords_f32`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -91,10 +92,53 @@ struct Assembly<'l, 'c, 'd> {
     seq: Sequence,
     chooser: &'c mut StateChooser<'d>,
     out: BuiltGlycan,
+    /// the H of each oxygen that takes a link or a substituent, removed at the end (`build`'s `linked_h`)
+    linked_h: HashSet<usize>,
 }
 
 fn div(a: V3, s: f64) -> V3 {
     [a[0] / s, a[1] / s, a[2] / s]
+}
+
+/// `out` without the atoms in `drop`, the others keeping their order (bonds renumbered).
+fn without_atoms(out: BuiltGlycan, drop: &HashSet<usize>) -> BuiltGlycan {
+    if drop.is_empty() {
+        return out;
+    }
+    let keep: Vec<bool> = (0..out.atom_names.len())
+        .map(|i| !drop.contains(&i))
+        .collect();
+    let mut new = vec![usize::MAX; keep.len()];
+    let mut k = 0;
+    for (i, &kept) in keep.iter().enumerate() {
+        if kept {
+            new[i] = k;
+            k += 1;
+        }
+    }
+    fn retain<T>(v: Vec<T>, keep: &[bool]) -> Vec<T> {
+        v.into_iter()
+            .zip(keep)
+            .filter(|(_, &k)| k)
+            .map(|(x, _)| x)
+            .collect()
+    }
+    BuiltGlycan {
+        atom_names: retain(out.atom_names, &keep),
+        res_names: retain(out.res_names, &keep),
+        res_ids: retain(out.res_ids, &keep),
+        elements: retain(out.elements, &keep),
+        coords: retain(out.coords, &keep),
+        bonds: out
+            .bonds
+            .into_iter()
+            .filter(|[a, b]| keep[*a] && keep[*b])
+            .map(|[a, b]| [new[a], new[b]])
+            .collect(),
+        res_paths: retain(out.res_paths, &keep),
+        residue_codes: out.residue_codes,
+        residue_states: out.residue_states,
+    }
 }
 
 /// `builder.place`: template coordinates with the anchor bonded to `ox` at the template's own bond
@@ -268,17 +312,24 @@ impl<'l, 'c, 'd> Assembly<'l, 'c, 'd> {
                     "{node_name} has no {o_name} to attach a substituent"
                 ))
             })?;
-            let (cx_i, before) = {
+            let (cx_i, before, hydrogens) = {
                 let o = &self.out;
                 let same = |a: usize, b: usize| o.res_ids[a] == o.res_ids[b];
-                let cx_i = o
+                let own: Vec<usize> = o
                     .bonds
                     .iter()
-                    .find(|[a, b]| (*a == ox_i || *b == ox_i) && same(*a, *b))
+                    .filter(|[a, b]| (*a == ox_i || *b == ox_i) && same(*a, *b))
                     .map(|[a, b]| if *a == ox_i { *b } else { *a })
+                    .collect();
+                let cx_i = own
+                    .iter()
+                    .copied()
+                    .find(|&j| o.elements[j] != "H")
                     .ok_or_else(|| {
                         Error::Library(format!("{o_name} of {node_name} has no carbon"))
                     })?;
+                let hydrogens: Vec<usize> =
+                    own.into_iter().filter(|&j| o.elements[j] == "H").collect();
                 let before = o
                     .bonds
                     .iter()
@@ -291,8 +342,9 @@ impl<'l, 'c, 'd> Assembly<'l, 'c, 'd> {
                             "cannot orient a substituent on {o_name} of {node_name}"
                         ))
                     })?;
-                (cx_i, before)
+                (cx_i, before, hydrogens)
             };
+            self.linked_h.extend(hydrogens);
             let (code, resname, sub_path, child) = match &item {
                 Item::Child(c) => {
                     let code = self.seq.nodes[*c].code.clone();
@@ -305,8 +357,15 @@ impl<'l, 'c, 'd> Assembly<'l, 'c, 'd> {
                 }
                 Item::Mod(m) => {
                     let resname = self.lib.mod_codes[m].clone();
+                    // a substituent's template is under its full name (ACX and PCX would share "CX");
+                    // libraries before 2026-11 used resname[1..]
+                    let code = if self.lib.templates.contains_key(&resname) {
+                        resname.clone()
+                    } else {
+                        resname[1..].to_string()
+                    };
                     (
-                        resname[1..].to_string(),
+                        code,
                         resname,
                         format!("{path}/m{ppos}"),
                         None,
@@ -393,6 +452,7 @@ impl ResidueLibrary {
             seq,
             chooser,
             out: empty,
+            linked_h: HashSet::new(),
         };
         let root = asm.seq.root;
         asm.resolve(root)?;
@@ -442,6 +502,6 @@ impl ResidueLibrary {
             .ok_or_else(|| Error::Library(format!("template {root_code} has no anchor")))?;
         asm.out.bonds.push([agl[&agl_tpl.atoms[o_k]], anchor]);
         asm.grow(root, &red, "r")?;
-        Ok(asm.out)
+        Ok(without_atoms(asm.out, &asm.linked_h))
     }
 }
