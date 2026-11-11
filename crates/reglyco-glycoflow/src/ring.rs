@@ -167,6 +167,50 @@ pub fn flip_root_chair(glycan: &mut Glycan, which: impl Fn(usize) -> bool) -> bo
     true
 }
 
+/// A six-ring within this Cremer-Pople theta of its chair is in the chair (degrees).
+pub const CHAIR_TOLERANCE: f64 = 30.0;
+
+/// Bring every six-ring of templates `1..` that is out of the chair of the majority build
+/// (template 0) into that chair, with its substituents. Returns the number of rings changed.
+///
+/// The pucker states of the residue library and the ring shapes a model generates include the
+/// inverted chair and boats of residues such as GlcNAc at a few per cent each. A fit to a map
+/// takes the best of its templates, so in weak density such a ring is selected by noise, and the
+/// model would carry a conformation that no map at these resolutions can show. Iduronic acid,
+/// whose ring has several states in solution, is left as drawn.
+pub fn chair_templates(glycan: &mut Glycan) -> usize {
+    let rings: Vec<_> = glycan
+        .topology
+        .rings
+        .iter()
+        .filter(|ring| {
+            let name = &glycan.res_names[ring.atoms[0]];
+            ring.len() == 6 && !name.to_ascii_lowercase().ends_with("ua")
+        })
+        .cloned()
+        .collect();
+    let f64s = |x: &[[f32; 3]]| -> Vec<V> { x.iter().map(|p| p.map(f64::from)).collect() };
+    let theta = |q: &[f64; 3]| q[0].hypot(q[1]).atan2(q[2]).to_degrees();
+    let chairs = glycoflow_core::ring_puckers(&f64s(&glycan.templates[0]), &rings);
+    let mut changed = 0;
+    for template in glycan.templates.iter_mut().skip(1) {
+        let mut x = f64s(template);
+        let mut shapes = glycoflow_core::ring_puckers(&x, &rings);
+        let before = changed;
+        for (shape, chair) in shapes.iter_mut().zip(&chairs) {
+            if (theta(shape) - theta(chair)).abs() > CHAIR_TOLERANCE {
+                *shape = *chair;
+                changed += 1;
+            }
+        }
+        if changed > before {
+            glycoflow_core::set_puckers(&mut x, &rings, &shapes);
+            *template = x.iter().map(|p| p.map(|v| v as f32)).collect();
+        }
+    }
+    changed
+}
+
 /// Cremer-Pople theta (degrees) of a six-ring given in order: 0 for 4C1, 180 for 1C4 (D-sugars,
 /// ring O5 C1 C2 C3 C4 C5).
 pub fn chair_theta(ring: &[V; 6]) -> f64 {

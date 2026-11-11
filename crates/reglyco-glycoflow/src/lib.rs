@@ -15,7 +15,8 @@
 //!   completion (pinned-torsion inpainting); [`pipeline`]: `fit_site`;
 //! * [`output`], [`evaluation`], [`workflow`]: structures, reports, validation;
 //! * [`observer`]: watching a fit as it runs; [`deposition`]: chemistry checks of a deposit;
-//! * [`ensemble`]: the extend mode, an ensemble of conformers past the density.
+//! * [`ensemble`]: the extend mode, an ensemble of conformers past the density;
+//! * [`known`]: known atom positions (a deposit, an earlier fit) as starts of a fit.
 
 pub mod anchor;
 pub mod cartesian;
@@ -24,7 +25,9 @@ pub mod deposition;
 pub mod ensemble;
 pub mod error;
 pub mod evaluation;
+pub mod ideal;
 pub mod infer;
+pub mod known;
 pub mod maxent;
 pub mod model;
 pub mod observation;

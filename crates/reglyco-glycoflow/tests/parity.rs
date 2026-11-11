@@ -243,7 +243,12 @@ fn load(name: &str) -> Loaded {
         Box::new(DensityObservation::new(lik)),
         grid_box,
         radius,
-        &ProblemOptions::default(),
+        // the reference restrains to the geometry of the library's templates
+        &ProblemOptions {
+            ideal_geometry: false,
+            chair_rings: false,
+            ..Default::default()
+        },
     )
     .unwrap();
     Loaded {

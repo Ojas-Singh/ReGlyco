@@ -77,6 +77,9 @@ pub struct Restraints {
     /// (centre, first three bonded neighbours, V0)
     pub chiral: Vec<(usize, [usize; 3], f64)>,
     pub w_volume: f64,
+    /// (the four atoms, target in radians, weight): the ring torsions of the template, which
+    /// hold the shape of every ring, and the torsions of every amide, which hold it planar
+    pub torsions: Vec<([usize; 4], f64, f64)>,
     /// attachment angle: |A1 - C1| held at the linkage geometry (A1 = CG for Asn, CB for Ser/Thr)
     pub attachment: (usize, V3, f64, f64),
 }
@@ -86,6 +89,10 @@ pub struct RestraintOptions {
     pub sd_bond: f64,
     pub sd_angle: f64,
     pub sd_volume: f64,
+    /// ring torsions (degrees)
+    pub sd_ring: f64,
+    /// amide torsions (degrees)
+    pub sd_amide: f64,
 }
 
 impl Default for RestraintOptions {
@@ -94,6 +101,8 @@ impl Default for RestraintOptions {
             sd_bond: 0.02,
             sd_angle: 0.04,
             sd_volume: 0.2,
+            sd_ring: 15.0,
+            sd_amide: 5.0,
         }
     }
 }
@@ -104,52 +113,167 @@ fn volume(x: &[V3], c: usize, n: [usize; 3]) -> f64 {
 }
 
 impl Restraints {
+    /// The restraints of the glycan itself, without its attachment. Targets come from the
+    /// monomer library where it has them ([`crate::ideal`]) and from `reference` elsewhere; the
+    /// rings are held in the shape they have in `shape`.
+    pub fn internal(
+        problem: &SiteProblem,
+        reference: &[V3],
+        shape: &[V3],
+        options: &RestraintOptions,
+    ) -> Self {
+        let (wb, wa) = (
+            1.0 / options.sd_bond.powi(2),
+            1.0 / options.sd_angle.powi(2),
+        );
+        let pairs = problem
+            .ideal
+            .pairs
+            .iter()
+            .map(|&(i, j, bond, ideal)| {
+                let d0 = ideal.unwrap_or_else(|| norm(sub(reference[i], reference[j])));
+                (i, j, d0, if bond { wb } else { wa }, bond)
+            })
+            .collect();
+        let chiral = problem
+            .ideal
+            .chiral
+            .iter()
+            .map(|&(c, k, ideal)| {
+                // the hand of the centre is the template's
+                let v = volume(reference, c, k);
+                (c, k, ideal.map_or(v, |i| i.copysign(v)))
+            })
+            .collect();
+        let weight = |sd: f64| 1.0 / sd.to_radians().powi(2);
+        let (w_ring, w_amide) = (weight(options.sd_ring), weight(options.sd_amide));
+        let ideal = &problem.ideal;
+        let rings = ideal
+            .ring_torsions
+            .iter()
+            .map(|&q| (q, dihedral(shape[q[0]], shape[q[1]], shape[q[2]], shape[q[3]]), w_ring));
+        let amides = ideal.amide_torsions.iter().map(|&(q, t)| (q, t, w_amide));
+        let torsions = rings.chain(amides).collect();
+        Self {
+            pairs,
+            chiral,
+            w_volume: 1.0 / options.sd_volume.powi(2),
+            torsions,
+            attachment: (problem.c1, [0.0; 3], 0.0, 0.0),
+        }
+    }
+
     pub fn new(problem: &SiteProblem, template: usize, options: &RestraintOptions) -> Self {
-        let n = problem.n_atoms;
-        let topo = &problem.glycan.topology.topo_dist;
-        let nt = problem.glycan.topology.n_atoms;
-        // Bonds, angles and chirality are restrained to the template's geometry. A generated ring
-        // shape is written by displacing ring atoms along the mean-plane normal, which stretches
-        // ring bonds by up to ~0.1 A; those templates take their covalent geometry from the
-        // library's majority build instead (template 0), which bonds and angles do not depend on.
-        let refx = if problem.generated_rings {
+        // Bonds, angles and chirality without an ideal value are restrained to the template's
+        // geometry. A generated ring shape is written by displacing ring atoms along the
+        // mean-plane normal, which stretches ring bonds by up to ~0.1 A; those templates take
+        // their covalent geometry from the library's majority build instead (template 0), which
+        // bonds and angles do not depend on.
+        let reference = if problem.generated_rings {
             &problem.templates[0]
         } else {
             &problem.templates[template]
         };
-        let mut pairs = Vec::new();
-        for i in 0..n {
-            for j in i + 1..n {
-                let t = topo[i * nt + j];
-                if t == 1 || t == 2 {
-                    let w = if t == 1 {
-                        1.0 / options.sd_bond.powi(2)
-                    } else {
-                        1.0 / options.sd_angle.powi(2)
-                    };
-                    pairs.push((i, j, norm(sub(refx[i], refx[j])), w, t == 1));
-                }
-            }
-        }
-        let mut chiral = Vec::new();
-        for c in 0..n {
-            let nb: Vec<usize> = (0..n).filter(|&j| topo[c * nt + j] == 1).collect();
-            if nb.len() >= 3 {
-                let k = [nb[0], nb[1], nb[2]];
-                chiral.push((c, k, volume(refx, c, k)));
-            }
-        }
         let (a1, link) = (problem.anchor[1], problem.anchor[2]);
         let b0 = norm(sub(a1, link));
         let d_att = (b0 * b0 + problem.bond * problem.bond
             - 2.0 * b0 * problem.bond * problem.angle.cos())
         .sqrt();
         Self {
-            pairs,
-            chiral,
-            w_volume: 1.0 / options.sd_volume.powi(2),
             attachment: (problem.c1, a1, d_att, 1.0 / options.sd_angle.powi(2)),
+            ..Self::internal(problem, reference, &problem.templates[template], options)
         }
+    }
+
+    /// The coordinates nearest `x0` at the minimum of the restraint energy (L-BFGS).
+    pub fn relax(&self, x0: &[V3]) -> Vec<V3> {
+        self.minimise(x0, &vec![true; x0.len()], &vec![0.0; x0.len()])
+    }
+
+    /// `x0` with its covalent geometry repaired in place: the minimum of the restraint energy
+    /// with every `free` atom held to its position in `x0` by a harmonic spring of standard
+    /// deviation `sd` (A, by atom). Without the springs the repair of an angle near the protein
+    /// would swing everything beyond it.
+    pub fn regularise(&self, x0: &[V3], free: &[bool], sd: &[f64]) -> Vec<V3> {
+        let tether: Vec<f64> = sd.iter().map(|sd| 1.0 / (sd * sd)).collect();
+        self.minimise(x0, free, &tether)
+    }
+
+    fn minimise(&self, x0: &[V3], free: &[bool], tether: &[f64]) -> Vec<V3> {
+        let n = x0.len();
+        let dotv = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+        let eval = |p: &[f64]| -> (f64, Vec<f64>) {
+            let x: Vec<V3> = p.chunks(3).map(|c| [c[0], c[1], c[2]]).collect();
+            let mut g = vec![[0.0; 3]; n];
+            let mut e = self.energy(&x, Some(&mut g));
+            for (i, g) in g.iter_mut().enumerate() {
+                if !free[i] {
+                    *g = [0.0; 3];
+                } else if tether[i] > 0.0 {
+                    let d = sub(x[i], x0[i]);
+                    e += 0.5 * tether[i] * dot(d, d);
+                    axpy(g, tether[i], d);
+                }
+            }
+            (e, g.into_iter().flatten().collect())
+        };
+        let stiffest = self.pairs.iter().map(|p| p.3).fold(1.0, f64::max);
+        let mut p: Vec<f64> = x0.iter().flatten().copied().collect();
+        let (mut e, mut g) = eval(&p);
+        let mut history: std::collections::VecDeque<(Vec<f64>, Vec<f64>, f64)> = Default::default();
+        for _ in 0..1000 {
+            if g.iter().fold(0.0f64, |m, v| m.max(v.abs())) < 1e-7 {
+                break;
+            }
+            // two-loop recursion: q = H g
+            let mut q = g.clone();
+            let mut alpha = Vec::with_capacity(history.len());
+            for (s, y, rho) in history.iter().rev() {
+                let a = rho * dotv(s, &q);
+                q.iter_mut().zip(y).for_each(|(q, y)| *q -= a * y);
+                alpha.push(a);
+            }
+            let scale = history
+                .back()
+                .map_or(1.0 / stiffest, |(s, y, _)| dotv(s, y) / dotv(y, y));
+            q.iter_mut().for_each(|q| *q *= scale);
+            for ((s, y, rho), a) in history.iter().zip(alpha.iter().rev()) {
+                let b = rho * dotv(y, &q);
+                q.iter_mut().zip(s).for_each(|(q, s)| *q += (a - b) * s);
+            }
+            let mut slope = -dotv(&g, &q);
+            if slope >= 0.0 {
+                history.clear();
+                q = g.iter().map(|v| v / stiffest).collect();
+                slope = -dotv(&g, &q);
+            }
+            let mut step = 1.0;
+            let accepted = loop {
+                let trial: Vec<f64> = p.iter().zip(&q).map(|(p, q)| p - step * q).collect();
+                let (e1, g1) = eval(&trial);
+                if e1 <= e + 1e-4 * step * slope {
+                    break Some((trial, e1, g1));
+                }
+                step *= 0.5;
+                if step < 1e-12 {
+                    break None;
+                }
+            };
+            let Some((trial, e1, g1)) = accepted else {
+                break;
+            };
+            let s: Vec<f64> = trial.iter().zip(&p).map(|(a, b)| a - b).collect();
+            let y: Vec<f64> = g1.iter().zip(&g).map(|(a, b)| a - b).collect();
+            let sy = dotv(&s, &y);
+            if sy > 1e-14 {
+                if history.len() == 12 {
+                    history.pop_front();
+                }
+                history.push_back((s, y, 1.0 / sy));
+            }
+            (p, e, g) = (trial, e1, g1);
+        }
+        p.chunks(3).map(|c| [c[0], c[1], c[2]]).collect()
     }
 
     /// Restraint energy; `g` receives its gradient.
@@ -188,6 +312,18 @@ impl Restraints {
                 }
             }
         }
+        for &(q, t0, w) in &self.torsions {
+            let p = q.map(|i| x[i]);
+            let t = dihedral(p[0], p[1], p[2], p[3]) - t0;
+            let t = t.sin().atan2(t.cos());
+            e += 0.5 * w * t * t;
+            if let Some(g) = g.as_deref_mut() {
+                let dq = dihedral_gradient(p[0], p[1], p[2], p[3]);
+                for (i, d) in q.into_iter().zip(dq) {
+                    axpy(&mut g[i], w * t, d);
+                }
+            }
+        }
         e
     }
 
@@ -209,6 +345,31 @@ impl Restraints {
             (sa / na.max(1) as f64).sqrt(),
         )
     }
+}
+
+/// Bring the pucker templates of a problem to its restraint targets. The templates of the residue
+/// library are frames of a simulation, with the thermal scatter of its bonds and angles; a pose
+/// built on one would start the restrained refinement off its targets, and the torsion search
+/// would rank poses that no deposit could match atom for atom.
+pub fn regularise_templates(problem: &mut SiteProblem) {
+    let options = RestraintOptions::default();
+    let mut templates: Vec<Vec<V3>> = Vec::with_capacity(problem.templates.len());
+    for template in &problem.templates {
+        let reference = match templates.first() {
+            Some(first) if problem.generated_rings => first,
+            _ => template,
+        };
+        // First with the ring torsions of the template, which hold the shape of a ring while its
+        // bonds settle; then without them, since the torsions of a ring and its ideal angles are
+        // not independent and the ideal values are the ones to reach.
+        let mut restraints = Restraints::internal(problem, reference, template, &options);
+        let held = restraints.relax(template);
+        restraints.torsions.drain(..problem.ideal.ring_torsions.len());
+        templates.push(restraints.relax(&held));
+    }
+    problem
+        .set_templates(templates)
+        .expect("as many atoms as before");
 }
 
 /// Objective of placed coordinates (psi_N and torsions measured on `x`), without restraints;

@@ -54,6 +54,10 @@ pub struct WorkflowOptions {
     /// (`evaluation::deposited_pose`), so the fit reports the best pose the pipeline reaches from
     /// the deposit; off by default
     pub seed_deposit: bool,
+    /// atom positions known before the fit (`known`: a deposited model, an earlier fit of a smaller
+    /// glycan): their pose joins the search basins and they join the Cartesian refinement, so the
+    /// selected model is never worse by the objective than the known one with ideal geometry
+    pub known: Option<crate::known::KnownAtoms>,
     /// inference: fit every candidate even when the map does not support the candidates' shared
     /// reducing-end residue on its own (`infer::glycan_from_density`); off by default
     pub infer_without_root_check: bool,
@@ -193,6 +197,19 @@ pub fn fit_one(
                 .push(crate::evaluation::deposited_pose(&problem, dep, &fallback));
         }
     }
+    if let Some(known) = &options.known {
+        let start = known.on(&problem);
+        let fallback = Pose {
+            tau: vec![std::f64::consts::PI; problem.n_torsions],
+            psi: problem.link_torsion.start(),
+            phi: 0.0,
+            template: 0,
+        };
+        let mut pose = crate::known::pose_from_atoms(&problem, |i| start.x[i], &fallback);
+        pose.template = crate::known::start_template(&problem, &start, &pose);
+        fit_config.extra_starts.push(pose);
+        fit_config.coordinate_start = Some(start);
+    }
     let mut outcome = fit_site(&mut problem, &sampler, &fit_config)?;
     let naming = residue_naming(&problem, &site, protein)?;
     // a selected pose that fails validation (a hard overlap the contact energies left) gives way to
@@ -210,15 +227,23 @@ pub fn fit_one(
             focus_sites: vec![site.residue.clone()],
             ..ValidationOptions::default()
         };
-        Ok(validate_with_options(&structure, &options).valid)
+        let report = validate_with_options(&structure, &options);
+        Ok(report.valid)
     };
     if !passes(&outcome.basins[outcome.best].x)? {
         let best = outcome.best;
+        // known positions do not give way to a basin the map tells against by more than
+        // `known_guard`: the overlap is then the deposit's own (an asparagine built cis to its
+        // glycan), and leaving the density would not mend it
+        let guarded = |i: usize| {
+            let (known, other) = (&outcome.basins[best], &outcome.basins[i]);
+            known.from_known && known.terms.loglik - other.terms.loglik > fit_config.known_guard
+        };
         let candidates: Vec<usize> = outcome
             .alternatives
             .iter()
             .copied()
-            .filter(|&i| i != best)
+            .filter(|&i| i != best && !guarded(i))
             .take(VALID_ALTERNATIVES)
             .collect();
         for i in candidates {

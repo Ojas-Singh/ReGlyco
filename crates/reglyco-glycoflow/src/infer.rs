@@ -289,6 +289,60 @@ pub fn contains_tree(sequence: &str, deposited: &str) -> Result<bool> {
         .all(|(path, token)| big.get(path) == Some(token)))
 }
 
+/// A deposited N-glycan with its anomers corrected ([`corrected_anomers`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CorrectedTree {
+    pub sequence: String,
+    /// residues whose anomer changed: (path, deposited residue, corrected residue)
+    pub changed: Vec<(String, String, String)>,
+}
+
+/// The deposited N-glycan with the anomers of the known N-glycans: a residue whose anomer none of
+/// them has at that position (a core Man a1-4, a Fuc b1-6, a GlcNAc a1-4) takes the one they all
+/// have there. Such an anomer is an error of the deposit, not a different glycan: the enzymes
+/// that build N-glycans make one anomer at each position. Residues and positions the known
+/// glycans do not have are left as deposited.
+pub fn corrected_anomers(deposited: &str) -> Result<CorrectedTree> {
+    let mut known: BTreeMap<(String, String), BTreeSet<char>> = BTreeMap::new();
+    for (_, glycans) in N_GLYCAN_SUGGESTIONS {
+        for (_, sequence) in glycans.iter() {
+            for (path, (token, anomer)) in sequence_paths(sequence)? {
+                known.entry((path, token)).or_default().insert(anomer);
+            }
+        }
+    }
+    let mut seq = parse_glycam(deposited)?;
+    let (mut changed, mut keep) = (Vec::new(), BTreeSet::new());
+    let mut stack = vec![(seq.root, "r".to_string())];
+    while let Some((k, path)) = stack.pop() {
+        for &c in &seq.nodes[k].children {
+            stack.push((c, format!("{path}/{}", seq.nodes[c].ppos.unwrap_or(0))));
+        }
+        let node = &mut seq.nodes[k];
+        if let Some(anomers) = known.get(&(path.clone(), node.name.clone()))
+            && anomers.len() == 1
+            && !anomers.contains(&node.anomer)
+        {
+            let anomer = *anomers.first().expect("one anomer");
+            changed.push((
+                path.clone(),
+                format!("{}{}", node.name, node.anomer),
+                format!("{}{anomer}", node.name),
+            ));
+            node.anomer = anomer;
+        }
+        keep.insert(path);
+    }
+    changed.sort();
+    let sequence = if changed.is_empty() {
+        deposited.to_string()
+    } else {
+        let tail = if seq.aglycone == "ROH" { "-OH" } else { "-OME" };
+        write_node(&seq, seq.root, "r", tail, &keep, &mut BTreeMap::new())
+    };
+    Ok(CorrectedTree { sequence, changed })
+}
+
 fn kept_children(
     seq: &Sequence,
     k: usize,

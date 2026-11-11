@@ -293,3 +293,62 @@ fn attachment_reproduces_the_requested_angles() {
         assert!((bond - 1.45).abs() < 1e-9);
     }
 }
+
+#[test]
+#[ignore = "needs GLYCOFLOW_MODEL (licensed GlycoFlow model directory with residue_library.json)"]
+fn templates_take_the_monomer_library_geometry() {
+    let site = site();
+    let p = problem(&site, None);
+    let distance = |x: &[[f64; 3]], i: usize, j: usize| {
+        (0..3).map(|k| (x[i][k] - x[j][k]).powi(2)).sum::<f64>().sqrt()
+    };
+    // every heavy-atom bond of these sugars and of their links is in the library
+    assert_eq!(p.ideal.coverage(&p.glycan), 1.0);
+    let raw = build_glycan(&library(), SEQUENCE, 4, 0).unwrap();
+    for (t, template) in p.templates.iter().enumerate() {
+        let (mut bonds, mut angles, mut before) = (0.0f64, 0.0f64, 0.0f64);
+        for &(i, j, bond, ideal) in &p.ideal.pairs {
+            let Some(d0) = ideal else { continue };
+            let off = (distance(template, i, j) - d0).abs();
+            if bond {
+                bonds = bonds.max(off);
+                let x: Vec<[f64; 3]> = raw.templates[t].iter().map(|v| v.map(f64::from)).collect();
+                before = before.max((distance(&x, i, j) - d0).abs());
+            } else {
+                angles = angles.max(off);
+            }
+        }
+        println!("template {t}: bonds off by {bonds:.4} A at most (library frame: {before:.4}), 1-3 distances by {angles:.4}");
+        assert!(bonds < 0.002, "template {t}: a bond is {bonds} A off its ideal length");
+        assert!(angles < 0.005, "template {t}: a 1-3 distance is {angles} A off");
+    }
+    let at = |path: &str, name: &str| {
+        (0..p.n_atoms)
+            .find(|&i| p.glycan.res_paths[i] == path && p.glycan.atom_names[i] == name)
+            .unwrap()
+    };
+    let x = &p.templates[0];
+    assert!((distance(x, at("r", "C2"), at("r", "N2")) - 1.448).abs() < 0.005);
+    // the aglycone oxygen stands at the link atom's distance
+    assert!((distance(x, p.o1, p.c1) - p.bond).abs() < 0.005);
+    // and the poses built on a template keep its hand
+    let r = reglyco_glycoflow::cartesian::Restraints::new(&p, 0, &Default::default());
+    // (an amide stays as the template has it: its torsion is restrained)
+    let amide = |q: &[usize; 4]| p.ideal.amide_torsions.iter().any(|(a, _)| a[1..3] == q[1..3]);
+    let tau = p.glycan.topology.quads[..p.n_torsions]
+        .iter()
+        .map(|q| match amide(q) {
+            true => reglyco_glycoflow::problem::dihedral(x[q[0]], x[q[1]], x[q[2]], x[q[3]]),
+            false => 0.3,
+        })
+        .collect();
+    let pose = Pose {
+        tau,
+        psi: 3.0,
+        phi: -1.5,
+        template: 0,
+    };
+    let placed = p.place(&pose);
+    println!("restraint energy of a placed pose: {:.3}", r.energy(&placed, None));
+    assert!(r.energy(&placed, None) < 2.0);
+}
