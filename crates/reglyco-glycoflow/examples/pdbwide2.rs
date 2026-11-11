@@ -207,12 +207,18 @@ fn fit_site(
     let mut options = WorkflowOptions::default();
     options.fit.seed = seed;
     options.prior.cache = Some(priors.clone());
+    // a chair set where the deposit has a boat is held between its neighbours: with the wider default
+    // the ring settles half-way, twisted, so the rings are held to their chair more tightly here
+    options.fit.restraints.sd_ring = 5.0;
     // experiments: restraint width, Cartesian steps and the margin of the known positions
     let number = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
     if let Some(s) = number("PDBWIDE_SD") {
         options.fit.restraints.sd_bond *= s;
         options.fit.restraints.sd_angle *= s;
         options.fit.restraints.sd_volume *= s;
+    }
+    if let Some(s) = number("PDBWIDE_RING") {
+        options.fit.restraints.sd_ring = s;
     }
     if let Some(s) = number("PDBWIDE_CSTEPS") {
         options.fit.cartesian_steps = s as usize;
@@ -225,6 +231,9 @@ fn fit_site(
     }
     if let Some(s) = number("PDBWIDE_GUARD") {
         options.fit.known_guard = s;
+    }
+    if let Some(s) = number("PDBWIDE_SHARE") {
+        options.fit.known_share = s;
     }
     let deposited = deposited_glycan(&structure, &residue)?.ok_or("no deposited glycan")?;
     let deposited_sequence = deposited.glycam_sequence()?;
@@ -343,41 +352,81 @@ fn fit_site(
             };
             eprintln!(
                 "{name}: deposit loglik {:.2} objective {:.2} prior {:.2} att {:.2} env {:.4} self {:.4} restraint {:.1}",
-                d.terms.loglik, d.terms.total, d.terms.e_prior, d.terms.e_att, d.terms.e_env,
-                d.terms.e_self, d.e_restraint
+                d.terms.loglik,
+                d.terms.total,
+                d.terms.e_prior,
+                d.terms.e_att,
+                d.terms.e_env,
+                d.terms.e_self,
+                d.e_restraint
             );
             // what the restraints still hold against in the lowest basin from the deposit
-            if let Some(&k) = fit.outcome.order.iter().find(|&&i| fit.outcome.basins[i].from_known) {
+            if let Some(&k) = fit
+                .outcome
+                .order
+                .iter()
+                .find(|&&i| fit.outcome.basins[i].from_known)
+            {
                 let b = &fit.outcome.basins[k];
                 let r = Restraints::new(p, b.pose.template, restraints);
                 let g = &p.glycan;
                 let label = |i: usize| format!("{}:{}", g.res_paths[i], g.atom_names[i]);
                 let dist = |x: &[V3], i: usize, j: usize| {
-                    (0..3).map(|c| (x[i][c] - x[j][c]).powi(2)).sum::<f64>().sqrt()
+                    (0..3)
+                        .map(|c| (x[i][c] - x[j][c]).powi(2))
+                        .sum::<f64>()
+                        .sqrt()
                 };
                 let mut terms: Vec<(f64, String)> = Vec::new();
                 let (mut eb, mut ea, mut ev) = (0.0, 0.0, 0.0);
                 for &(i, j, d0, w, bond) in &r.pairs {
                     let d = dist(&b.x, i, j);
                     let e = 0.5 * w * (d - d0).powi(2);
-                    if bond { eb += e } else { ea += e }
-                    terms.push((e, format!("{} {}-{} {:.2} (ideal {:.2}, deposit {:.2})",
-                        if bond { "bond" } else { "1-3" }, label(i), label(j), d, d0, dist(&x0, i, j))));
+                    if bond {
+                        eb += e
+                    } else {
+                        ea += e
+                    }
+                    terms.push((
+                        e,
+                        format!(
+                            "{} {}-{} {:.2} (ideal {:.2}, deposit {:.2})",
+                            if bond { "bond" } else { "1-3" },
+                            label(i),
+                            label(j),
+                            d,
+                            d0,
+                            dist(&x0, i, j)
+                        ),
+                    ));
                 }
                 let vol = |x: &[V3], c: usize, n: [usize; 3]| {
                     let s = |a: V3, b: V3| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
                     let (u, v, w) = (s(x[n[0]], x[c]), s(x[n[1]], x[c]), s(x[n[2]], x[c]));
-                    u[0] * (v[1] * w[2] - v[2] * w[1]) + u[1] * (v[2] * w[0] - v[0] * w[2])
+                    u[0] * (v[1] * w[2] - v[2] * w[1])
+                        + u[1] * (v[2] * w[0] - v[0] * w[2])
                         + u[2] * (v[0] * w[1] - v[1] * w[0])
                 };
                 for &(c, n, v0) in &r.chiral {
                     let v = vol(&b.x, c, n);
                     let e = 0.5 * r.w_volume * (v - v0).powi(2);
                     ev += e;
-                    terms.push((e, format!("chiral {} {:.2} (ideal {:.2}, deposit {:.2})", label(c), v, v0, vol(&x0, c, n))));
+                    terms.push((
+                        e,
+                        format!(
+                            "chiral {} {:.2} (ideal {:.2}, deposit {:.2})",
+                            label(c),
+                            v,
+                            v0,
+                            vol(&x0, c, n)
+                        ),
+                    ));
                 }
                 terms.sort_by(|a, b| b.0.total_cmp(&a.0));
-                eprintln!("  basin #{k}: bonds {eb:.1} 1-3 {ea:.1} chiral {ev:.1} of {:.1}", b.e_restraint);
+                eprintln!(
+                    "  basin #{k}: bonds {eb:.1} 1-3 {ea:.1} chiral {ev:.1} of {:.1}",
+                    b.e_restraint
+                );
                 for (e, t) in terms.iter().take(8) {
                     eprintln!("     {e:6.2} {t}");
                 }
@@ -389,8 +438,14 @@ fn fit_site(
                         "  {rank:3} #{i:3} {} {} total {:9.2} loglik {:8.2} prior {:6.2} att {:5.2} env {:.4} self {:.4} restraint {:6.2} rmsd {:.2}",
                         if b.from_known { "known" } else { "     " },
                         if i == fit.outcome.best { "*" } else { " " },
-                        b.terms.total + b.e_restraint, b.terms.loglik, b.terms.e_prior,
-                        b.terms.e_att, b.terms.e_env, b.terms.e_self, b.e_restraint, rmsd(&b.x)
+                        b.terms.total + b.e_restraint,
+                        b.terms.loglik,
+                        b.terms.e_prior,
+                        b.terms.e_att,
+                        b.terms.e_env,
+                        b.terms.e_self,
+                        b.e_restraint,
+                        rmsd(&b.x)
                     );
                 }
             }
@@ -415,7 +470,11 @@ fn fit_site(
             let (mut sums, mut counts) = ([0.0; 2], [0usize; 2]);
             for &(i, j, d0, _, bond) in &ideal.pairs {
                 if start.x[i].is_some() && start.x[j].is_some() {
-                    let d = (0..3).map(|k| (x[i][k] - x[j][k]).powi(2)).sum::<f64>().sqrt() - d0;
+                    let d = (0..3)
+                        .map(|k| (x[i][k] - x[j][k]).powi(2))
+                        .sum::<f64>()
+                        .sqrt()
+                        - d0;
                     sums[bond as usize] += d * d;
                     counts[bond as usize] += 1;
                 }
@@ -556,7 +615,10 @@ fn fit_site(
         })
         .collect();
     // a cis amide between the site and the glycan (CB-CG-ND2-C1 is 180 deg in N-glycans)
-    if let Some(psi) = comparison["psi_n_deposit"].as_f64().filter(|p| n_linked && p.abs() < 90.0) {
+    if let Some(psi) = comparison["psi_n_deposit"]
+        .as_f64()
+        .filter(|p| n_linked && p.abs() < 90.0)
+    {
         deposit_errors.push(json!({
             "path": "r", "kind": "link", "deposit": psi, "fit": best.pose.psi.to_degrees(),
         }));
@@ -580,7 +642,10 @@ fn fit_site(
             // the map cannot tell from noise at its resolution, or a gain without density of
             // its own); unsupported: neither
             let statistical = assessed.statistical.contains(&path);
-            let dense = assessed.density.get(&path).is_some_and(|f| *f >= DENSITY_GATE);
+            let dense = assessed
+                .density
+                .get(&path)
+                .is_some_and(|f| *f >= DENSITY_GATE);
             let verdict = if supported.contains(&path) {
                 "supported"
             } else if statistical || dense {

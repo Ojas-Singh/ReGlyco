@@ -232,12 +232,17 @@ pub fn fit_one(
     };
     if !passes(&outcome.basins[outcome.best].x)? {
         let best = outcome.best;
-        // known positions do not give way to a basin the map tells against by more than
-        // `known_guard`: the overlap is then the deposit's own (an asparagine built cis to its
+        // known positions do not give way to a basin the map tells against
+        // (`map_tells_for_known`): the overlap is then the deposit's own (an asparagine built cis to its
         // glycan), and leaving the density would not mend it
         let guarded = |i: usize| {
             let (known, other) = (&outcome.basins[best], &outcome.basins[i]);
-            known.from_known && known.terms.loglik - other.terms.loglik > fit_config.known_guard
+            known.from_known
+                && crate::pipeline::map_tells_for_known(
+                    &fit_config,
+                    known.terms.loglik,
+                    other.terms.loglik,
+                )
         };
         let candidates: Vec<usize> = outcome
             .alternatives

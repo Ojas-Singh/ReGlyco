@@ -70,7 +70,9 @@ impl<'a> Geometry<'a> {
     fn residue(&self, i: usize) -> Option<&'static Residue> {
         // "4YB": linkage prefix, then the residue code
         let name = &self.glycan.res_names[i];
-        table().residues.get(name.get(name.len().checked_sub(2)?..)?)
+        table()
+            .residues
+            .get(name.get(name.len().checked_sub(2)?..)?)
     }
 
     fn name(&self, i: usize) -> &str {
@@ -186,10 +188,12 @@ impl Targets {
                 }
                 let ideal = match (topo[i * nt + j], geometry) {
                     (1, Some(g)) => g.bond(i, j),
-                    (2, Some(g)) => (0..n).find(|&k| bonded(i, k) && bonded(k, j)).and_then(|k| {
-                        let (a, b) = (g.bond(i, k)?, g.bond(k, j)?);
-                        Some((a * a + b * b - 2.0 * a * b * g.angle(i, k, j)?.cos()).sqrt())
-                    }),
+                    (2, Some(g)) => (0..n)
+                        .find(|&k| bonded(i, k) && bonded(k, j))
+                        .and_then(|k| {
+                            let (a, b) = (g.bond(i, k)?, g.bond(k, j)?);
+                            Some((a * a + b * b - 2.0 * a * b * g.angle(i, k, j)?.cos()).sqrt())
+                        }),
                     (1 | 2, None) => None,
                     _ => continue,
                 };
@@ -235,7 +239,8 @@ impl Targets {
             let x = &glycan.templates[0];
             for (nitrogen, carbon) in (0..n).flat_map(|i| (0..n).map(move |j| (i, j))) {
                 // an amide: N bonded to a carbon that carries a carbonyl oxygen
-                let carbonyl = |o: usize| glycan.elements[o] == "O" && around(o, carbon).count() == 0;
+                let carbonyl =
+                    |o: usize| glycan.elements[o] == "O" && around(o, carbon).count() == 0;
                 if glycan.elements[nitrogen] != "N"
                     || glycan.elements[carbon] != "C"
                     || !bonded(nitrogen, carbon)

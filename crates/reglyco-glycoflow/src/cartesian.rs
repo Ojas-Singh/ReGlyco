@@ -148,10 +148,13 @@ impl Restraints {
         let weight = |sd: f64| 1.0 / sd.to_radians().powi(2);
         let (w_ring, w_amide) = (weight(options.sd_ring), weight(options.sd_amide));
         let ideal = &problem.ideal;
-        let rings = ideal
-            .ring_torsions
-            .iter()
-            .map(|&q| (q, dihedral(shape[q[0]], shape[q[1]], shape[q[2]], shape[q[3]]), w_ring));
+        let rings = ideal.ring_torsions.iter().map(|&q| {
+            (
+                q,
+                dihedral(shape[q[0]], shape[q[1]], shape[q[2]], shape[q[3]]),
+                w_ring,
+            )
+        });
         let amides = ideal.amide_torsions.iter().map(|&(q, t)| (q, t, w_amide));
         let torsions = rings.chain(amides).collect();
         Self {
@@ -364,7 +367,9 @@ pub fn regularise_templates(problem: &mut SiteProblem) {
         // not independent and the ideal values are the ones to reach.
         let mut restraints = Restraints::internal(problem, reference, template, &options);
         let held = restraints.relax(template);
-        restraints.torsions.drain(..problem.ideal.ring_torsions.len());
+        restraints
+            .torsions
+            .drain(..problem.ideal.ring_torsions.len());
         templates.push(restraints.relax(&held));
     }
     problem

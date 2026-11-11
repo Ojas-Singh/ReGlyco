@@ -46,7 +46,9 @@ pub use crate::ring::CHAIR_TOLERANCE;
 
 impl KnownAtoms {
     fn at(&self, path: &str, name: &str) -> Option<V3> {
-        self.atoms.get(&(path.to_string(), name.to_string())).copied()
+        self.atoms
+            .get(&(path.to_string(), name.to_string()))
+            .copied()
     }
 
     /// C2-N2-C2N-CME of the N-acetyl group of a residue (degrees).
@@ -62,13 +64,24 @@ impl KnownAtoms {
             return None;
         }
         let at = |name| self.at(path, name);
-        let ring = [at("O5")?, at("C1")?, at("C2")?, at("C3")?, at("C4")?, at("C5")?];
+        let ring = [
+            at("O5")?,
+            at("C1")?,
+            at("C2")?,
+            at("C3")?,
+            at("C4")?,
+            at("C5")?,
+        ];
         let bonded = (0..6).all(|i| {
             let (a, b) = (ring[i], ring[(i + 1) % 6]);
             (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>() < 2.0f64.powi(2)
         });
         let theta = chair_theta(&ring);
-        bonded.then_some(if residue.starts_with('L') { 180.0 - theta } else { theta })
+        bonded.then_some(if residue.starts_with('L') {
+            180.0 - theta
+        } else {
+            theta
+        })
     }
 
     /// The errors of the known geometry (`residues`: path -> GLYCAM residue).
@@ -81,7 +94,10 @@ impl KnownAtoms {
             if let Some(t) = self.acetyl_torsion(path).filter(|t| t.abs() < 90.0) {
                 errors.push((path.clone(), GeometryError::Acetyl(t)));
             }
-            if let Some(t) = self.chair_deviation(path, residue).filter(|t| *t > CHAIR_TOLERANCE) {
+            if let Some(t) = self
+                .chair_deviation(path, residue)
+                .filter(|t| *t > CHAIR_TOLERANCE)
+            {
                 errors.push((path.clone(), GeometryError::Ring(t)));
             }
         }
@@ -167,7 +183,14 @@ pub fn start_template(problem: &SiteProblem, start: &CoordinateStart, fallback: 
             let atom = |name: &str| {
                 (0..problem.n_atoms).find(|&i| g.res_paths[i] == *path && g.atom_names[i] == name)
             };
-            Some([atom("O5")?, atom("C1")?, atom("C2")?, atom("C3")?, atom("C4")?, atom("C5")?])
+            Some([
+                atom("O5")?,
+                atom("C1")?,
+                atom("C2")?,
+                atom("C3")?,
+                atom("C4")?,
+                atom("C5")?,
+            ])
         })
         .collect();
     let theta = |template: usize, ring: &[usize; 6]| {

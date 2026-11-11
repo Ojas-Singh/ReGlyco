@@ -534,7 +534,16 @@ impl SiteProblem {
         radius: f64,
         options: &ProblemOptions,
     ) -> Result<Self> {
-        Self::with_rings(site, glycan, vocab, observation, grid_box, radius, options, false)
+        Self::with_rings(
+            site,
+            glycan,
+            vocab,
+            observation,
+            grid_box,
+            radius,
+            options,
+            false,
+        )
     }
 
     /// [`SiteProblem::new`]; `generated_rings`: templates `1..` of the glycan carry ring shapes

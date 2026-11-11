@@ -55,6 +55,9 @@ pub struct FitConfig {
     /// known positions stay the model against a basin that explains the map worse by more than
     /// this (log-likelihood units), whatever the priors say (see `keeps_known`)
     pub known_guard: f64,
+    /// ... and against a basin that keeps less than this share of their log-likelihood: where
+    /// the map is weak the whole log-likelihood is smaller than `known_guard`
+    pub known_share: f64,
     pub flow_steps: usize,
     pub guidance_scale: f64,
     pub guidance_start: f64,
@@ -155,6 +158,7 @@ impl Default for FitConfig {
             completion_guidance: 0.3,
             alt_margin: 5.0,
             known_guard: 10.0,
+            known_share: 0.75,
             flow_steps: 8,
             guidance_scale: 2.0,
             guidance_start: 0.3,
@@ -816,7 +820,12 @@ pub fn fit_site(
             lowest(n_search..fits.len())
                 .filter(|&k| {
                     let objective = fits[k].total - fits[best].total;
-                    keeps_known(config, objective, fits[k].terms.loglik - fits[best].terms.loglik)
+                    keeps_known(
+                        config,
+                        objective,
+                        fits[k].terms.loglik,
+                        fits[best].terms.loglik,
+                    )
                 })
                 .unwrap_or(best)
         };
@@ -972,8 +981,8 @@ pub fn fit_site(
         .copied()
         .find(|&i| basins[i].from_known)
         .filter(|&i| {
-            let loglik = basins[i].terms.loglik - basins[lowest].terms.loglik;
-            keeps_known(config, energies[i] - energies[lowest], loglik)
+            let (known, other) = (basins[i].terms.loglik, basins[lowest].terms.loglik);
+            keeps_known(config, energies[i] - energies[lowest], known, other)
         })
         .unwrap_or(lowest);
     let mut outcome = FitOutcome {
@@ -998,11 +1007,18 @@ pub fn fit_site(
 
 /// Whether the lowest basin from known positions stays the model against the lowest basin of
 /// all, given its objective and its log-likelihood relative to that one: when the map cannot tell
-/// the two apart, or when the map tells for the known positions by more than `known_guard` and
+/// the two apart, or when the map tells for the known positions (`map_tells_for_known`) and
 /// only the priors tell against them. The priors take the protein as it is given, and a misplaced
 /// side chain at the site would otherwise move a well-placed glycan out of its density.
-fn keeps_known(config: &FitConfig, objective: f64, loglik: f64) -> bool {
-    objective <= config.alt_margin || loglik > config.known_guard
+fn keeps_known(config: &FitConfig, objective: f64, known: f64, other: f64) -> bool {
+    objective <= config.alt_margin || map_tells_for_known(config, known, other)
+}
+
+/// Whether the map tells for known positions (log-likelihood `known`) against another basin
+/// (`other`): by more than `known_guard`, or the other keeps less than `known_share` of it
+/// (a share only means something of a log-likelihood above zero).
+pub(crate) fn map_tells_for_known(config: &FitConfig, known: f64, other: f64) -> bool {
+    known - other > config.known_guard || (known > 0.0 && other < config.known_share * known)
 }
 
 /// Make basin `best` the selected one: its support, prior completions, prior deviation and the
@@ -1071,5 +1087,36 @@ fn polish_top(
             poses[i] = pose;
             energies[i] = e;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_map_tells_for_known_positions_by_a_margin_or_by_a_share() {
+        let config = FitConfig::default();
+        // far apart in absolute terms
+        assert!(map_tells_for_known(&config, 120.0, 105.0));
+        // close in absolute terms, but the other basin keeps less than the share
+        assert!(map_tells_for_known(&config, 20.0, 14.0));
+        assert!(!map_tells_for_known(&config, 20.0, 16.0));
+        // the other basin fits the map as well or better
+        assert!(!map_tells_for_known(&config, 20.0, 21.0));
+        // a map that says nothing of either tells for neither
+        assert!(!map_tells_for_known(&config, -4.0, -3.5));
+        assert!(!map_tells_for_known(&config, 0.0, -1.0));
+    }
+
+    #[test]
+    fn known_positions_stay_when_the_map_cannot_tell_or_tells_for_them() {
+        let config = FitConfig::default();
+        // within the margin of the lowest basin
+        assert!(keeps_known(&config, config.alt_margin, 20.0, 20.0));
+        // further off by the priors, the map telling for them
+        assert!(keeps_known(&config, 40.0, 20.0, 9.0));
+        // further off by the priors, the map not telling
+        assert!(!keeps_known(&config, 40.0, 20.0, 19.0));
     }
 }
