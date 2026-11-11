@@ -289,20 +289,193 @@ pub fn contains_tree(sequence: &str, deposited: &str) -> Result<bool> {
         .all(|(path, token)| big.get(path) == Some(token)))
 }
 
-/// A deposited N-glycan with its anomers corrected ([`corrected_anomers`]).
-#[derive(Debug, Clone, serde::Serialize)]
+/// A deposited N-glycan with its core linkages and its anomers corrected ([`corrected_tree`]).
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CorrectedTree {
     pub sequence: String,
     /// residues whose anomer changed: (path, deposited residue, corrected residue)
     pub changed: Vec<(String, String, String)>,
+    /// residues of the core linked to another position of their parent: (deposited path,
+    /// corrected path, residue)
+    pub relinked: Vec<(String, String, String)>,
+    /// deposited path -> corrected path of every residue whose path changed (the relinked
+    /// residues and the residues they carry)
+    pub moved: BTreeMap<String, String>,
 }
 
-/// The deposited N-glycan with the anomers of the known N-glycans: a residue whose anomer none of
-/// them has at that position (a core Man a1-4, a Fuc b1-6, a GlcNAc a1-4) takes the one they all
-/// have there. Such an anomer is an error of the deposit, not a different glycan: the enzymes
-/// that build N-glycans make one anomer at each position. Residues and positions the known
-/// glycans do not have are left as deposited.
-pub fn corrected_anomers(deposited: &str) -> Result<CorrectedTree> {
+impl CorrectedTree {
+    /// The deposit as it is.
+    pub fn unchanged(deposited: &str) -> Self {
+        Self {
+            sequence: deposited.to_string(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The residues that carry the core of every N-glycan (GlcNAc b1-4 GlcNAc b1-4 Man, with its
+/// a1-3 and a1-6 arms and the core fucose): the linkages of their children are the same in every
+/// N-glycan, so another one is an error of the deposit.
+const CORE_PARENTS: [&str; 3] = ["r", "r/4", "r/4/4"];
+
+/// The N-glycans that say what is known of a host: its own for a mammalian host, which makes
+/// one core fucose (a1-6); all of them otherwise, since the hosts differ only in what they add.
+fn known_glycans(host_class: &str) -> Vec<&'static str> {
+    N_GLYCAN_SUGGESTIONS
+        .iter()
+        .filter(|(host, _)| host_class != "mammalian" || *host == host_class)
+        .flat_map(|(_, glycans)| glycans.iter().map(|(_, sequence)| *sequence))
+        .collect()
+}
+
+fn child_at(seq: &Sequence, k: usize, position: u32) -> Option<usize> {
+    seq.nodes[k]
+        .children
+        .iter()
+        .copied()
+        .find(|&c| seq.nodes[c].ppos == Some(position))
+}
+
+fn node_paths(seq: &Sequence) -> Vec<String> {
+    let mut paths = vec![String::new(); seq.nodes.len()];
+    let mut stack = vec![(seq.root, "r".to_string())];
+    while let Some((k, path)) = stack.pop() {
+        for &c in &seq.nodes[k].children {
+            stack.push((c, format!("{path}/{}", seq.nodes[c].ppos.unwrap_or(0))));
+        }
+        paths[k] = path;
+    }
+    paths
+}
+
+/// Link the residues of the core to the position the known N-glycans have them at: a residue
+/// at a position of its parent where none of them has it (a GlcNAc b1-6 on the first GlcNAc, a
+/// core fucose a1-3 in a mammalian host) moves to the one free position where they do. A residue
+/// with no such position, or with two, stays as deposited.
+fn relink_core(seq: &mut Sequence, host_class: &str) -> Result<()> {
+    let mut known: BTreeMap<(String, String), BTreeSet<u32>> = BTreeMap::new();
+    for sequence in known_glycans(host_class) {
+        let known_seq = parse_glycam(sequence)?;
+        let paths = node_paths(&known_seq);
+        for (k, node) in known_seq.nodes.iter().enumerate() {
+            for &c in &node.children {
+                let child = &known_seq.nodes[c];
+                known
+                    .entry((paths[k].clone(), child.name.clone()))
+                    .or_default()
+                    .extend(child.ppos);
+            }
+        }
+    }
+    let mut parent = Some(seq.root);
+    for path in CORE_PARENTS {
+        let Some(k) = parent else { break };
+        let children = seq.nodes[k].children.clone();
+        let positions = |c: usize| known.get(&(path.to_string(), seq.nodes[c].name.clone()));
+        let placed = |c: usize| {
+            positions(c).is_some_and(|q| seq.nodes[c].ppos.is_some_and(|p| q.contains(&p)))
+        };
+        let taken: BTreeSet<u32> = children
+            .iter()
+            .filter(|&&c| placed(c))
+            .filter_map(|&c| seq.nodes[c].ppos)
+            .collect();
+        // a misplaced residue with one free position to go to
+        let mut moves: BTreeMap<usize, u32> = children
+            .iter()
+            .filter(|&&c| !placed(c))
+            .filter_map(|&c| {
+                let free: Vec<u32> = positions(c)?.difference(&taken).copied().collect();
+                (free.len() == 1).then(|| (c, free[0]))
+            })
+            .collect();
+        // which no residue that stays holds, and no other one goes to
+        loop {
+            let blocked: Vec<usize> = moves
+                .iter()
+                .filter(|&(&c, &to)| {
+                    children.iter().any(|&o| {
+                        o != c
+                            && match moves.get(&o) {
+                                Some(&other) => other == to,
+                                None => seq.nodes[o].ppos == Some(to),
+                            }
+                    })
+                })
+                .map(|(&c, _)| c)
+                .collect();
+            if blocked.is_empty() {
+                break;
+            }
+            for c in blocked {
+                moves.remove(&c);
+            }
+        }
+        for (c, to) in moves {
+            seq.nodes[c].ppos = Some(to);
+        }
+        parent = child_at(seq, k, 4);
+    }
+    Ok(())
+}
+
+/// What a residue of the core of an N-glycan has that no known N-glycan has ([`core_faults`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreFault {
+    /// linked to a position of its parent where the known glycans do not have it
+    Linkage,
+    /// another residue than the one every N-glycan has at this position
+    Residue,
+}
+
+/// The residues of the core of an N-glycan (one that starts with GlcNAc) that no known N-glycan
+/// has: what [`corrected_tree`] could not correct, e.g. a third GlcNAc in place of the
+/// b-mannose, or an arm on O2 of it with both O3 and O6 free.
+pub fn core_faults(sequence: &str, host_class: &str) -> Result<Vec<(String, CoreFault)>> {
+    let mut positions: BTreeMap<(String, String), BTreeSet<u32>> = BTreeMap::new();
+    let mut tokens: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for known in known_glycans(host_class) {
+        for (path, (token, _)) in sequence_paths(known)? {
+            if let Some((parent, position)) = path.rsplit_once('/') {
+                positions
+                    .entry((parent.to_string(), token.clone()))
+                    .or_default()
+                    .extend(position.parse::<u32>());
+            }
+            tokens.entry(path).or_default().insert(token);
+        }
+    }
+    let residues = sequence_paths(sequence)?;
+    if residues.get("r").map(|r| r.0.as_str()) != Some("DGlcpNAc") {
+        return Ok(Vec::new());
+    }
+    let mut faults = Vec::new();
+    for (path, (token, _)) in &residues {
+        let Some((parent, position)) = path.rsplit_once('/') else {
+            continue;
+        };
+        if !CORE_PARENTS.contains(&parent) {
+            continue;
+        }
+        let here = position.parse::<u32>().ok();
+        if let Some(known) = positions.get(&(parent.to_string(), token.clone())) {
+            if !here.is_some_and(|p| known.contains(&p)) {
+                faults.push((path.clone(), CoreFault::Linkage));
+            }
+        } else if tokens.get(path).is_some_and(|t| !t.contains(token)) {
+            faults.push((path.clone(), CoreFault::Residue));
+        }
+    }
+    Ok(faults)
+}
+
+/// The deposited N-glycan as the known N-glycans have it: the residues of the core at their
+/// linkage position ([`relink_core`]), and every residue with the anomer the known glycans have at
+/// its position (a core Man a1-4, a Fuc b1-6, a GlcNAc a1-4 takes the one they all have there).
+/// Such a linkage or anomer is an error of the deposit, not a different glycan: the enzymes that
+/// build N-glycans make one of each at these positions. Residues and positions the known glycans
+/// do not have are left as deposited.
+pub fn corrected_tree(deposited: &str, host_class: &str) -> Result<CorrectedTree> {
     let mut known: BTreeMap<(String, String), BTreeSet<char>> = BTreeMap::new();
     for (_, glycans) in N_GLYCAN_SUGGESTIONS {
         for (_, sequence) in glycans.iter() {
@@ -312,12 +485,32 @@ pub fn corrected_anomers(deposited: &str) -> Result<CorrectedTree> {
         }
     }
     let mut seq = parse_glycam(deposited)?;
+    let before = node_paths(&seq);
+    relink_core(&mut seq, host_class)?;
+    let after = node_paths(&seq);
+    let moved: BTreeMap<String, String> = before
+        .iter()
+        .zip(&after)
+        .filter(|(a, b)| a != b)
+        .map(|(a, b)| (a.clone(), b.clone()))
+        .collect();
+    let mut relinked: Vec<(String, String, String)> = (0..seq.nodes.len())
+        .filter(|&k| {
+            // its own position changed, not only that of a residue below it
+            before[k] != after[k] && before[k].rsplit('/').next() != after[k].rsplit('/').next()
+        })
+        .map(|k| {
+            let node = &seq.nodes[k];
+            (
+                before[k].clone(),
+                after[k].clone(),
+                format!("{}{}", node.name, node.anomer),
+            )
+        })
+        .collect();
+    relinked.sort();
     let (mut changed, mut keep) = (Vec::new(), BTreeSet::new());
-    let mut stack = vec![(seq.root, "r".to_string())];
-    while let Some((k, path)) = stack.pop() {
-        for &c in &seq.nodes[k].children {
-            stack.push((c, format!("{path}/{}", seq.nodes[c].ppos.unwrap_or(0))));
-        }
+    for (k, path) in after.iter().enumerate() {
         let node = &mut seq.nodes[k];
         if let Some(anomers) = known.get(&(path.clone(), node.name.clone()))
             && anomers.len() == 1
@@ -331,16 +524,21 @@ pub fn corrected_anomers(deposited: &str) -> Result<CorrectedTree> {
             ));
             node.anomer = anomer;
         }
-        keep.insert(path);
+        keep.insert(path.clone());
     }
     changed.sort();
-    let sequence = if changed.is_empty() {
+    let sequence = if changed.is_empty() && moved.is_empty() {
         deposited.to_string()
     } else {
         let tail = if seq.aglycone == "ROH" { "-OH" } else { "-OME" };
         write_node(&seq, seq.root, "r", tail, &keep, &mut BTreeMap::new())
     };
-    Ok(CorrectedTree { sequence, changed })
+    Ok(CorrectedTree {
+        sequence,
+        changed,
+        relinked,
+        moved,
+    })
 }
 
 fn kept_children(
@@ -1043,6 +1241,143 @@ mod tests {
                 keep.insert(p);
             }
             assert_eq!(pruned_sequence(seq, &keep).unwrap().0, *seq);
+        }
+    }
+
+    #[test]
+    fn a_core_linkage_no_n_glycan_has_is_corrected() {
+        // 8ZJ4 D:909: the two core GlcNAc joined b1-6
+        let t = corrected_tree("DManpb1-4DGlcpNAcb1-6DGlcpNAcb1-OH", "mammalian").unwrap();
+        assert_eq!(t.sequence, "DManpb1-4DGlcpNAcb1-4DGlcpNAcb1-OH");
+        assert_eq!(
+            t.relinked,
+            vec![(
+                "r/6".to_string(),
+                "r/4".to_string(),
+                "DGlcpNAcb".to_string()
+            )]
+        );
+        assert_eq!(t.moved["r/6"], "r/4");
+        assert_eq!(t.moved["r/6/4"], "r/4/4");
+        assert!(t.changed.is_empty());
+        // the b-mannose on O6 of the second GlcNAc, and an arm on O2 of it beside the a1-3 arm
+        let t =
+            corrected_tree("DManpa1-2[DManpa1-3]DManpb1-6DGlcpNAcb1-4DGlcpNAcb1-OH", "").unwrap();
+        assert_eq!(t.sequence, CORE);
+        assert_eq!(t.relinked.len(), 2);
+        assert_eq!(t.moved["r/4/6/2"], "r/4/4/6");
+        assert_eq!(t.moved["r/4/6/3"], "r/4/4/3");
+        // the linkage and the anomer of one residue
+        let t = corrected_tree("DGlcpNAca1-6DGlcpNAcb1-OH", "insect").unwrap();
+        assert_eq!(t.sequence, "DGlcpNAcb1-4DGlcpNAcb1-OH");
+        assert_eq!(
+            t.changed,
+            vec![(
+                "r/4".to_string(),
+                "DGlcpNAca".to_string(),
+                "DGlcpNAcb".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_core_fucose_goes_to_o6_in_a_mammalian_host_only() {
+        let deposit = "DGlcpNAcb1-4[LFucpa1-3]DGlcpNAcb1-OH";
+        let t = corrected_tree(deposit, "mammalian").unwrap();
+        assert_eq!(
+            sequence_paths(&t.sequence).unwrap(),
+            sequence_paths("DGlcpNAcb1-4[LFucpa1-6]DGlcpNAcb1-OH").unwrap()
+        );
+        assert_eq!(
+            t.relinked,
+            vec![("r/3".to_string(), "r/6".to_string(), "LFucpa".to_string())]
+        );
+        for host in ["insect", "plant", "yeast or fungus", ""] {
+            let t = corrected_tree(deposit, host).unwrap();
+            assert_eq!(t.sequence, deposit, "{host}");
+            assert!(t.relinked.is_empty() && t.moved.is_empty());
+        }
+        // both fucoses deposited: O6 is taken, the a1-3 one stays
+        let both = "DGlcpNAcb1-4[LFucpa1-3][LFucpa1-6]DGlcpNAcb1-OH";
+        assert!(
+            corrected_tree(both, "mammalian")
+                .unwrap()
+                .relinked
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn what_the_known_glycans_do_not_say_stays_as_deposited() {
+        // every known glycan itself
+        for (host, glycans) in N_GLYCAN_SUGGESTIONS {
+            for (_, sequence) in glycans.iter() {
+                let t = corrected_tree(sequence, host).unwrap();
+                assert_eq!(t.sequence, *sequence);
+                assert!(t.changed.is_empty() && t.moved.is_empty());
+            }
+        }
+        // a bisecting GlcNAc, a third GlcNAc in place of the mannose, an arm with two free
+        // positions, a residue beyond the core, and two residues that would go to one position
+        for deposit in [
+            "DManpa1-6[DGlcpNAcb1-4][DManpa1-3]DManpb1-4DGlcpNAcb1-4DGlcpNAcb1-OH",
+            "DGlcpNAcb1-4DGlcpNAcb1-4DGlcpNAcb1-OH",
+            "DManpa1-2DManpb1-4DGlcpNAcb1-4DGlcpNAcb1-OH",
+            "DManpa1-3DManpa1-3DManpb1-4DGlcpNAcb1-4DGlcpNAcb1-OH",
+            "DGlcpNAcb1-6[DGlcpNAcb1-3]DGlcpNAcb1-OH",
+        ] {
+            let t = corrected_tree(deposit, "mammalian").unwrap();
+            assert!(t.moved.is_empty(), "{deposit} -> {}", t.sequence);
+        }
+        // a swap: the GlcNAc on O6 and the fucose on O4 exchange in a mammalian host, and stay
+        // where the fucose has two positions to go to
+        let swap = "DGlcpNAcb1-6[LFucpa1-4]DGlcpNAcb1-OH";
+        let t = corrected_tree(swap, "mammalian").unwrap();
+        assert_eq!(
+            sequence_paths(&t.sequence).unwrap(),
+            sequence_paths("DGlcpNAcb1-4[LFucpa1-6]DGlcpNAcb1-OH").unwrap()
+        );
+        assert!(corrected_tree(swap, "").unwrap().moved.is_empty());
+    }
+
+    #[test]
+    fn core_faults_are_what_the_correction_leaves() {
+        let faults = |deposit: &str, host: &str| {
+            let t = corrected_tree(deposit, host).unwrap();
+            core_faults(&t.sequence, host).unwrap()
+        };
+        for (host, glycans) in N_GLYCAN_SUGGESTIONS {
+            for (_, sequence) in glycans.iter() {
+                assert!(faults(sequence, host).is_empty(), "{sequence}");
+            }
+        }
+        // corrected: nothing left
+        assert!(faults("DManpb1-4DGlcpNAcb1-6DGlcpNAcb1-OH", "mammalian").is_empty());
+        // 5Z65 A:82: a third GlcNAc where every N-glycan has the b-mannose
+        assert_eq!(
+            faults("DGlcpNAcb1-4DGlcpNAcb1-4DGlcpNAcb1-OH", "mammalian"),
+            vec![("r/4/4".to_string(), CoreFault::Residue)]
+        );
+        // an arm on O2 with two positions to go to, and a second fucose in a mammalian host
+        assert_eq!(
+            faults("DManpa1-2DManpb1-4DGlcpNAcb1-4DGlcpNAcb1-OH", ""),
+            vec![("r/4/4/2".to_string(), CoreFault::Linkage)]
+        );
+        assert_eq!(
+            faults(
+                "DGlcpNAcb1-4[LFucpa1-3][LFucpa1-6]DGlcpNAcb1-OH",
+                "mammalian"
+            ),
+            vec![("r/3".to_string(), CoreFault::Linkage)]
+        );
+        // a bisecting GlcNAc and a plant xylose are no faults, nor is a glycan that is not an
+        // N-glycan of this kind
+        for deposit in [
+            "DManpa1-6[DGlcpNAcb1-4][DManpa1-3]DManpb1-4DGlcpNAcb1-4DGlcpNAcb1-OH",
+            "DManpa1-6[DXylpb1-2][DManpa1-3]DManpb1-4DGlcpNAcb1-4DGlcpNAcb1-OH",
+            "DGalpb1-3DGlcpb1-OH",
+        ] {
+            assert!(faults(deposit, "mammalian").is_empty(), "{deposit}");
         }
     }
 }

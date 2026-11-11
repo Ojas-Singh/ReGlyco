@@ -38,6 +38,7 @@ pub mod prior;
 pub mod problem;
 pub mod ring;
 pub mod search;
+pub mod sidechain;
 pub mod site;
 pub mod support;
 pub mod symmetry;

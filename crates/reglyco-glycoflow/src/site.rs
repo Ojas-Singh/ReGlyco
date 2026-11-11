@@ -356,6 +356,9 @@ pub struct SiteOptions {
     pub symmetry: SymmetryMode,
     /// GLYCAM sequence to fit instead of the deposited glycan's
     pub sequence: Option<String>,
+    /// atoms of the site residue at other positions than in the structure (a rebuilt side chain;
+    /// see [`crate::sidechain`]): atom name -> position
+    pub moved: BTreeMap<String, [f64; 3]>,
 }
 
 impl Default for SiteOptions {
@@ -364,6 +367,7 @@ impl Default for SiteOptions {
             env_radius: 45.0,
             symmetry: SymmetryMode::Auto,
             sequence: None,
+            moved: BTreeMap::new(),
         }
     }
 }
@@ -613,8 +617,14 @@ pub fn load_site(
     crystal: &CrystalInput,
     options: &SiteOptions,
 ) -> Result<Site> {
-    let (residue_name, names, anchor) = anchor_of(structure, residue)?;
+    let (residue_name, names, mut anchor) = anchor_of(structure, residue)?;
+    // the glycan is read from the link atom as deposited; the fit then has the moved atoms
     let deposited = deposited_glycan(structure, residue)?;
+    for (k, name) in names.iter().enumerate() {
+        if let Some(x) = options.moved.get(*name) {
+            anchor[k] = x.map(|v| v as f32 as f64);
+        }
+    }
     let tree = deposited.as_ref().map(|d| d.residues.clone());
     // sequence: requested, else crabWURCS from the deposited graph (checked against the
     // distance-based tree), else the tree itself
@@ -681,7 +691,10 @@ pub fn load_site(
                 && !a.element.eq_ignore_ascii_case("D")
         })
         .map(|a| EnvAtom {
-            position: v3(a.position),
+            position: match options.moved.get(&a.name) {
+                Some(x) if a.residue == *residue => *x,
+                _ => v3(a.position),
+            },
             atomic_number: atomic_number(&a.element),
             chain: a.residue.chain.clone(),
             residue_number: a.residue.number,

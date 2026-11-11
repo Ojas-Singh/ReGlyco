@@ -1,6 +1,7 @@
 //! Batch refit of prepared PDB entries, deposit first: every N-glycosylation site keeps the glycan
-//! its depositor built, with the anomers corrected, refitted from the deposited coordinates; the
-//! map then says which of its residues it supports, and whether it holds more of the glycan.
+//! its depositor built, with the core linkages and the anomers corrected, refitted from the
+//! deposited coordinates; the map then says which of its residues it supports, and whether it
+//! holds more of the glycan.
 //!
 //! cargo run --release -p reglyco-glycoflow --features cuda --example pdbwide2 -- \
 //!   <model dir> <manifest.jsonl> <output dir> <cpu|cuda> [seed] [members] [shard, e.g. 0/4]
@@ -9,12 +10,18 @@
 //! `{"entry", "method", "sites": [{"name", "site": "CHAIN:NUM", "pdb", "map", "host_class", "status"}]}`.
 //!
 //! One site:
-//! 1. the deposited tree with the anomers of the known N-glycans (`infer::corrected_anomers`);
+//! 1. the deposited tree with the core linkages and the anomers of the known N-glycans
+//!    (`infer::corrected_tree`);
 //! 2. a fit of it that also starts at the deposited atoms (`known`), so the model is never worse
 //!    by the objective than the deposit with ideal geometry;
-//! 3. growth: while the map supports the outermost residues, the next residues of the glycans of
+//! 3. a cis amide between the asparagine and the glycan that the fit could not turn: the side
+//!    chain of the asparagine is rebuilt under the glycan (`sidechain`), and kept when the link
+//!    is then trans, the glycan stays in its pose and the map holds the glycan and the side
+//!    chain as well as before;
+//! 4. growth: while the map supports the outermost residues, the next residues of the glycans of
 //!    the expression system are fitted on top of the model, and those that pass the support test
-//!    and the density gate are added.
+//!    and the density gate are added, unless a residue the map supported loses its support to
+//!    them.
 //!
 //! Deposited residues stay in the model whatever the map says, each with its verdict (supported:
 //! it passes the support test and the density gate; weak: one of the two; unsupported: neither);
@@ -30,20 +37,23 @@ use std::path::Path;
 use std::time::Instant;
 
 use glycoflow_core::model::Precision;
-use glysys::{BuildOptions, ResidueId, Structure, read_pdb};
+use glysys::{BuildOptions, ResidueId, Structure, Vec3, read_pdb};
 use reglyco_density::DensityMap;
 use reglyco_glycoflow::cartesian::{Restraints, cartesian_refine};
 use reglyco_glycoflow::ensemble::EnsembleOptions;
+use reglyco_glycoflow::evaluation::recovery;
 use reglyco_glycoflow::infer::{
-    DENSITY_GATE, DensityLevels, Gate, N_GLYCAN_SUGGESTIONS, contains_tree, corrected_anomers,
-    density_gate, pruned_sequence, statistical_support, suggestions_for,
+    CoreFault, CorrectedTree, DENSITY_GATE, DensityLevels, Gate, N_GLYCAN_SUGGESTIONS,
+    contains_tree, core_faults, corrected_tree, density_gate, pruned_sequence, statistical_support,
+    suggestions_for,
 };
 use reglyco_glycoflow::known::{
     CHAIR_TOLERANCE, GeometryError, KnownAtoms, hybrid, pose_from_atoms,
 };
 use reglyco_glycoflow::output::{PlacedGlycan, glycan_pdb};
-use reglyco_glycoflow::problem::V3;
-use reglyco_glycoflow::site::{deposited_glycan, sequence_paths};
+use reglyco_glycoflow::problem::{V3, dihedral};
+use reglyco_glycoflow::sidechain::{AsnSideChain, asn_side_chains};
+use reglyco_glycoflow::site::{DepositedGlycan, deposited_glycan, sequence_paths};
 use reglyco_glycoflow::workflow::{
     SiteFit, SiteRequest, extend_one, extension_report, fit_one, site_report,
 };
@@ -147,7 +157,25 @@ struct Fitter<'a> {
     options: WorkflowOptions,
 }
 
-impl Fitter<'_> {
+impl<'a> Fitter<'a> {
+    /// The same fits with atoms of the site residue moved: `protein` has them there.
+    fn moved<'b>(&self, protein: &'b Structure, atoms: &[(&str, V3)]) -> Fitter<'b>
+    where
+        'a: 'b,
+    {
+        let mut options = self.options.clone();
+        options.site.moved = atoms.iter().map(|(n, x)| (n.to_string(), *x)).collect();
+        Fitter {
+            structure: self.structure,
+            text: self.text,
+            map: self.map,
+            model: self.model,
+            protein,
+            residue: self.residue.clone(),
+            options,
+        }
+    }
+
     fn input(&self, known: Option<KnownAtoms>) -> WorkflowInput<'_> {
         let mut options = self.options.clone();
         options.known = known;
@@ -182,6 +210,111 @@ fn stage_record(label: &str, sequence: &str, fit: &SiteFit, a: &Assessed, second
         "statistical": a.statistical, "supported": a.supported(),
         "density": a.density, "root_gain": a.gate.root_gain,
     })
+}
+
+fn distance(a: V3, b: V3) -> f64 {
+    (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt()
+}
+
+fn atom_at(structure: &Structure, residue: &ResidueId, name: &str) -> Option<V3> {
+    let p = structure.atom_position(structure.find_atom(residue, name)?)?;
+    Some([p.x, p.y, p.z])
+}
+
+/// Grid of the side-chain torsions of a rebuilt asparagine (degrees).
+const ASN_STEP: f64 = 10.0;
+/// Rebuilt side chains tried at one site.
+const ASN_TRIALS: usize = 2;
+/// Two trials are at least this far apart in chi1 (degrees).
+const ASN_APART: f64 = 60.0;
+/// Closest approach of a rebuilt carbon, and of a rebuilt N or O, to the atoms around (A).
+const ASN_CONTACT: [f64; 2] = [3.0, 2.6];
+
+/// Side chains of the asparagine of a fitted site that would put a trans link within `reach` of
+/// C1 of the fitted glycan, the nearest first, each with that distance; none of them in contact
+/// with the rest of the structure.
+fn side_chains_under(
+    fit: &SiteFit,
+    structure: &Structure,
+    residue: &ResidueId,
+    reach: f64,
+) -> Vec<(f64, AsnSideChain)> {
+    let at = |name: &str| atom_at(structure, residue, name);
+    let (Some(n), Some(ca), Some(cb), Some(c), Some(o)) =
+        (at("N"), at("CA"), at("CB"), at("C"), at("O"))
+    else {
+        return Vec::new();
+    };
+    let p = &fit.problem;
+    let x = &fit.outcome.basins[fit.outcome.best].x;
+    let Some(c1) = (0..p.n_atoms)
+        .find(|&i| p.glycan.res_paths[i] == "r" && p.glycan.atom_names[i] == "C1")
+        .map(|i| x[i])
+    else {
+        return Vec::new();
+    };
+    // the atoms around, without the residue itself
+    let around: Vec<V3> = fit
+        .site
+        .environment
+        .iter()
+        .filter(|a| {
+            !(a.is_identity() && a.chain == residue.chain && a.residue_number == residue.number)
+        })
+        .map(|a| a.position)
+        .filter(|x| distance(*x, cb) < 8.0)
+        .collect();
+    let free = |s: &AsnSideChain| {
+        let clear = |x: V3, d: f64| around.iter().all(|a| distance(x, *a) >= d);
+        clear(s.cg, ASN_CONTACT[0])
+            && clear(s.od1, ASN_CONTACT[1])
+            && clear(s.nd2, ASN_CONTACT[1])
+            // its own backbone
+            && [n, c].iter().all(|b| distance(s.cg, *b) >= 2.75)
+            && [n, c, o]
+                .iter()
+                .all(|b| distance(s.od1, *b) >= 2.6 && distance(s.nd2, *b) >= 2.6)
+    };
+    let mut all: Vec<(f64, AsnSideChain)> = asn_side_chains(n, ca, cb, ASN_STEP)
+        .into_iter()
+        .map(|s| (distance(s.c1, c1), s))
+        .filter(|(d, s)| *d <= reach && free(s))
+        .collect();
+    all.sort_by(|a, b| a.0.total_cmp(&b.0));
+    all
+}
+
+/// The first of `all`, and the next ones that are another rotamer than those taken.
+fn trials(all: &[(f64, AsnSideChain)]) -> Vec<(f64, AsnSideChain)> {
+    let apart = |a: f64, b: f64| ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs() >= ASN_APART;
+    let mut taken: Vec<(f64, AsnSideChain)> = Vec::new();
+    for (d, s) in all {
+        if taken.len() < ASN_TRIALS && taken.iter().all(|(_, t)| apart(t.chi1, s.chi1)) {
+            taken.push((*d, *s));
+        }
+    }
+    taken
+}
+
+/// The protein with the side chain of the asparagine at `s`.
+fn with_side_chain(
+    protein: &Structure,
+    residue: &ResidueId,
+    s: &AsnSideChain,
+) -> Result<Structure, Error> {
+    let mut rebuilt = protein.clone();
+    for (name, x) in s.atoms() {
+        let id = rebuilt
+            .find_atom(residue, name)
+            .ok_or("asparagine without its side chain")?;
+        let position = Vec3 {
+            x: x[0],
+            y: x[1],
+            z: x[2],
+        };
+        rebuilt.set_atom_position(id, position)?;
+    }
+    Ok(rebuilt)
 }
 
 /// Refit one site; the summary line, and the files written under `dir`.
@@ -245,15 +378,27 @@ fn fit_site(
         .ok_or("site residue not found")?;
     let host = site["host_class"].as_str().unwrap_or("");
     let n_linked = site_residue == "ASN";
-    // 1. the deposited tree with corrected anomers
+    // 1. the deposited tree with the core linkages and the anomers corrected
     let corrected = if n_linked {
-        corrected_anomers(&deposited_sequence)?
+        corrected_tree(&deposited_sequence, host)?
     } else {
-        reglyco_glycoflow::infer::CorrectedTree {
-            sequence: deposited_sequence.clone(),
-            changed: Vec::new(),
-        }
+        CorrectedTree::unchanged(&deposited_sequence)
     };
+    // the deposited atoms by the paths of the corrected tree
+    let deposited_atoms: BTreeMap<(String, String), V3> = deposited
+        .atoms
+        .iter()
+        .map(|((path, name), x)| {
+            let path = corrected.moved.get(path).unwrap_or(path).clone();
+            ((path, name.clone()), *x)
+        })
+        .collect();
+    // how far a placed glycan is from the deposit, residue by residue of the corrected tree
+    let moved_deposit = DepositedGlycan {
+        residues: deposited.residues.clone(),
+        atoms: deposited_atoms.clone(),
+    };
+    let from_deposit = |fit: &SiteFit, x: &[V3]| recovery(&fit.problem, &moved_deposit, x, &[]);
     let suggestions = suggestions_for(&site_residue, host);
     // the glycan of a list that is the tree (told by `true`), or the first one that holds it
     let holding = |list: &[(&str, &str)], sequence: &str| {
@@ -269,7 +414,10 @@ fn fit_site(
     };
     let mut protein = structure.clone();
     protein.remove_residues(&deposited.residue_ids());
-    let fitter = Fitter {
+    // the same with the side chain of the asparagine rebuilt (step 3)
+    let rebuilt_protein: Structure;
+    let refine = (options.fit.cartesian_lr, options.fit.restraints.clone());
+    let mut fitter = Fitter {
         structure: &structure,
         text: text.as_deref(),
         map: &map,
@@ -286,7 +434,7 @@ fn fit_site(
         .map(|(path, (token, _))| (path, token))
         .collect();
     let deposit_atoms = KnownAtoms {
-        atoms: deposited.atoms.clone(),
+        atoms: deposited_atoms.clone(),
         rigid: BTreeSet::new(),
     };
     // C-mannose on Trp is 1C4 in crystals: no error
@@ -303,12 +451,18 @@ fn fit_site(
     };
     let errors = geometry_errors(&deposit_atoms, &deposit_tokens);
     let known = KnownAtoms {
-        atoms: deposited.atoms.clone(),
-        rigid: corrected.changed.iter().map(|c| c.0.clone()).collect(),
+        atoms: deposited_atoms.clone(),
+        rigid: corrected
+            .changed
+            .iter()
+            .map(|c| c.0.clone())
+            .chain(corrected.relinked.iter().map(|c| c.1.clone()))
+            .collect(),
     }
     .without(&errors);
     let t0 = Instant::now();
     let (mut fit, mut assessed) = fitter.fit(&corrected.sequence, Some(known))?;
+    let mut fits = 1;
     let mut sequence = corrected.sequence.clone();
     let deposit_paths = residue_paths(&fit);
     let mut stages = vec![stage_record(
@@ -320,20 +474,17 @@ fn fit_site(
     )];
     // the deposited coordinates on the same map and objective (hydrogens and missing atoms on
     // ideal residues moved onto them), and the density of every deposited residue
-    let comparison = {
+    let compare = |fit: &SiteFit, assessed: &Assessed| -> Value {
         let p = &fit.problem;
         let start = KnownAtoms {
-            atoms: deposited.atoms.clone(),
+            atoms: deposited_atoms.clone(),
             rigid: BTreeSet::new(),
         }
         .on(p);
         let best = &fit.outcome.basins[fit.outcome.best];
         let pose = pose_from_atoms(p, |i| start.x[i], &best.pose);
         let x0 = hybrid(p, &p.place(&pose), &start);
-        let (lr, restraints) = (
-            fitter.options.fit.cartesian_lr,
-            &fitter.options.fit.restraints,
-        );
+        let (lr, restraints) = (refine.0, &refine.1);
         let d = cartesian_refine(p, &x0, pose.template, 0, lr, restraints);
         let f = cartesian_refine(p, &best.x, best.pose.template, 0, lr, restraints);
         if std::env::var("PDBWIDE_BASINS").is_ok() {
@@ -450,8 +601,7 @@ fn fit_site(
         let mut density = BTreeMap::new();
         if let Some(l) = &assessed.levels {
             for path in &deposit_paths {
-                let pts: Vec<V3> = deposited
-                    .atoms
+                let pts: Vec<V3> = deposited_atoms
                     .iter()
                     .filter(|((r, _), _)| r == path)
                     .map(|(_, x)| *x)
@@ -486,23 +636,121 @@ fn fit_site(
                 "clash": c.terms.e_env + c.terms.e_self,
             })
         };
+        let away = from_deposit(fit, &best.x);
         json!({
             "deposit": side(&d), "fit": side(&f), "density_deposit": density,
             "density_fit": assessed.density,
             "from_deposit": best.from_known,
             "psi_n_deposit": pose.psi.to_degrees(),
             "matched_atoms": start.x.iter().filter(|x| x.is_some()).count(),
-            "rmsd": fit.recovery.as_ref().map(|r| r.full_rmsd),
-            "core_rmsd": fit.recovery.as_ref().map(|r| r.core_rmsd),
-            "per_residue_rmsd": fit.recovery.as_ref().map(|r| &r.per_residue),
+            "rmsd": away.full_rmsd,
+            "core_rmsd": away.core_rmsd,
+            "per_residue_rmsd": away.per_residue,
         })
     };
-    // 3. growth along the glycans of the expression system, one layer of residues at a time
+    let mut comparison = compare(&fit, &assessed);
+    // 3. a cis amide the fit could not turn on the deposited side chain: the side chain rebuilt
+    // under the glycan, kept when the link is then trans, the glycan stays in its pose and the
+    // map holds the glycan and the side chain as well as before
+    let psi_of = |fit: &SiteFit| fit.outcome.basins[fit.outcome.best].pose.psi.to_degrees();
+    let mut asn = Value::Null;
+    if n_linked && psi_of(&fit).abs() < 90.0 {
+        let reach = number("PDBWIDE_ASN_REACH").unwrap_or(2.5);
+        let at = |name: &str| atom_at(&structure, &residue, name);
+        let old = [at("CG"), at("OD1"), at("ND2")];
+        let level = |x: &[V3]| assessed.levels.as_ref().and_then(|l| l.fraction(&map, x));
+        let old_level = match old {
+            [Some(a), Some(b), Some(c)] => level(&[a, b, c]),
+            _ => None,
+        };
+        let (old_psi, old_loglik, old_known) = {
+            let b = &fit.outcome.basins[fit.outcome.best];
+            (psi_of(&fit), b.terms.loglik, b.from_known)
+        };
+        let all = side_chains_under(&fit, &structure, &residue, reach);
+        let mut tried = Vec::new();
+        let mut taken = None;
+        for (away, side) in trials(&all) {
+            let Some(old_level) = old_level else {
+                break;
+            };
+            let t = Instant::now();
+            let rebuilt = with_side_chain(&protein, &residue, &side)?;
+            let x = &fit.outcome.basins[fit.outcome.best].x;
+            let known = KnownAtoms::of_fit(&fit.problem, x, None);
+            let (r_fit, r_assessed) = fitter
+                .moved(&rebuilt, &side.atoms())
+                .fit(&sequence, Some(known))?;
+            fits += 1;
+            let b = &r_fit.outcome.basins[r_fit.outcome.best];
+            let (psi, loglik) = (psi_of(&r_fit), b.terms.loglik);
+            let new_level = level(&[side.cg, side.od1, side.nd2]);
+            let trans = psi.abs() >= 90.0;
+            let holds = loglik >= old_loglik - fitter.options.fit.alt_margin
+                || (old_loglik > 0.0 && loglik >= fitter.options.fit.known_share * old_loglik);
+            let dense = new_level.is_some_and(|l| l >= DENSITY_GATE.min(old_level));
+            // the glycan stays where the fit had it: a refit that leaves for another pose is
+            // not this glycan with its side chain turned
+            let stays = b.from_known;
+            let accepted = trans && holds && dense && stays;
+            tried.push(json!({
+                "chi1": side.chi1, "chi2": side.chi2, "away": away, "psi": psi,
+                "loglik": loglik, "level": new_level, "stays": stays, "accepted": accepted,
+                "seconds": t.elapsed().as_secs_f64(),
+            }));
+            if accepted {
+                stages.push(stage_record(
+                    "asparagine side chain rebuilt",
+                    &sequence,
+                    &r_fit,
+                    &r_assessed,
+                    t.elapsed().as_secs_f64(),
+                ));
+                taken = Some((side, rebuilt, r_fit, r_assessed, new_level));
+                break;
+            }
+        }
+        let chi = match (at("N"), at("CA"), at("CB"), old) {
+            (Some(n), Some(ca), Some(cb), [Some(cg), Some(od1), _]) => Some([
+                dihedral(n, ca, cb, cg).to_degrees(),
+                dihedral(ca, cb, cg, od1).to_degrees(),
+            ]),
+            _ => None,
+        };
+        asn = json!({
+            "rebuilt": taken.is_some(), "candidates": all.len(), "tried": tried,
+            "chi_deposit": chi, "psi_deposit_side_chain": old_psi,
+            "loglik_deposit_side_chain": old_loglik, "level_deposit_side_chain": old_level,
+        });
+        if let Some((side, rebuilt, r_fit, r_assessed, new_level)) = taken {
+            rebuilt_protein = rebuilt;
+            fitter = fitter.moved(&rebuilt_protein, &side.atoms());
+            (fit, assessed) = (r_fit, r_assessed);
+            let c = compare(&fit, &assessed);
+            for k in [
+                "fit",
+                "density_fit",
+                "rmsd",
+                "core_rmsd",
+                "per_residue_rmsd",
+            ] {
+                comparison[k] = c[k].clone();
+            }
+            comparison["from_deposit"] = json!(old_known && c["from_deposit"] == true);
+            asn["chi"] = json!([side.chi1, side.chi2]);
+            asn["psi"] = json!(psi_of(&fit));
+            asn["loglik"] = json!(fit.outcome.basins[fit.outcome.best].terms.loglik);
+            asn["level"] = json!(new_level);
+            asn["shift"] = json!(old[2].map(|x| distance(x, side.nd2)));
+            asn["atoms"] = json!({"CG": side.cg, "OD1": side.od1, "ND2": side.nd2});
+        }
+    }
+    // 4. growth along the glycans of the expression system, one layer of residues at a time
     let mut tree = deposit_paths.clone();
     let mut tried: BTreeSet<(String, String)> = BTreeSet::new();
     let mut added: Vec<String> = Vec::new();
-    let mut fits = 1;
-    while fits < MAX_FITS {
+    let limit = fits + MAX_FITS - 1;
+    while fits < limit {
         let built = assessed.supported();
         let mut next = None;
         for (glycan, s) in suggestions {
@@ -533,13 +781,17 @@ fn fit_site(
         let t = Instant::now();
         let (g_fit, g_assessed) = fitter.fit(&grown, Some(known))?;
         fits += 1;
-        // an added residue needs its own support and that of the residue it is linked to
+        // an added residue needs its own support and that of the residue it is linked to, and
+        // the layer is refused when a residue the map supported loses its support to it
         let g_supported = g_assessed.supported();
+        let costs = !built.is_subset(&g_supported);
         let accepted: Vec<String> = frontier
             .iter()
             .map(|(p, _)| p.clone())
             .filter(|p| {
-                g_supported.contains(p) && parent(p).is_some_and(|q| g_supported.contains(q))
+                !costs
+                    && g_supported.contains(p)
+                    && parent(p).is_some_and(|q| g_supported.contains(q))
             })
             .collect();
         let mut record = stage_record(
@@ -551,32 +803,45 @@ fn fit_site(
         );
         record["tried"] = json!(frontier);
         record["accepted"] = json!(accepted);
+        record["costs"] = json!(costs);
         stages.push(record);
         tried.extend(frontier.iter().cloned());
         if accepted.is_empty() {
             continue;
         }
-        tree.extend(accepted.iter().cloned());
-        added.extend(accepted.iter().cloned());
         if accepted.len() == frontier.len() {
+            tree.extend(accepted.iter().cloned());
+            added.extend(accepted.iter().cloned());
             (fit, assessed, sequence) = (g_fit, g_assessed, grown);
             continue;
         }
-        // some of the layer was refused: the model is the fit of the accepted tree alone
-        let (kept, _) = pruned_sequence(s, &tree)?;
+        // some of the layer was refused: the model is the fit of the accepted tree alone, when
+        // that fit keeps the support of the accepted residues and of those before them
+        let mut wider = tree.clone();
+        wider.extend(accepted.iter().cloned());
+        let (kept, _) = pruned_sequence(s, &wider)?;
         let gx = &g_fit.outcome.basins[g_fit.outcome.best].x;
-        let known = KnownAtoms::of_fit(&g_fit.problem, gx, Some(&tree));
+        let known = KnownAtoms::of_fit(&g_fit.problem, gx, Some(&wider));
         let t = Instant::now();
         let (k_fit, k_assessed) = fitter.fit(&kept, Some(known))?;
         fits += 1;
-        stages.push(stage_record(
+        let k_supported = k_assessed.supported();
+        let holds =
+            built.is_subset(&k_supported) && accepted.iter().all(|p| k_supported.contains(p));
+        let mut record = stage_record(
             "refit of the accepted residues",
             &kept,
             &k_fit,
             &k_assessed,
             t.elapsed().as_secs_f64(),
-        ));
-        (fit, assessed, sequence) = (k_fit, k_assessed, kept);
+        );
+        record["kept"] = json!(holds);
+        stages.push(record);
+        if holds {
+            tree = wider;
+            added.extend(accepted.iter().cloned());
+            (fit, assessed, sequence) = (k_fit, k_assessed, kept);
+        }
     }
     let fit_seconds = t0.elapsed().as_secs_f64();
     // the model: every deposited residue, and the added ones
@@ -585,8 +850,13 @@ fn fit_site(
         .into_iter()
         .map(|(path, (token, anomer))| (path, format!("{token}{anomer}")))
         .collect();
-    let changed: BTreeSet<&str> = corrected.changed.iter().map(|c| c.0.as_str()).collect();
-    let per_residue = fit.recovery.as_ref().map(|r| &r.per_residue);
+    let changed: BTreeSet<&str> = corrected
+        .changed
+        .iter()
+        .map(|c| c.0.as_str())
+        .chain(corrected.relinked.iter().map(|c| c.1.as_str()))
+        .collect();
+    let away = from_deposit(&fit, &best.x);
     let supported = assessed.supported();
     // errors of the deposited geometry, with the same measure on the model
     let model_atoms = KnownAtoms::of_fit(&fit.problem, &best.x, None);
@@ -611,6 +881,31 @@ fn fit_site(
             GeometryError::Ring(t) => json!({"path": path, "kind": "ring", "fit": t}),
         })
         .collect();
+    // a core residue on another position of its parent than in any N-glycan, now where they
+    // have it; and what of the core no known N-glycan has and the correction had to leave
+    let position = |path: &str| path.rsplit('/').next().and_then(|p| p.parse::<u32>().ok());
+    for (from, to, residue) in &corrected.relinked {
+        deposit_errors.push(json!({
+            "path": to, "kind": "linkage", "residue": residue,
+            "deposit": position(from), "fit": position(to),
+        }));
+    }
+    if n_linked {
+        for (path, fault) in core_faults(&corrected.sequence, host)? {
+            let kind = match fault {
+                CoreFault::Linkage => "linkage",
+                CoreFault::Residue => "residue",
+            };
+            let residue = tokens.get(&path);
+            deposit_errors.push(json!({
+                "path": path, "kind": kind, "residue": residue,
+                "deposit": position(&path), "fit": position(&path),
+            }));
+            fit_errors.push(json!({
+                "path": path, "kind": kind, "residue": residue, "fit": position(&path),
+            }));
+        }
+    }
     // a cis amide between the site and the glycan (CB-CG-ND2-C1 is 180 deg in N-glycans)
     if let Some(psi) = comparison["psi_n_deposit"]
         .as_f64()
@@ -655,7 +950,7 @@ fn fit_site(
                 "statistical": statistical,
                 "density": assessed.density.get(&path),
                 "density_deposit": comparison["density_deposit"].get(&path),
-                "rmsd": per_residue.and_then(|r| r.get(&path)),
+                "rmsd": away.per_residue.get(&path),
             })
         })
         .collect();
@@ -730,6 +1025,8 @@ fn fit_site(
         "deposited_residues": deposit_paths.len(),
         "glycan": glycan, "sequence": sequence,
         "corrections": corrected.changed,
+        "relinked": corrected.relinked,
+        "asn": asn,
         "deposit_errors": deposit_errors,
         "fit_errors": fit_errors,
         "typical": typical, "elsewhere": elsewhere, "whole_glycan": whole_glycan,
@@ -745,8 +1042,8 @@ fn fit_site(
         "root_gain": assessed.gate.root_gain,
         "clusters": extension.as_ref().and_then(|e| e.ensemble.as_ref()).map(|e| e.clusters.len()),
         "objective": best.terms.total, "loglik": best.terms.loglik,
-        "core_rmsd": fit.recovery.as_ref().map(|r| r.core_rmsd),
-        "full_rmsd": fit.recovery.as_ref().map(|r| r.full_rmsd),
+        "core_rmsd": away.core_rmsd,
+        "full_rmsd": away.full_rmsd,
         "resolution": fit.resolution, "sigma": fit.sigma.selected,
         "fits": fits, "fit_seconds": fit_seconds,
     });
