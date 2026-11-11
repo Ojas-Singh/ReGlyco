@@ -255,20 +255,17 @@ fn fit_site(
         }
     };
     let suggestions = suggestions_for(&site_residue, host);
+    // the glycan of a list that is the tree (told by `true`), or the first one that holds it
     let holding = |list: &[(&str, &str)], sequence: &str| {
+        let holds = |big: &str, small: &str| contains_tree(big, small).unwrap_or(false);
         list.iter()
-            .find(|(_, s)| contains_tree(s, sequence).unwrap_or(false))
-            .map(|(n, _)| n.to_string())
-    };
-    // the glycan of this expression system that holds the tree, or the system whose glycans do
-    let typical = holding(suggestions, &corrected.sequence);
-    let elsewhere = if typical.is_some() || !n_linked {
-        None
-    } else {
-        N_GLYCAN_SUGGESTIONS
-            .iter()
-            .filter(|(h, _)| !h.is_empty() && *h != host)
-            .find_map(|(h, list)| holding(list, &corrected.sequence).map(|n| (h.to_string(), n)))
+            .find(|(_, s)| holds(s, sequence) && holds(sequence, s))
+            .map(|(n, _)| (n.to_string(), true))
+            .or_else(|| {
+                list.iter()
+                    .find(|(_, s)| holds(s, sequence))
+                    .map(|(n, _)| (n.to_string(), false))
+            })
     };
     let mut protein = structure.clone();
     protein.remove_residues(&deposited.residue_ids());
@@ -703,6 +700,24 @@ fn fit_site(
     models.push_str("ENDMDL\nEND\n");
     std::fs::create_dir_all(dir)?;
     std::fs::write(dir.join(format!("{name}.pdb")), models)?;
+    // the glycan of this expression system that holds the model, or the system whose glycans do
+    let named = holding(suggestions, &sequence);
+    let elsewhere = if named.is_some() || !n_linked {
+        None
+    } else {
+        N_GLYCAN_SUGGESTIONS
+            .iter()
+            .filter(|(h, _)| !h.is_empty() && *h != host)
+            .find_map(|(h, list)| {
+                holding(list, &sequence).map(|(n, whole)| (h.to_string(), n, whole))
+            })
+    };
+    let whole_glycan = named
+        .as_ref()
+        .map(|n| n.1)
+        .or(elsewhere.as_ref().map(|e| e.2));
+    let typical = named.map(|n| n.0);
+    let elsewhere = elsewhere.map(|(h, n, _)| (h, n));
     let glycan = typical.clone().unwrap_or_else(|| "deposited".to_string());
     let weak: Vec<&str> = residues
         .iter()
@@ -717,7 +732,7 @@ fn fit_site(
         "corrections": corrected.changed,
         "deposit_errors": deposit_errors,
         "fit_errors": fit_errors,
-        "typical": typical, "elsewhere": elsewhere,
+        "typical": typical, "elsewhere": elsewhere, "whole_glycan": whole_glycan,
         "added": added,
         "residues": residues,
         "deposited_supported": count(&["deposited", "corrected"], "supported"),
