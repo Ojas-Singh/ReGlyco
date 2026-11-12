@@ -51,7 +51,7 @@ use reglyco_glycoflow::known::{
     CHAIR_TOLERANCE, GeometryError, KnownAtoms, hybrid, pose_from_atoms,
 };
 use reglyco_glycoflow::output::{PlacedGlycan, glycan_pdb};
-use reglyco_glycoflow::problem::{V3, dihedral};
+use reglyco_glycoflow::problem::{SiteProblem, V3, dihedral};
 use reglyco_glycoflow::sidechain::{AsnSideChain, asn_side_chains};
 use reglyco_glycoflow::site::{DepositedGlycan, deposited_glycan, sequence_paths};
 use reglyco_glycoflow::workflow::{
@@ -104,6 +104,19 @@ impl Assessed {
             .cloned()
             .collect()
     }
+}
+
+/// Share of its density a residue may lose to the growth of the glycan before the growth is refused.
+const DENSITY_LOSS: f64 = 0.2;
+
+/// Whether a residue that is in density in `before` has lost more than [`DENSITY_LOSS`] of it in `after`.
+fn loses_density(before: &BTreeMap<String, f64>, after: &BTreeMap<String, f64>) -> bool {
+    before.iter().any(|(path, &level)| {
+        level >= DENSITY_GATE
+            && after
+                .get(path)
+                .is_some_and(|&now| now < (1.0 - DENSITY_LOSS) * level)
+    })
 }
 
 fn residue_paths(fit: &SiteFit) -> BTreeSet<String> {
@@ -219,6 +232,81 @@ fn distance(a: V3, b: V3) -> f64 {
 fn atom_at(structure: &Structure, residue: &ResidueId, name: &str) -> Option<V3> {
     let p = structure.atom_position(structure.find_atom(residue, name)?)?;
     Some([p.x, p.y, p.z])
+}
+
+/// Width in degrees of the bins GlycoFlow's samples of a torsion are counted in.
+const TORSION_BIN: f64 = 10.0;
+
+/// The torsions of the glycosidic linkages (phi, psi and the omega of a 1-6 linkage) in the model
+/// and in the deposit, against what GlycoFlow generates for the glycan: the angle, its percentile
+/// (the share of GlycoFlow's samples that are less likely than it) and the samples themselves,
+/// counted in bins of `TORSION_BIN` degrees from -180.
+fn linkage_torsions(p: &SiteProblem, deposit: &[Option<V3>], x: &[V3]) -> Vec<Value> {
+    let Some(prior) = p.prior.as_ref() else {
+        return Vec::new();
+    };
+    let paths = &p.glycan.res_paths;
+    let quads = &p.glycan.topology.quads;
+    let mut neighbours = vec![Vec::new(); p.n_atoms];
+    for &[a, b] in &p.glycan.bonds {
+        neighbours[a].push(b);
+        neighbours[b].push(a);
+    }
+    let parent_of: BTreeMap<&str, &str> = quads
+        .iter()
+        .filter(|q| paths[q[1]] != paths[q[2]])
+        .map(|q| (paths[q[2]].as_str(), paths[q[1]].as_str()))
+        .collect();
+    let bridging = |i: usize| {
+        p.glycan.elements[i] == "O" && neighbours[i].iter().any(|&j| paths[j] != paths[i])
+    };
+    // the residue a torsion carries, when it is one of its linkage to the parent
+    let linkage = |t: usize| -> Option<(&'static str, &str)> {
+        let [_, b, c, _] = quads[t];
+        if paths[b] != paths[c] {
+            return Some(("phi", paths[c].as_str()));
+        }
+        let child = p.glycan.topology.distal[t]
+            .iter()
+            .map(|&i| paths[i].as_str())
+            .find(|r| parent_of.get(r) == Some(&paths[c].as_str()))?;
+        Some((if bridging(c) { "psi" } else { "omega" }, child))
+    };
+    let fit: Vec<f64> = quads
+        .iter()
+        .map(|q| dihedral(x[q[0]], x[q[1]], x[q[2]], x[q[3]]))
+        .collect();
+    let dep: Vec<Option<f64>> = quads
+        .iter()
+        .map(|q| Some(dihedral(deposit[q[0]]?, deposit[q[1]]?, deposit[q[2]]?, deposit[q[3]]?)))
+        .collect();
+    let fit_pct = prior.percentiles(&fit);
+    let dep_pct = prior.percentiles(&dep.iter().map(|v| v.unwrap_or(0.0)).collect::<Vec<_>>());
+    let heavy = p.heavy_torsions();
+    let bins = (360.0 / TORSION_BIN) as usize;
+    (0..quads.len())
+        .filter(|&t| heavy[t])
+        .filter_map(|t| {
+            let (kind, child) = linkage(t)?;
+            if child == "agl" || paths[quads[t][1]] == "agl" {
+                return None;
+            }
+            let mut counts = vec![0u32; bins];
+            for s in 0..prior.n_samples {
+                let deg = prior.samples[s * prior.n_torsions + t].to_degrees();
+                let bin = ((deg + 180.0).rem_euclid(360.0) / TORSION_BIN) as usize;
+                counts[bin.min(bins - 1)] += 1;
+            }
+            Some(json!({
+                "kind": kind, "path": child,
+                "atoms": quads[t].iter().map(|&i| p.glycan.atom_names[i].as_str()).collect::<Vec<_>>(),
+                "fit": fit[t].to_degrees(), "fit_percentile": fit_pct[t],
+                "deposit": dep[t].map(f64::to_degrees),
+                "deposit_percentile": dep[t].map(|_| dep_pct[t]),
+                "samples": counts,
+            }))
+        })
+        .collect()
 }
 
 /// Grid of the side-chain torsions of a rebuilt asparagine (degrees).
@@ -343,6 +431,9 @@ fn fit_site(
     // a chair set where the deposit has a boat is held between its neighbours: with the wider default
     // the ring settles half-way, twisted, so the rings are held to their chair more tightly here
     options.fit.restraints.sd_ring = 5.0;
+    // a model that leaves the known positions has to explain the map at least as well as they do:
+    // a pose the map likes less is not taken for its conformation alone
+    options.fit.known_guard = 0.0;
     // experiments: restraint width, Cartesian steps and the margin of the known positions
     let number = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
     if let Some(s) = number("PDBWIDE_SD") {
@@ -632,6 +723,7 @@ fn fit_site(
             let [bond_rmsd, one_three_rmsd] = geometry(&c.x);
             json!({
                 "loglik": c.terms.loglik, "objective": c.terms.total,
+                "prior": c.terms.e_prior,
                 "bond_rmsd": bond_rmsd, "one_three_rmsd": one_three_rmsd,
                 "clash": c.terms.e_env + c.terms.e_self,
             })
@@ -782,9 +874,11 @@ fn fit_site(
         let (g_fit, g_assessed) = fitter.fit(&grown, Some(known))?;
         fits += 1;
         // an added residue needs its own support and that of the residue it is linked to, and
-        // the layer is refused when a residue the map supported loses its support to it
+        // the layer is refused when a residue the map supported loses its support to it, or a
+        // residue in density a good part of its density
         let g_supported = g_assessed.supported();
-        let costs = !built.is_subset(&g_supported);
+        let costs = !built.is_subset(&g_supported)
+            || loses_density(&assessed.density, &g_assessed.density);
         let accepted: Vec<String> = frontier
             .iter()
             .map(|(p, _)| p.clone())
@@ -826,8 +920,9 @@ fn fit_site(
         let (k_fit, k_assessed) = fitter.fit(&kept, Some(known))?;
         fits += 1;
         let k_supported = k_assessed.supported();
-        let holds =
-            built.is_subset(&k_supported) && accepted.iter().all(|p| k_supported.contains(p));
+        let holds = built.is_subset(&k_supported)
+            && accepted.iter().all(|p| k_supported.contains(p))
+            && !loses_density(&assessed.density, &k_assessed.density);
         let mut record = stage_record(
             "refit of the accepted residues",
             &kept,
@@ -1019,6 +1114,17 @@ fn fit_site(
         .filter(|r| r["verdict"] == "weak")
         .filter_map(|r| r["path"].as_str())
         .collect();
+    // the linkage torsions of the final model and of the deposit against GlycoFlow's own
+    let torsions = linkage_torsions(
+        &fit.problem,
+        &KnownAtoms {
+            atoms: deposited_atoms.clone(),
+            rigid: BTreeSet::new(),
+        }
+        .on(&fit.problem)
+        .x,
+        &best.x,
+    );
     let summary = json!({
         "recipe": "v2",
         "deposited": deposited_sequence,
@@ -1037,6 +1143,7 @@ fn fit_site(
         "deposited_unsupported": count(&["deposited", "corrected"], "unsupported"),
         "added_supported": count(&["added"], "supported"),
         "comparison": comparison,
+        "torsions": torsions,
         "built": supported, "weak": weak,
         "density_fraction": assessed.density,
         "root_gain": assessed.gate.root_gain,
