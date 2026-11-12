@@ -33,6 +33,13 @@
 //!
 //! Output: `results.jsonl` (one line per site), and per site `<entry>/<name>.json` (the summary,
 //! the `site_report` of the final fit, every stage) and `<entry>/<name>.pdb` (the glycan alone).
+//!
+//! `PDBWIDE_FINAL=1` (same arguments) scores final models in place of fitting: a site with a row of
+//! the first pass and a `<entry>/<name>.final.json` beside its files ([`Final`]: its glycan as a
+//! later stage left it, such as the refinement against the diffraction data) gets a line in
+//! `final.jsonl`, `<entry>/<name>.final.pdb` and `<entry>/<name>.final.report.json`, in the format
+//! of the first pass: its decisions, and the numbers of the final coordinates. No search, no
+//! refinement; the files of the first pass are left as they are.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, Write};
@@ -43,7 +50,9 @@ use std::time::Instant;
 use glycoflow_core::model::Precision;
 use glysys::{BuildOptions, ResidueId, Structure, Vec3, read_pdb};
 use reglyco_density::DensityMap;
-use reglyco_glycoflow::cartesian::{Restraints, cartesian_refine};
+use reglyco_glycoflow::cartesian::{
+    DataWeight, Restraints, cartesian_refine, cartesian_refine_weighted,
+};
 use reglyco_glycoflow::ensemble::EnsembleOptions;
 use reglyco_glycoflow::evaluation::recovery;
 use reglyco_glycoflow::infer::{
@@ -54,13 +63,14 @@ use reglyco_glycoflow::infer::{
 use reglyco_glycoflow::known::{
     CHAIR_TOLERANCE, GeometryError, KnownAtoms, hybrid, pose_from_atoms,
 };
-use reglyco_glycoflow::output::{PlacedGlycan, glycan_pdb};
+use reglyco_glycoflow::output::{PlacedGlycan, ResidueNaming, glycan_pdb};
 use reglyco_glycoflow::problem::{SiteProblem, V3, dihedral};
 use reglyco_glycoflow::sidechain::{AsnSideChain, asn_side_chains};
-use reglyco_glycoflow::site::{DepositedGlycan, deposited_glycan, sequence_paths};
+use reglyco_glycoflow::site::{DepositedGlycan, atom_rename, deposited_glycan, sequence_paths};
 use reglyco_glycoflow::workflow::{
-    SiteFit, SiteRequest, extend_one, extension_report, fit_one, site_report,
+    SiteFit, SiteRequest, extend_one, extension_report, fit_one, place_one, site_report,
 };
+use reglyco_glycoflow::pipeline::density_problem;
 use reglyco_glycoflow::{
     ComputeDevice, GlycoflowModel, PriorCache, WorkflowInput, WorkflowOptions,
 };
@@ -216,6 +226,315 @@ impl<'a> Fitter<'a> {
         let assessed = assess(&fit, self.map, &self.options);
         Ok((fit, assessed))
     }
+
+    /// The glycan `sequence` at the atoms of a final model: no search and no refinement.
+    fn place(&self, sequence: &str, model: &Final) -> Result<(SiteFit, Assessed), Error> {
+        let input = self.input(None);
+        let request = SiteRequest {
+            residue: self.residue.clone(),
+            sequence: Some(sequence.to_string()),
+        };
+        let atoms = KnownAtoms {
+            atoms: model.atoms.clone(),
+            rigid: BTreeSet::new(),
+        };
+        let torsions = model.torsions.as_deref();
+        let fit = place_one(&input, &request, self.protein, &atoms, torsions)?;
+        let assessed = assess(&fit, self.map, &self.options);
+        Ok((fit, assessed))
+    }
+}
+
+/// Chain, number and insertion code of the residue of a HETATM record, and its atom name.
+fn record_atom(line: &str) -> Option<((String, i32, Option<char>), &str)> {
+    let insertion = line.get(26..27)?.chars().next().filter(|c| *c != ' ');
+    let residue = (
+        line.get(21..22)?.to_string(),
+        line.get(22..26)?.trim().parse().ok()?,
+        insertion,
+    );
+    Some((residue, line.get(12..16)?.trim()))
+}
+
+/// The final model of a site, made of its fit by a later stage (the refinement against the
+/// diffraction data, which also chooses between the fit and the deposit): `<name>.final.json`
+/// beside the files of the first pass,
+/// `{"choice", "residues": [{"path", "ccd", "atoms": [[name, x, y, z, B], ...]}], "asn", "xray"}`,
+/// with the heavy atoms of every residue of the fitted model under their PDB names and, in `asn`,
+/// CG, OD1 and ND2 of the asparagine where they are not the deposited ones. With `PDBWIDE_FINAL`
+/// the runner scores this model in place of fitting one.
+struct Final {
+    /// the stage's own record
+    sidecar: Value,
+    /// the result of the first pass, and its report
+    first: Value,
+    report: Value,
+    /// the atoms by tree path and GLYCAM name, and the model of the first pass likewise
+    atoms: BTreeMap<(String, String), V3>,
+    engine: BTreeMap<(String, String), V3>,
+    /// B-factors by tree path and PDB atom name
+    b: BTreeMap<(String, String), f64>,
+    /// residue names by tree path
+    ccd: BTreeMap<String, String>,
+    /// the side chain of the asparagine, when it is not the deposited one
+    asn: Option<[(&'static str, V3); 3]>,
+    /// the torsions no heavy atom determines, as the first pass had them
+    torsions: Option<Vec<f64>>,
+}
+
+impl Final {
+    fn read(dir: &Path, name: &str, first: &Value) -> Result<Self, Error> {
+        let read = |file: String| -> Result<String, Error> {
+            std::fs::read_to_string(dir.join(&file)).map_err(|e| format!("{file}: {e}").into())
+        };
+        let sidecar: Value = serde_json::from_str(&read(format!("{name}.final.json"))?)?;
+        let report: Value = serde_json::from_str(&read(format!("{name}.json"))?)?;
+        let glycam = |ccd: &str, pdb: &str| {
+            let renamed = atom_rename(ccd).iter().find(|(p, _)| *p == pdb);
+            renamed.map_or(pdb, |(_, g)| *g).to_string()
+        };
+        let point = |v: &Value| -> Option<V3> {
+            Some([
+                v.get(0)?.as_f64()?,
+                v.get(1)?.as_f64()?,
+                v.get(2)?.as_f64()?,
+            ])
+        };
+        let (mut atoms, mut b, mut ccd) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let residues = sidecar["residues"].as_array();
+        for r in residues.ok_or("final model without residues")? {
+            let (Some(path), Some(name)) = (r["path"].as_str(), r["ccd"].as_str()) else {
+                return Err("final model: residue without path or ccd".into());
+            };
+            ccd.insert(path.to_string(), name.to_string());
+            for a in r["atoms"].as_array().into_iter().flatten() {
+                let (Some(atom), Some(x), Some(y), Some(z)) =
+                    (a[0].as_str(), a[1].as_f64(), a[2].as_f64(), a[3].as_f64())
+                else {
+                    return Err(format!("final model: atom of {path} unreadable").into());
+                };
+                atoms.insert((path.to_string(), glycam(name, atom)), [x, y, z]);
+                if let Some(v) = a[4].as_f64() {
+                    b.insert((path.to_string(), atom.to_string()), v);
+                }
+            }
+        }
+        // the model of the first pass, from its file and the residue names of its report
+        let mut naming = BTreeMap::new();
+        for n in report["fit"]["naming"].as_array().into_iter().flatten() {
+            let insertion = n["insertion_code"].as_str().and_then(|s| s.chars().next());
+            let (Some(chain), Some(number), Some(path), Some(name)) = (
+                n["chain"].as_str(),
+                n["number"].as_i64(),
+                n["path"].as_str(),
+                n["ccd"].as_str(),
+            ) else {
+                return Err("report of the first pass: residue names unreadable".into());
+            };
+            naming.insert((chain.to_string(), number as i32, insertion), (path, name));
+        }
+        let mut engine = BTreeMap::new();
+        for line in read(format!("{name}.pdb"))?.lines() {
+            if line.starts_with("ENDMDL") {
+                break;
+            }
+            if !line.starts_with("HETATM") {
+                continue;
+            }
+            let coordinate = |k: usize| line.get(k..k + 8)?.trim().parse::<f64>().ok();
+            let (Some((residue, atom)), Some(x), Some(y), Some(z)) = (
+                record_atom(line),
+                coordinate(30),
+                coordinate(38),
+                coordinate(46),
+            ) else {
+                return Err("model of the first pass: record unreadable".into());
+            };
+            let (path, name) = naming
+                .get(&residue)
+                .ok_or("model of the first pass: residue not in its report")?;
+            engine.insert((path.to_string(), glycam(name, atom)), [x, y, z]);
+        }
+        // the side chain of the asparagine: the final model's; without one, the one its glycan
+        // was fitted on (the rebuilt one under the fit, the deposited one under the deposit)
+        let rebuilt = &first["asn"]["atoms"];
+        let side = match (&sidecar["asn"], sidecar["choice"].as_str()) {
+            (Value::Null, Some("deposit")) => &Value::Null,
+            (Value::Null, _) => rebuilt,
+            (given, _) => given,
+        };
+        let asn = match side {
+            Value::Null => None,
+            s => Some(["CG", "OD1", "ND2"].map(|k| (k, point(&s[k])))),
+        };
+        let asn = match asn {
+            Some(a) if a.iter().any(|(_, x)| x.is_none()) => {
+                return Err("final model: asparagine without CG, OD1 and ND2".into());
+            }
+            Some(a) => Some(a.map(|(k, x)| (k, x.unwrap_or_default()))),
+            None => None,
+        };
+        let torsions = report["fit"]["best"]["torsions_rad"]
+            .as_array()
+            .map(|t| t.iter().filter_map(Value::as_f64).collect());
+        Ok(Self {
+            sidecar,
+            first: first.clone(),
+            report,
+            atoms,
+            engine,
+            b,
+            ccd,
+            asn,
+            torsions,
+        })
+    }
+
+    /// The strings of a list of the first pass's result.
+    fn list(&self, key: &str) -> Vec<String> {
+        let items = self.first[key].as_array().into_iter().flatten();
+        items
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// The model of the first pass on the atoms of `p`.
+    fn engine_on(&self, p: &SiteProblem) -> Vec<Option<V3>> {
+        KnownAtoms {
+            atoms: self.engine.clone(),
+            rigid: BTreeSet::new(),
+        }
+        .on(p)
+        .x
+    }
+
+    /// The result of a rescored site from that of the final model (`summary`, made as a fit's):
+    /// the decisions of the first pass, the numbers of the final coordinates. `asn` is the first
+    /// pass's record with the final side chain, `scored` what only this pass knows.
+    fn summary(&self, mut summary: Value, asn: Value, scored: Value) -> Value {
+        let first = &self.first;
+        summary["recipe"] = json!("v2.1");
+        for k in [
+            "added",
+            "replaced",
+            "built",
+            "weak",
+            "deposited_supported",
+            "deposited_weak",
+            "deposited_unsupported",
+            "added_supported",
+            "clusters",
+            "fits",
+            "fit_seconds",
+        ] {
+            summary[k] = first[k].clone();
+        }
+        summary["asn"] = asn;
+        let same = |a: &Value, b: &Value, keys: &[&str]| keys.iter().all(|k| a[*k] == b[*k]);
+        let of_first = |list: &str, item: &Value, keys: &[&str]| {
+            let items = first[list].as_array().into_iter().flatten();
+            items.into_iter().find(|f| same(f, item, keys)).cloned()
+        };
+        for r in summary["residues"].as_array_mut().into_iter().flatten() {
+            if let Some(f) = of_first("residues", r, &["path"]) {
+                for k in ["origin", "verdict", "statistical", "density_deposit"] {
+                    r[k] = f[k].clone();
+                }
+            }
+        }
+        for t in summary["torsions"].as_array_mut().into_iter().flatten() {
+            if let Some(f) = of_first("torsions", t, &["kind", "path", "atoms"]) {
+                for k in ["deposit", "deposit_percentile", "samples"] {
+                    t[k] = f[k].clone();
+                }
+            }
+        }
+        // the errors of the deposit are the first pass's, with the measure on the final model
+        let mut errors = first["deposit_errors"].clone();
+        for e in errors.as_array_mut().into_iter().flatten() {
+            if matches!(e["kind"].as_str(), Some("acetyl" | "ring" | "link")) {
+                let now = summary["deposit_errors"].as_array().into_iter().flatten();
+                e["fit"] = now
+                    .into_iter()
+                    .find(|n| same(n, e, &["path", "kind"]))
+                    .map_or(Value::Null, |n| n["fit"].clone());
+            }
+        }
+        summary["deposit_errors"] = errors;
+        summary["xray"] = self.sidecar["xray"].clone();
+        summary["final"] = scored;
+        summary
+    }
+
+    /// The records of the model with the B-factors of the final model (an atom without one: the
+    /// mean of its residue).
+    fn with_b(&self, records: &str, naming: &[ResidueNaming]) -> String {
+        let path_of: BTreeMap<(String, i32, Option<char>), &str> = naming
+            .iter()
+            .map(|n| {
+                (
+                    (n.chain.clone(), n.number, n.insertion_code),
+                    n.path.as_str(),
+                )
+            })
+            .collect();
+        let mean = |path: &str| {
+            let b: Vec<f64> = self
+                .b
+                .iter()
+                .filter(|(k, _)| k.0 == path)
+                .map(|(_, b)| *b)
+                .collect();
+            (!b.is_empty()).then(|| b.iter().sum::<f64>() / b.len() as f64)
+        };
+        let mut out = String::new();
+        for line in records.lines() {
+            let b = record_atom(line)
+                .filter(|_| line.starts_with("HETATM") && line.len() >= 66)
+                .and_then(|(residue, atom)| {
+                    let path = *path_of.get(&residue)?;
+                    let own = self.b.get(&(path.to_string(), atom.to_string())).copied();
+                    own.or_else(|| mean(path))
+                });
+            match b {
+                Some(b) => out.push_str(&format!("{}{b:>6.2}{}\n", &line[..60], &line[66..])),
+                None => out.push_str(&format!("{line}\n")),
+            }
+        }
+        out
+    }
+
+    /// The report of a rescored site from that of the final model: the stages and the search of
+    /// the first pass around it.
+    fn report(&self, report: &mut Value, stage: Value) {
+        let first = &self.report;
+        let mut stages = first["stages"].clone();
+        if let Some(s) = stages.as_array_mut() {
+            s.push(stage);
+        }
+        report["stages"] = stages;
+        if first["extend"]["ensemble"].is_null() {
+            report["extend"]["weak"] = first["extend"]["weak"].clone();
+        } else {
+            report["extend"] = first["extend"].clone();
+        }
+        for k in [
+            "basins",
+            "support",
+            "supported_residues",
+            "unsupported_residues",
+            "free_torsions",
+            "alternatives",
+            "completions",
+            "maxent",
+        ] {
+            report["fit"][k] = first["fit"][k].clone();
+        }
+        let deviation = report["fit"]["costs"]["prior_deviation"].take();
+        report["fit"]["costs"] = first["fit"]["costs"].clone();
+        report["fit"]["costs"]["prior_deviation"] = deviation;
+        report["fit"]["best"]["basin"] = Value::Null;
+    }
 }
 
 fn stage_record(label: &str, sequence: &str, fit: &SiteFit, a: &Assessed, seconds: f64) -> Value {
@@ -224,6 +543,7 @@ fn stage_record(label: &str, sequence: &str, fit: &SiteFit, a: &Assessed, second
         "stage": label, "sequence": sequence, "seconds": seconds,
         "objective": best.terms.total, "loglik": best.terms.loglik, "restraint": best.e_restraint,
         "from_known": best.from_known, "basins": fit.outcome.basins.len(),
+        "data_weight": best.data_weight,
         "statistical": a.statistical, "supported": a.supported(),
         "density": a.density, "root_gain": a.gate.root_gain,
     })
@@ -388,14 +708,14 @@ fn trials(all: &[(f64, AsnSideChain)]) -> Vec<(f64, AsnSideChain)> {
     taken
 }
 
-/// The protein with the side chain of the asparagine at `s`.
+/// The protein with atoms of the side chain of the asparagine at `atoms`.
 fn with_side_chain(
     protein: &Structure,
     residue: &ResidueId,
-    s: &AsnSideChain,
+    atoms: &[(&str, V3)],
 ) -> Result<Structure, Error> {
     let mut rebuilt = protein.clone();
-    for (name, x) in s.atoms() {
+    for &(name, x) in atoms {
         let id = rebuilt
             .find_atom(residue, name)
             .ok_or("asparagine without its side chain")?;
@@ -409,14 +729,21 @@ fn with_side_chain(
     Ok(rebuilt)
 }
 
-/// Refit one site; the summary line, and the files written under `dir`.
+/// The largest weight on the map in the final refinement of a cryo-EM site.
+const CRYO_EM_DATA_WEIGHT: f64 = 32.0;
+
+/// Refit one site; the summary line, and the files written under `dir`. With `rescore`, that
+/// final model takes the place of the fits (steps 2 to 5), and the files are its own.
+#[allow(clippy::too_many_arguments)]
 fn fit_site(
     model: &GlycoflowModel,
+    method: &str,
     site: &Value,
     dir: &Path,
     seed: u64,
     members: usize,
     priors: &PriorCache,
+    rescore: Option<&Final>,
 ) -> Result<Value, Error> {
     let field = |k: &str| site[k].as_str().ok_or(format!("site has no {k}"));
     let (name, pdb) = (field("name")?, field("pdb")?);
@@ -428,6 +755,8 @@ fn fit_site(
     let structure = read_pdb(pdb, &build)?;
     let text = std::fs::read_to_string(pdb).ok();
     let map = DensityMap::open(field("map")?)?;
+    // a map the fit does not see (the other half map, say), for the weight probe to score in
+    let map2 = site["map2"].as_str().map(DensityMap::open).transpose()?;
     let residue = residue_id(field("site")?)?;
     let mut options = WorkflowOptions::default();
     options.fit.seed = seed;
@@ -462,6 +791,27 @@ fn fit_site(
     }
     if let Some(s) = number("PDBWIDE_SHARE") {
         options.fit.known_share = s;
+    }
+    // the selected model is refined once more with the map weighted up, on the residues the map shows.
+    // For a cryo-EM map this holds up in the half map the fit did not see; against a crystal's map, whose
+    // phases come from the model, it fits noise (R-free rises), so those sites keep weight 1 here and get
+    // their final refinement against the diffraction data. PDBWIDE_DW overrides (1 switches it off).
+    let default_weight = (method == "cryo-EM").then_some(CRYO_EM_DATA_WEIGHT);
+    if let Some(max) = number("PDBWIDE_DW").or(default_weight).filter(|&w| w > 1.0) {
+        let mut weight = DataWeight::up_to(max);
+        if let Some(s) = number("PDBWIDE_DW_STEPS") {
+            weight.steps = s as usize;
+        }
+        if let Some(s) = number("PDBWIDE_DW_BOND") {
+            weight.bond_rmsd = s;
+        }
+        if let Some(s) = number("PDBWIDE_DW_ANGLE") {
+            weight.one_three_rmsd = s;
+        }
+        if let Some(s) = number("PDBWIDE_DW_RING") {
+            weight.ring_rmsd = s;
+        }
+        options.fit.data_weight = Some(weight);
     }
     let deposited = deposited_glycan(&structure, &residue)?.ok_or("no deposited glycan")?;
     let deposited_sequence = deposited.glycam_sequence()?;
@@ -511,7 +861,10 @@ fn fit_site(
     protein.remove_residues(&deposited.residue_ids());
     // the same with the side chain of the asparagine rebuilt (step 3)
     let rebuilt_protein: Structure;
+    // or with the side chain of a final model (rescore)
+    let final_protein: Structure;
     let refine = (options.fit.cartesian_lr, options.fit.restraints.clone());
+    let problem_options = options.problem.clone();
     let mut fitter = Fitter {
         structure: &structure,
         text: text.as_deref(),
@@ -521,6 +874,10 @@ fn fit_site(
         residue: residue.clone(),
         options,
     };
+    if let Some(side) = rescore.and_then(|r| r.asn.as_ref()) {
+        final_protein = with_side_chain(&protein, &residue, side)?;
+        fitter = fitter.moved(&final_protein, side);
+    }
     // 2. the deposit's own glycan, also from its atoms; a residue with a corrected anomer only
     // takes its place from them, and so does one with a distorted ring; a cis N-acetyl group is
     // left out
@@ -556,7 +913,10 @@ fn fit_site(
     }
     .without(&errors);
     let t0 = Instant::now();
-    let (mut fit, mut assessed) = fitter.fit(&corrected.sequence, Some(known))?;
+    let (mut fit, mut assessed) = match rescore {
+        None => fitter.fit(&corrected.sequence, Some(known))?,
+        Some(r) => fitter.place(&corrected.sequence, r)?,
+    };
     let mut fits = 1;
     let mut sequence = corrected.sequence.clone();
     let deposit_paths = residue_paths(&fit);
@@ -581,7 +941,7 @@ fn fit_site(
         let x0 = hybrid(p, &p.place(&pose), &start);
         let (lr, restraints) = (refine.0, &refine.1);
         let d = cartesian_refine(p, &x0, pose.template, 0, lr, restraints);
-        let f = cartesian_refine(p, &best.x, best.pose.template, 0, lr, restraints);
+        let f = cartesian_refine(p, &best.x, best.template, 0, lr, restraints);
         if std::env::var("PDBWIDE_BASINS").is_ok() {
             let rmsd = |x: &[V3]| {
                 let (mut s, mut n) = (0.0, 0usize);
@@ -603,6 +963,75 @@ fn fit_site(
                 d.terms.e_self,
                 d.e_restraint
             );
+            // the selected basin and the lowest from the deposit under a rising weight of the map
+            if std::env::var("PDBWIDE_PROBE").is_ok() {
+                // the log-likelihood of a model in the unseen map
+                let unseen = map2.as_ref().and_then(|m| {
+                    density_problem(&fit.site, model, m, fit.sigma.selected, fit.resolution, &problem_options).ok()
+                });
+                let held_out = |x: &[V3]| match &unseen {
+                    Some(q) => format!(" unseen {:.2}", q.placed_terms(x, 0.0, None).0.loglik),
+                    None => String::new(),
+                };
+                if unseen.is_some() {
+                    eprintln!("  deposit{}", held_out(&d.x));
+                }
+                let known = fit
+                    .outcome
+                    .order
+                    .iter()
+                    .copied()
+                    .find(|&i| fit.outcome.basins[i].from_known);
+                for k in [Some(fit.outcome.best), known].into_iter().flatten() {
+                    let b = &fit.outcome.basins[k];
+                    let r = Restraints::new(p, b.template, restraints);
+                    eprintln!(
+                        "  probe basin #{k} (weight {}): loglik {:8.2} prior {:6.2} restraint {:7.2} rmsd {:.2}{}",
+                        b.data_weight, b.terms.loglik, b.terms.e_prior, b.e_restraint, rmsd(&b.x), held_out(&b.x)
+                    );
+                    // PDBWIDE_PROBE_OUT=<dir>: the model of every weight, for cross-validation
+                    let dump = |w: f64, x: &[V3]| -> Result<(), Error> {
+                        let Ok(dir) = std::env::var("PDBWIDE_PROBE_OUT") else {
+                            return Ok(());
+                        };
+                        let text = glycan_pdb(&[PlacedGlycan {
+                            problem: p,
+                            site: &fit.site,
+                            naming: &fit.naming,
+                            x,
+                        }])?;
+                        std::fs::create_dir_all(&dir)?;
+                        let tag = if k == fit.outcome.best { "selected" } else { "known" };
+                        std::fs::write(format!("{dir}/{name}.{tag}.w{w}.pdb"), text)?;
+                        Ok(())
+                    };
+                    dump(0.0, &b.x).expect("probe model");
+                    let mut x = b.x.clone();
+                    for w in [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0] {
+                        let c = cartesian_refine_weighted(p, &x, b.template, 600, lr, restraints, w, None, None);
+                        dump(w, &c.x).expect("probe model");
+                        eprintln!(
+                            "    x{w:<3}: loglik {:8.2} prior {:6.2} att {:5.2} contact {:.4} restraint {:7.1} bonds {:.4} 1-3 {:.4} ring {:4.1} rmsd {:.2}{}",
+                            c.terms.loglik,
+                            c.terms.e_prior,
+                            c.terms.e_att,
+                            p.worst_contact(&c.x),
+                            c.e_restraint,
+                            c.bond_rmsd,
+                            c.one_three_rmsd,
+                            r.ring_rmsd(&c.x),
+                            rmsd(&c.x),
+                            held_out(&c.x)
+                        );
+                        if w > 1.0 {
+                            x = c.x;
+                        }
+                    }
+                    if known == Some(fit.outcome.best) {
+                        break;
+                    }
+                }
+            }
             // what the restraints still hold against in the lowest basin from the deposit
             if let Some(&k) = fit
                 .outcome
@@ -737,6 +1166,8 @@ fn fit_site(
             "deposit": side(&d), "fit": side(&f), "density_deposit": density,
             "density_fit": assessed.density,
             "from_deposit": best.from_known,
+            "data_weight": best.data_weight,
+            "ring_rmsd": Restraints::new(p, best.template, restraints).ring_rmsd(&best.x),
             "psi_n_deposit": pose.psi.to_degrees(),
             "matched_atoms": start.x.iter().filter(|x| x.is_some()).count(),
             "rmsd": away.full_rmsd,
@@ -745,12 +1176,32 @@ fn fit_site(
         })
     };
     let mut comparison = compare(&fit, &assessed);
+    // rescore: the deposit's side of the comparison is the first pass's; how far the deposit's
+    // log-likelihood is from it here tells whether this is the same map and the same objective
+    let mut deposit_drift = None;
+    if let Some(r) = rescore {
+        let was = &r.first["comparison"];
+        let loglik = |c: &Value| c["deposit"]["loglik"].as_f64();
+        deposit_drift = loglik(&comparison)
+            .zip(loglik(was))
+            .map(|(now, was)| now - was);
+        for k in [
+            "deposit",
+            "density_deposit",
+            "from_deposit",
+            "data_weight",
+            "psi_n_deposit",
+            "matched_atoms",
+        ] {
+            comparison[k] = was[k].clone();
+        }
+    }
     // 3. a cis amide the fit could not turn on the deposited side chain: the side chain rebuilt
     // under the glycan, kept when the link is then trans, the glycan stays in its pose and the
     // map holds the glycan and the side chain as well as before
     let psi_of = |fit: &SiteFit| fit.outcome.basins[fit.outcome.best].pose.psi.to_degrees();
     let mut asn = Value::Null;
-    if n_linked && psi_of(&fit).abs() < 90.0 {
+    if rescore.is_none() && n_linked && psi_of(&fit).abs() < 90.0 {
         let reach = number("PDBWIDE_ASN_REACH").unwrap_or(2.5);
         let at = |name: &str| atom_at(&structure, &residue, name);
         let old = [at("CG"), at("OD1"), at("ND2")];
@@ -771,7 +1222,7 @@ fn fit_site(
                 break;
             };
             let t = Instant::now();
-            let rebuilt = with_side_chain(&protein, &residue, &side)?;
+            let rebuilt = with_side_chain(&protein, &residue, &side.atoms())?;
             let x = &fit.outcome.basins[fit.outcome.best].x;
             let known = KnownAtoms::of_fit(&fit.problem, x, None);
             let (r_fit, r_assessed) = fitter
@@ -859,7 +1310,7 @@ fn fit_site(
         .cloned()
         .collect();
     let held: BTreeSet<String> = deposit_paths.difference(&free).cloned().collect();
-    if !free.is_empty() && held.contains("r") {
+    if rescore.is_none() && !free.is_empty() && held.contains("r") {
         let x = &fit.outcome.basins[fit.outcome.best].x;
         let known = KnownAtoms::of_fit(&fit.problem, x, Some(&held));
         let t = Instant::now();
@@ -906,7 +1357,7 @@ fn fit_site(
     let mut tried: BTreeSet<(String, String)> = BTreeSet::new();
     let mut added: Vec<String> = Vec::new();
     let limit = fits + MAX_FITS - 1;
-    while fits < limit {
+    while rescore.is_none() && fits < limit {
         let built = assessed.supported();
         let mut next = None;
         for (glycan, s) in suggestions {
@@ -1002,6 +1453,43 @@ fn fit_site(
             (fit, assessed, sequence) = (k_fit, k_assessed, kept);
         }
     }
+    // rescore: the final model on the tree of the first pass, with its residue names
+    let mut missing_atoms = 0;
+    if let Some(r) = rescore {
+        let grown = r.first["sequence"]
+            .as_str()
+            .ok_or("first pass without a sequence")?;
+        if grown != sequence {
+            (fit, assessed) = fitter.place(grown, r)?;
+            sequence = grown.to_string();
+        }
+        if json!(fit.naming) != r.report["fit"]["naming"] {
+            return Err("final model: not the residues of the first pass".into());
+        }
+        let p = &fit.problem;
+        let given = KnownAtoms {
+            atoms: r.atoms.clone(),
+            rigid: BTreeSet::new(),
+        }
+        .on(p)
+        .x;
+        for n in &fit.naming {
+            if r.ccd.get(&n.path) != Some(&n.ccd) {
+                return Err(format!("final model: {} is not {}", n.path, n.ccd).into());
+            }
+            let atoms = |known: bool| {
+                (0..p.n_atoms)
+                    .filter(|&i| p.keep[i] && p.glycan.res_paths[i] == n.path)
+                    .filter(|&i| given[i].is_some() == known)
+                    .count()
+            };
+            // fewer atoms do not place a residue (`known::hybrid`)
+            if atoms(true) < 4 {
+                return Err(format!("final model: {} has {} atoms", n.path, atoms(true)).into());
+            }
+            missing_atoms += atoms(false);
+        }
+    }
     let fit_seconds = t0.elapsed().as_secs_f64();
     // the model: every deposited residue, and the added ones
     let best = &fit.outcome.basins[fit.outcome.best];
@@ -1016,7 +1504,11 @@ fn fit_site(
         .chain(corrected.relinked.iter().map(|c| c.1.as_str()))
         .collect();
     let away = from_deposit(&fit, &best.x);
-    let supported = assessed.supported();
+    // rescore: the residues the first pass built
+    let supported: BTreeSet<String> = match rescore {
+        Some(r) => r.list("built").into_iter().collect(),
+        None => assessed.supported(),
+    };
     // errors of the deposited geometry, with the same measure on the model
     let model_atoms = KnownAtoms::of_fit(&fit.problem, &best.x, None);
     let mut deposit_errors: Vec<Value> = errors
@@ -1122,7 +1614,7 @@ fn fit_site(
             .count()
     };
     let input = fitter.input(None);
-    let extension = if members > 0 {
+    let extension = if members > 0 && rescore.is_none() {
         Some(extend_one(
             &input,
             &fit,
@@ -1153,7 +1645,13 @@ fn fit_site(
     );
     models.push_str("ENDMDL\nEND\n");
     std::fs::create_dir_all(dir)?;
-    std::fs::write(dir.join(format!("{name}.pdb")), models)?;
+    match rescore {
+        Some(r) => {
+            let models = r.with_b(&models, &fit.naming);
+            std::fs::write(dir.join(format!("{name}.final.pdb")), models)?
+        }
+        None => std::fs::write(dir.join(format!("{name}.pdb")), models)?,
+    }
     // the glycan of this expression system that holds the model, or the system whose glycans do
     let named = holding(suggestions, &sequence);
     let elsewhere = if named.is_some() || !n_linked {
@@ -1189,7 +1687,7 @@ fn fit_site(
         .x,
         &best.x,
     );
-    let summary = json!({
+    let mut summary = json!({
         "recipe": "v2",
         "deposited": deposited_sequence,
         "deposited_residues": deposit_paths.len(),
@@ -1228,12 +1726,100 @@ fn fit_site(
             "ensemble": null,
         }),
     };
-    let report = json!({
+    // rescore: the decisions of the first pass around the numbers of the final model
+    if let Some(r) = rescore {
+        let mut asn = r.first["asn"].clone();
+        if let Some(side) = &r.asn {
+            let [cg, od1, nd2] = side.map(|(_, x)| x);
+            let at = |name: &str| atom_at(&structure, &residue, name);
+            let chi = match (at("N"), at("CA"), at("CB")) {
+                (Some(n), Some(ca), Some(cb)) => Some([
+                    dihedral(n, ca, cb, cg).to_degrees(),
+                    dihedral(ca, cb, cg, od1).to_degrees(),
+                ]),
+                _ => None,
+            };
+            let levels = assessed.levels.as_ref();
+            asn["chi"] = json!(chi);
+            asn["psi"] = json!(psi);
+            asn["loglik"] = json!(best.terms.loglik);
+            asn["level"] = json!(levels.and_then(|l| l.fraction(&map, &[cg, od1, nd2])));
+            asn["shift"] = json!(at("ND2").map(|x| distance(x, nd2)));
+            asn["atoms"] = json!({"CG": cg, "OD1": od1, "ND2": nd2});
+            asn["rebuilt"] = true.into();
+        } else if asn["rebuilt"] == true {
+            // the side chain is the deposited one again: as a site whose rebuild was not accepted
+            let tried = asn["tried"].as_array().cloned().unwrap_or_default();
+            let mut back = json!({"rebuilt": false, "reverted": true, "tried": tried});
+            for k in [
+                "candidates",
+                "chi_deposit",
+                "level_deposit_side_chain",
+                "loglik_deposit_side_chain",
+                "psi_deposit_side_chain",
+            ] {
+                back[k] = asn[k].clone();
+            }
+            back["first_pass"] = asn;
+            asn = back;
+        }
+        // how far the final model is from the first pass's, residue by residue
+        let p = &fit.problem;
+        let mut apart: BTreeMap<&str, (f64, usize)> = BTreeMap::new();
+        for (i, e) in r.engine_on(p).iter().enumerate() {
+            if let Some(e) = e {
+                let sum = apart.entry(p.glycan.res_paths[i].as_str()).or_default();
+                sum.0 += distance(*e, best.x[i]).powi(2);
+                sum.1 += 1;
+            }
+        }
+        let rms = |(sum, n): (f64, usize)| (sum / n.max(1) as f64).sqrt();
+        let all = apart.values().fold((0.0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        let per_residue: BTreeMap<&str, f64> = apart.iter().map(|(k, v)| (*k, rms(*v))).collect();
+        let scored = json!({
+            "choice": r.sidecar["choice"],
+            "engine": {
+                "objective": r.first["objective"], "loglik": r.first["loglik"],
+                "rmsd": rms(all), "per_residue_rmsd": per_residue,
+            },
+            "built": assessed.supported(), "statistical": assessed.statistical,
+            "asn_moved": r.asn.is_some(),
+            "missing_atoms": missing_atoms,
+            "deposit_loglik_drift": deposit_drift,
+        });
+        summary = r.summary(summary, asn, scored);
+    }
+    let mut report = json!({
         "name": name, "summary": summary, "stages": stages,
         "fit": site_report(&fit, &input), "extend": extend,
     });
-    std::fs::write(dir.join(format!("{name}.json")), report.to_string())?;
+    let file = match rescore {
+        Some(r) => {
+            let seconds = t0.elapsed().as_secs_f64();
+            let stage = stage_record("final model", &sequence, &fit, &assessed, seconds);
+            r.report(&mut report, stage);
+            format!("{name}.final.report.json")
+        }
+        None => format!("{name}.json"),
+    };
+    std::fs::write(dir.join(file), report.to_string())?;
     Ok(summary)
+}
+
+/// The lines of the files of `dir` named `<stem>*.jsonl`.
+fn lines_of(dir: &Path, stem: &str) -> Result<Vec<Value>, Error> {
+    let mut rows = Vec::new();
+    for file in std::fs::read_dir(dir)? {
+        let file = file?;
+        let name = file.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with(stem) && name.ends_with(".jsonl")) {
+            continue;
+        }
+        for line in std::fs::read_to_string(file.path())?.lines() {
+            rows.extend(serde_json::from_str::<Value>(line).ok());
+        }
+    }
+    Ok(rows)
 }
 
 fn main() -> Result<(), Error> {
@@ -1258,12 +1844,28 @@ fn main() -> Result<(), Error> {
     let out = Path::new(&a[3]);
     std::fs::create_dir_all(out)?;
     // one results file per shard, so shards can run side by side
+    // PDBWIDE_FINAL: score the final models of the sites that have one ([`Final`]), into final.jsonl
+    let rescore = std::env::var("PDBWIDE_FINAL").is_ok_and(|v| v != "0" && !v.is_empty());
+    let stem = if rescore { "final" } else { "results" };
     let results = out.join(if shards > 1 {
-        format!("results.{shard}.jsonl")
+        format!("{stem}.{shard}.jsonl")
     } else {
-        "results.jsonl".to_string()
+        format!("{stem}.jsonl")
     });
     let mut done = HashSet::new();
+    // the rows of the first pass by site; a final model is scored once, whatever the shard
+    let mut first: BTreeMap<String, Value> = BTreeMap::new();
+    if rescore {
+        for row in lines_of(out, "results")? {
+            if let (Some(name), "ok") = (row["name"].as_str(), row["status"].as_str().unwrap_or(""))
+            {
+                first.insert(name.to_string(), row.clone());
+            }
+        }
+        for row in lines_of(out, "final")? {
+            done.extend(row["name"].as_str().map(str::to_string));
+        }
+    }
     if let Ok(f) = std::fs::File::open(&results) {
         for line in std::io::BufReader::new(f).lines() {
             if let Ok(v) = serde_json::from_str::<Value>(&line?) {
@@ -1287,6 +1889,7 @@ fn main() -> Result<(), Error> {
             continue;
         }
         let id = entry["entry"].as_str().unwrap_or("unknown");
+        let method = entry["method"].as_str().unwrap_or("");
         for site in entry["sites"].as_array().into_iter().flatten() {
             let Some(name) = site["name"].as_str() else {
                 continue;
@@ -1298,19 +1901,40 @@ fn main() -> Result<(), Error> {
             if only.as_ref().is_some_and(|o| !o.contains(name)) {
                 continue;
             }
+            let dir = out.join(id);
+            let was = first.get(name);
+            if rescore && (was.is_none() || !dir.join(format!("{name}.final.json")).exists()) {
+                continue;
+            }
             let t = Instant::now();
             let outcome = catch_unwind(AssertUnwindSafe(|| {
-                fit_site(&model, site, &out.join(id), seed, members, &priors)
-                    .map_err(|e| e.to_string())
+                let model_of = |row: &Value| Final::read(&dir, name, &row["result"]);
+                let rescore = was.map(model_of).transpose()?;
+                fit_site(
+                    &model,
+                    method,
+                    site,
+                    &dir,
+                    seed,
+                    members,
+                    &priors,
+                    rescore.as_ref(),
+                )
             }))
-            .unwrap_or_else(|_| Err("panic".to_string()));
+            .unwrap_or_else(|_| Err("panic".into()))
+            .map_err(|e| e.to_string());
             let mut row = json!({
                 "name": name, "entry": id, "method": entry["method"], "site": site["site"],
                 "host_class": site["host_class"], "seconds": t.elapsed().as_secs_f64(),
             });
             match outcome {
-                Ok(summary) => {
+                Ok(mut summary) => {
                     fitted += 1;
+                    // a rescored site keeps the time of its fit
+                    if let Some(was) = was {
+                        summary["final"]["seconds"] = row["seconds"].clone();
+                        row["seconds"] = was["seconds"].clone();
+                    }
                     row["status"] = "ok".into();
                     row["result"] = summary;
                 }

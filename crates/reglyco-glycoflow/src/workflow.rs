@@ -12,6 +12,7 @@ use reglyco_validate::{
 };
 use serde_json::{Value, json};
 
+use crate::cartesian::cartesian_refine;
 use crate::error::{Result, invalid, write_file};
 use crate::evaluation::{Recovery, recovery};
 use crate::model::GlycoflowModel;
@@ -20,11 +21,12 @@ use crate::output::{
     residue_naming,
 };
 use crate::pipeline::{
-    FitConfig, FitOutcome, PriorConfig, SigmaCalibration, build_prior, calibrate_sigma,
-    density_problem, fit_site, reselect,
+    Basin, FitConfig, FitOutcome, PriorConfig, SigmaCalibration, build_prior, calibrate_sigma,
+    density_problem, fit_site, prior_deviation, reselect,
 };
 use crate::problem::{Pose, ProblemOptions, SiteProblem, V3};
 use crate::site::{CrystalInput, Site, SiteOptions, deposited_glycan, load_site};
+use crate::support::{subtree_support, unsupported_torsions};
 use crate::symmetry::{UnitCell, parse_cryst1, parse_resolution};
 
 /// One site to fit.
@@ -128,15 +130,20 @@ pub fn crystal_input(text: Option<&str>, map: &DensityMap) -> CrystalInput {
     }
 }
 
-/// Fit one site.
-/// Alternatives tried when the selected pose fails validation (`fit_one`).
-pub const VALID_ALTERNATIVES: usize = 5;
+/// A site ready for a fit: its problem with the prior set, and the sampler of its glycan.
+struct Prepared<'m> {
+    site: Site,
+    problem: SiteProblem,
+    sampler: Sampler<'m>,
+    sigma: SigmaCalibration,
+    sigma_source: String,
+    resolution: f64,
+    preparation_seconds: f64,
+    prior_seconds: f64,
+    prior_network_evaluations: usize,
+}
 
-pub fn fit_one(
-    input: &WorkflowInput,
-    request: &SiteRequest,
-    protein: &Structure,
-) -> Result<SiteFit> {
+fn prepare<'m>(input: &WorkflowInput<'m>, request: &SiteRequest) -> Result<Prepared<'m>> {
     let options = &input.options;
     let t0 = Instant::now();
     let crystal = crystal_input(input.structure_text, input.map);
@@ -183,6 +190,40 @@ pub fn fit_one(
         prior_network_evaluations = options.prior.n_samples * options.prior.steps;
     }
     let prior_seconds = t1.elapsed().as_secs_f64();
+    Ok(Prepared {
+        site,
+        problem,
+        sampler,
+        sigma,
+        sigma_source,
+        resolution,
+        preparation_seconds,
+        prior_seconds,
+        prior_network_evaluations,
+    })
+}
+
+/// Fit one site.
+/// Alternatives tried when the selected pose fails validation (`fit_one`).
+pub const VALID_ALTERNATIVES: usize = 5;
+
+pub fn fit_one(
+    input: &WorkflowInput,
+    request: &SiteRequest,
+    protein: &Structure,
+) -> Result<SiteFit> {
+    let options = &input.options;
+    let Prepared {
+        site,
+        mut problem,
+        sampler,
+        sigma,
+        sigma_source,
+        resolution,
+        preparation_seconds,
+        prior_seconds,
+        prior_network_evaluations,
+    } = prepare(input, request)?;
     let mut fit_config = options.fit.clone();
     if options.seed_deposit {
         if let Some(dep) = site.deposited.as_ref() {
@@ -285,6 +326,122 @@ pub fn fit_one(
     };
     Ok(SiteFit {
         maxent,
+        site,
+        problem,
+        outcome,
+        naming,
+        sigma,
+        sigma_source,
+        resolution,
+        recovery,
+        preparation_seconds,
+        prior_seconds,
+        prior_network_evaluations,
+    })
+}
+
+/// One site with its glycan at given atom positions (`atoms`: the heavy atoms of every residue,
+/// such as a model refined elsewhere): no search and no refinement. The result reads as a fit with
+/// one basin, scored by the objective that ranks the basins of [`fit_one`], so everything computed
+/// from a fit (support, report, comparisons) describes these coordinates. Atoms without a position
+/// (hydrogens) follow their residue; `torsions` gives the torsions no position determines
+/// (hydroxyl rotamers; default 180 degrees).
+pub fn place_one(
+    input: &WorkflowInput,
+    request: &SiteRequest,
+    protein: &Structure,
+    atoms: &crate::known::KnownAtoms,
+    torsions: Option<&[f64]>,
+) -> Result<SiteFit> {
+    let config = &input.options.fit;
+    let Prepared {
+        site,
+        mut problem,
+        sampler: _,
+        sigma,
+        sigma_source,
+        resolution,
+        preparation_seconds,
+        prior_seconds,
+        prior_network_evaluations,
+    } = prepare(input, request)?;
+    let t0 = Instant::now();
+    // the contact weight `fit_site` leaves on the problem
+    let weight = if config.cartesian_steps > 0 {
+        config.cartesian_clash_weight
+    } else {
+        config
+            .final_clash_weight
+            .unwrap_or(config.search_clash_weight)
+    };
+    problem.w_env = weight;
+    problem.w_self = weight;
+    let start = atoms.on(&problem);
+    let fallback = Pose {
+        tau: match torsions {
+            Some(t) if t.len() == problem.n_torsions => t.to_vec(),
+            _ => vec![std::f64::consts::PI; problem.n_torsions],
+        },
+        psi: problem.link_torsion.start(),
+        phi: 0.0,
+        template: 0,
+    };
+    let pose = crate::known::pose_from_atoms(&problem, |i| start.x[i], &fallback);
+    let x = crate::known::hybrid(&problem, &problem.place(&pose), &start);
+    let placed = cartesian_refine(
+        &problem,
+        &x,
+        pose.template,
+        0,
+        config.cartesian_lr,
+        &config.restraints,
+    );
+    let mut measured = crate::known::pose_from_atoms(&problem, |i| Some(placed.x[i]), &pose);
+    measured.psi = placed.psi;
+    let support = subtree_support(
+        &problem,
+        &placed.x,
+        config.support_base,
+        config.support_per_torsion,
+    );
+    let outcome = FitOutcome {
+        free_torsions: unsupported_torsions(&problem, &support),
+        support,
+        prior_deviation: prior_deviation(&problem, &placed.x),
+        basins: vec![Basin {
+            pose: measured,
+            x: placed.x,
+            terms: placed.terms,
+            unrefined: placed.total,
+            e_restraint: placed.e_restraint,
+            from_known: true,
+            objective: placed.total,
+            data_weight: 1.0,
+            template: pose.template,
+        }],
+        order: vec![0],
+        best: 0,
+        completions: Vec::new(),
+        alternatives: vec![0],
+        counters: problem.counter.snapshot(),
+        wall_seconds: t0.elapsed().as_secs_f64(),
+        final_contact_weight: weight,
+    };
+    let naming = residue_naming(&problem, &site, protein)?;
+    let recovery = site.deposited.as_ref().map(|dep| {
+        let claimed: Vec<String> = std::iter::once("r".to_string())
+            .chain(
+                outcome
+                    .support
+                    .iter()
+                    .filter(|s| s.supported)
+                    .map(|s| s.residue.clone()),
+            )
+            .collect();
+        recovery(&problem, dep, &outcome.basins[0].x, &claimed)
+    });
+    Ok(SiteFit {
+        maxent: None,
         site,
         problem,
         outcome,

@@ -18,8 +18,8 @@ use reglyco_density::site_likelihood::{
 };
 
 use crate::cartesian::{
-    CartesianFit, RestraintOptions, Restraints, cartesian_refine, cartesian_refine_all,
-    cartesian_refine_traced,
+    CartesianFit, DataWeight, RestraintOptions, Restraints, cartesian_refine,
+    cartesian_refine_all, cartesian_refine_traced, refine_weighted_up,
 };
 use crate::counter::CounterSnapshot;
 use crate::error::{Result, invalid};
@@ -31,7 +31,8 @@ use crate::problem::{Pose, ProblemOptions, SiteProblem, Terms, V3, build_glycan,
 use crate::search::{method_b, refine, sample_free};
 use crate::site::Site;
 use crate::support::{
-    Completion, SubtreeSupport, complete_from_prior, subtree_support, unsupported_torsions,
+    Completion, SubtreeSupport, complete_from_prior, subtree_support, supported_atoms,
+    unsupported_torsions,
 };
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -84,6 +85,9 @@ pub struct FitConfig {
     pub cartesian_lr: f64,
     pub cartesian_clash_weight: f64,
     pub restraints: RestraintOptions,
+    /// final refinement of the selected basin with the map weighted up (`DataWeight`; None: off).
+    /// Basins are ranked and selected at weight 1 as before.
+    pub data_weight: Option<DataWeight>,
     /// escalate the contact weight in torsion space too (re-ranking every basin under it)
     pub torsion_escalation: bool,
     pub cartesian_escalation: Escalation,
@@ -172,6 +176,7 @@ impl Default for FitConfig {
             cartesian_lr: 0.005,
             cartesian_clash_weight: 100.0,
             restraints: RestraintOptions::default(),
+            data_weight: None,
             torsion_escalation: false,
             cartesian_escalation: Escalation::Selected,
             pre_refine: 0,
@@ -452,6 +457,14 @@ pub struct Basin {
     pub e_restraint: f64,
     /// refined from known atom positions (`FitConfig::coordinate_start`), not from a search pose
     pub from_known: bool,
+    /// terms.total + e_restraint when the basins were ranked: the final refinement of the
+    /// selected basin (`FitConfig::data_weight`) changes its terms, not its rank
+    pub objective: f64,
+    /// weight of the map in that final refinement (1: not refined further)
+    pub data_weight: f64,
+    /// the pucker template its restraints take their rings from (a pose measured on known
+    /// positions may name another)
+    pub template: usize,
 }
 
 pub struct FitOutcome {
@@ -923,7 +936,7 @@ pub fn fit_site(
     if let Some(o) = observer {
         o.stage("support+complete");
     }
-    let basins: Vec<Basin> = match cartesian {
+    let mut basins: Vec<Basin> = match cartesian {
         Some(fits) => {
             energies = fits.iter().map(|f| f.total).collect();
             poses
@@ -933,6 +946,7 @@ pub fn fit_site(
                 .enumerate()
                 .map(|(k, ((mut pose, fit), &unrefined))| {
                     pose.psi = fit.psi;
+                    let template = pose.template;
                     // a basin refined from known positions: the pose is measured on it
                     if k >= n_search {
                         pose = pose_from_atoms(problem, |i| Some(fit.x[i]), &pose);
@@ -944,6 +958,9 @@ pub fn fit_site(
                         unrefined,
                         e_restraint: fit.e_restraint,
                         from_known: k >= n_search,
+                        objective: fit.total,
+                        data_weight: 1.0,
+                        template,
                     }
                 })
                 .collect()
@@ -958,12 +975,15 @@ pub fn fit_site(
                 .zip(evaluated)
                 .zip(&unrefined)
                 .map(|((pose, ev), &unrefined)| Basin {
+                    template: pose.template,
                     pose,
                     x: ev.x,
+                    objective: ev.terms.total,
                     terms: ev.terms,
                     unrefined,
                     e_restraint: 0.0,
                     from_known: false,
+                    data_weight: 1.0,
                 })
                 .collect()
         }
@@ -976,7 +996,7 @@ pub fn fit_site(
     order.sort_by(|&a, &b| energies[a].total_cmp(&energies[b]));
     // known positions stay the model when the map cannot tell them from the lowest basin
     let lowest = order[0];
-    let best = order
+    let mut best = order
         .iter()
         .copied()
         .find(|&i| basins[i].from_known)
@@ -985,6 +1005,17 @@ pub fn fit_site(
             keeps_known(config, energies[i] - energies[lowest], known, other)
         })
         .unwrap_or(lowest);
+    // the final refinement of both; the known positions come back when the map then tells for
+    // them: at the weight of the search a model on them gives up density for its geometry
+    let known = order.iter().copied().find(|&i| basins[i].from_known);
+    if let Some(k) = known.filter(|&k| k != best && config.data_weight.is_some()) {
+        weigh_up(problem, config, &mut basins[best], best);
+        weigh_up(problem, config, &mut basins[k], k);
+        let (known, other) = (basins[k].terms.loglik, basins[best].terms.loglik);
+        if map_tells_for_known(config, known, other) {
+            best = k;
+        }
+    }
     let mut outcome = FitOutcome {
         basins,
         order,
@@ -1021,6 +1052,42 @@ pub(crate) fn map_tells_for_known(config: &FitConfig, known: f64, other: f64) ->
     known - other > config.known_guard || (known > 0.0 && other < config.known_share * known)
 }
 
+/// The final refinement of a basin with the map weighted up (`FitConfig::data_weight`), once.
+fn weigh_up(problem: &SiteProblem, config: &FitConfig, basin: &mut Basin, index: usize) {
+    let Some(weight) = config
+        .data_weight
+        .filter(|_| config.cartesian_steps > 0 && basin.data_weight == 1.0)
+    else {
+        return;
+    };
+    let weighted = supported_atoms(
+        problem,
+        &basin.x,
+        config.support_base,
+        config.support_per_torsion,
+    );
+    if let Some((fit, w)) = refine_weighted_up(
+        problem,
+        &basin.x,
+        basin.template,
+        config.cartesian_lr,
+        &config.restraints,
+        &weight,
+        &weighted,
+        config.contact_tolerance,
+        Some(index),
+    ) {
+        basin.pose.psi = fit.psi;
+        if basin.from_known {
+            basin.pose = pose_from_atoms(problem, |i| Some(fit.x[i]), &basin.pose);
+        }
+        basin.x = fit.x;
+        basin.terms = fit.terms;
+        basin.e_restraint = fit.e_restraint;
+        basin.data_weight = w;
+    }
+}
+
 /// Make basin `best` the selected one: its support, prior completions, prior deviation and the
 /// alternatives within `alt_margin` of it (`fit_site` calls this for the lowest-objective basin;
 /// the workflow again when that one fails validation and an alternative passes).
@@ -1031,6 +1098,7 @@ pub fn reselect(
     outcome: &mut FitOutcome,
     best: usize,
 ) -> Result<()> {
+    weigh_up(problem, config, &mut outcome.basins[best], best);
     let basins = &outcome.basins;
     let support = subtree_support(
         problem,
@@ -1053,7 +1121,7 @@ pub fn reselect(
     } else {
         Vec::new()
     };
-    let energy = |i: usize| basins[i].terms.total + basins[i].e_restraint;
+    let energy = |i: usize| basins[i].objective;
     let alternatives = outcome
         .order
         .iter()

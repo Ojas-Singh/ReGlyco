@@ -837,7 +837,22 @@ impl SiteProblem {
 
     /// Terms that depend on the placed coordinates (no prior); `gx` receives d(total)/dx and
     /// the return carries dE_attach/dpsi.
-    pub fn placed_terms(&self, x: &[V3], psi: f64, mut gx: Option<&mut [V3]>) -> (Terms, f64) {
+    pub fn placed_terms(&self, x: &[V3], psi: f64, gx: Option<&mut [V3]>) -> (Terms, f64) {
+        self.placed_terms_weighted(x, psi, gx, 1.0, None)
+    }
+
+    /// `placed_terms` with the gradient of the observation and of the contacts multiplied by
+    /// `data_weight` (the terms are those of weight 1), on the atoms of `weighted` when given.
+    /// The contacts are walls, not knowledge to be weighed against the map, so they keep their
+    /// strength against it.
+    pub fn placed_terms_weighted(
+        &self,
+        x: &[V3],
+        psi: f64,
+        mut gx: Option<&mut [V3]>,
+        data_weight: f64,
+        weighted: Option<&[bool]>,
+    ) -> (Terms, f64) {
         let obs = match gx.as_deref_mut() {
             Some(g) => self
                 .observation
@@ -846,7 +861,15 @@ impl SiteProblem {
                 .observation
                 .evaluate(x, self.score_only.as_deref(), None),
         };
-        self.terms_with(obs, x, psi, gx)
+        let out = self.terms_with(obs, x, psi, gx.as_deref_mut());
+        if let Some(g) = gx.filter(|_| data_weight != 1.0) {
+            g.iter_mut()
+                .enumerate()
+                .filter(|(i, _)| weighted.is_none_or(|w| w[*i]))
+                .flat_map(|(_, v)| v)
+                .for_each(|v| *v *= data_weight);
+        }
+        out
     }
 
     /// `placed_terms` without gradient, given the observation's `rigid_term` of this conformer:

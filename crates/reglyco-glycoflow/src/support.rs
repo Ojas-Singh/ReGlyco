@@ -17,7 +17,10 @@ use glycoflow_core::geometry::{P3, wrap};
 use glycoflow_core::sampler::{Guidance, GuidanceContext, Method, SampleOptions, Sampler};
 use rayon::prelude::*;
 
+use std::collections::BTreeSet;
+
 use crate::error::Result;
+use crate::infer::{tree_gain, tree_torsions};
 use crate::problem::{Pose, SiteProblem, Terms, V3};
 use crate::search::initial_torsions;
 
@@ -120,6 +123,28 @@ pub fn subtree_support(
         }
     }
     out
+}
+
+/// The atoms of the residues the observation supports in `x`: the root against no glycan (the
+/// aglycone goes with it), every other residue by its subtree ([`subtree_support`]).
+pub fn supported_atoms(problem: &SiteProblem, x: &[V3], base: f64, per_torsion: f64) -> Vec<bool> {
+    let root: BTreeSet<String> = ["r".to_string()].into();
+    let root_gain = tree_gain(problem, x, &root);
+    if root_gain <= base + per_torsion * tree_torsions(problem, &root) as f64 {
+        return vec![false; problem.n_atoms];
+    }
+    let supported: BTreeSet<String> = subtree_support(problem, x, base, per_torsion)
+        .into_iter()
+        .filter(|s| s.supported)
+        .map(|s| s.residue)
+        .collect();
+    problem
+        .glycan
+        .res_paths
+        .iter()
+        .take(problem.n_atoms)
+        .map(|p| p == "r" || p == "agl" || supported.contains(p))
+        .collect()
 }
 
 /// Torsions whose rotation moves atoms of `atoms` only (`support.torsions_moving_only`).

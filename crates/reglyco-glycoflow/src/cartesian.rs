@@ -80,6 +80,8 @@ pub struct Restraints {
     /// (the four atoms, target in radians, weight): the ring torsions of the template, which
     /// hold the shape of every ring, and the torsions of every amide, which hold it planar
     pub torsions: Vec<([usize; 4], f64, f64)>,
+    /// how many of `torsions` are ring torsions (the first ones)
+    pub rings: usize,
     /// attachment angle: |A1 - C1| held at the linkage geometry (A1 = CG for Asn, CB for Ser/Thr)
     pub attachment: (usize, V3, f64, f64),
 }
@@ -158,6 +160,7 @@ impl Restraints {
         let amides = ideal.amide_torsions.iter().map(|&(q, t)| (q, t, w_amide));
         let torsions = rings.chain(amides).collect();
         Self {
+            rings: ideal.ring_torsions.len(),
             pairs,
             chiral,
             w_volume: 1.0 / options.sd_volume.powi(2),
@@ -348,6 +351,18 @@ impl Restraints {
             (sa / na.max(1) as f64).sqrt(),
         )
     }
+
+    /// RMS deviation of the ring torsions from the template's (degrees).
+    pub fn ring_rmsd(&self, x: &[V3]) -> f64 {
+        let sum: f64 = self.torsions[..self.rings]
+            .iter()
+            .map(|&(q, t0, _)| {
+                let t = dihedral(x[q[0]], x[q[1]], x[q[2]], x[q[3]]) - t0;
+                t.sin().atan2(t.cos()).powi(2)
+            })
+            .sum();
+        (sum / self.rings.max(1) as f64).sqrt().to_degrees()
+    }
 }
 
 /// Bring the pucker templates of a problem to its restraint targets. The templates of the residue
@@ -367,9 +382,8 @@ pub fn regularise_templates(problem: &mut SiteProblem) {
         // not independent and the ideal values are the ones to reach.
         let mut restraints = Restraints::internal(problem, reference, template, &options);
         let held = restraints.relax(template);
-        restraints
-            .torsions
-            .drain(..problem.ideal.ring_torsions.len());
+        restraints.torsions.drain(..restraints.rings);
+        restraints.rings = 0;
         templates.push(restraints.relax(&held));
     }
     problem
@@ -382,12 +396,25 @@ pub fn regularise_templates(problem: &mut SiteProblem) {
 pub fn coordinate_objective(
     problem: &SiteProblem,
     x: &[V3],
+    g: Option<&mut [V3]>,
+) -> (Terms, f64) {
+    coordinate_objective_weighted(problem, x, g, 1.0, None)
+}
+
+/// [`coordinate_objective`] with the gradient of the observation and of the contacts multiplied
+/// by `data_weight` (`SiteProblem::placed_terms_weighted`; the terms are those of weight 1).
+pub fn coordinate_objective_weighted(
+    problem: &SiteProblem,
+    x: &[V3],
     mut g: Option<&mut [V3]>,
+    data_weight: f64,
+    weighted: Option<&[bool]>,
 ) -> (Terms, f64) {
     let [cb, cg, nd] = problem.anchor;
     let c1 = problem.c1;
     let psi = dihedral(cb, cg, nd, x[c1]);
-    let (mut terms, d_att) = problem.placed_terms(x, psi, g.as_deref_mut());
+    let (mut terms, d_att) =
+        problem.placed_terms_weighted(x, psi, g.as_deref_mut(), data_weight, weighted);
     if let Some(g) = g.as_deref_mut() {
         let dg = dihedral_gradient(cb, cg, nd, x[c1]);
         axpy(&mut g[c1], d_att, dg[3]);
@@ -453,6 +480,25 @@ pub fn cartesian_refine_traced(
     options: &RestraintOptions,
     trace: Option<(usize, &str)>,
 ) -> CartesianFit {
+    cartesian_refine_weighted(problem, x0, template, steps, lr, options, 1.0, None, trace)
+}
+
+/// [`cartesian_refine_traced`] with the observation (and the contacts, which keep their
+/// strength against it) weighted by `data_weight` against the restraints and the priors while
+/// the coordinates move, on the atoms of `weighted` when given (the others refine at weight 1);
+/// the terms returned are those of weight 1.
+#[allow(clippy::too_many_arguments)]
+pub fn cartesian_refine_weighted(
+    problem: &SiteProblem,
+    x0: &[V3],
+    template: usize,
+    steps: usize,
+    lr: f64,
+    options: &RestraintOptions,
+    data_weight: f64,
+    weighted: Option<&[bool]>,
+    trace: Option<(usize, &str)>,
+) -> CartesianFit {
     let observer = problem.observer.get().zip(trace);
     let r = Restraints::new(problem, template, options);
     let n = problem.n_atoms;
@@ -464,7 +510,8 @@ pub fn cartesian_refine_traced(
     for iteration in 0..steps {
         let x = to_x(&p);
         let mut g = vec![[0.0; 3]; n];
-        let (terms, _) = coordinate_objective(problem, &x, Some(&mut g));
+        let (terms, _) =
+            coordinate_objective_weighted(problem, &x, Some(&mut g), data_weight, weighted);
         let e_restraint = r.energy(&x, Some(&mut g));
         if let Some((o, (basin, pass))) = observer {
             o.cartesian_step(&CartesianStep {
@@ -503,6 +550,112 @@ pub fn cartesian_refine_traced(
         max_shift,
         x,
     }
+}
+
+/// The final refinement of the selected model, with the map weighted up against the restraints
+/// and the priors.
+///
+/// The noise of the likelihood is that of detection: the residual of the whole site about a model
+/// of its environment (unmodelled solvent, the error of the protein model, the inflation measured
+/// on decoys). That is the noise to tell a glycan from none and one pose from another, and far
+/// above the noise of the map at the atoms of a pose already found. Coordinates refined at that
+/// weight keep their ideal geometry more closely than any refinement program holds a model to
+/// it, and leave density unexplained wherever the map resolves atoms. As those programs do, the
+/// weight of the data is therefore raised for as long as the geometry stays within targets.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct DataWeight {
+    /// largest weight tried (the map's resolution sets how far it can be trusted against the
+    /// priors); the weight rises to it by factors of sqrt(2)
+    pub max: f64,
+    /// steps at each weight
+    pub steps: usize,
+    /// targets: RMS deviation of the bonds and of the 1-3 distances (A) and of the ring torsions
+    /// (degrees)
+    pub bond_rmsd: f64,
+    pub one_three_rmsd: f64,
+    pub ring_rmsd: f64,
+}
+
+impl DataWeight {
+    /// The targets of a macromolecular refinement: bonds to 0.01 A and angles to 2 degrees
+    /// (0.03 A between the outer atoms of an angle), rings within the spread of a chair.
+    pub fn up_to(max: f64) -> Self {
+        Self {
+            max,
+            steps: 300,
+            bond_rmsd: 0.010,
+            one_three_rmsd: 0.030,
+            ring_rmsd: 6.0,
+        }
+    }
+}
+
+/// Refine `x0` with the map weighted up (`DataWeight`) on the atoms of `weighted`, by
+/// continuation over rising weights. The weight is for the atoms the map supports: where it
+/// shows nothing, a weighted map is noise to fit, and those atoms stay with the priors.
+/// Returns the model of the largest weight that keeps the geometry targets, clears its contacts
+/// (`contact_tolerance`, as the fit asks of its selected basin; a start that does not clear them
+/// must not get deeper into them) and explains the map at least as well as `x0`, with that
+/// weight; `None` when no weight does.
+#[allow(clippy::too_many_arguments)]
+pub fn refine_weighted_up(
+    problem: &SiteProblem,
+    x0: &[V3],
+    template: usize,
+    lr: f64,
+    options: &RestraintOptions,
+    weight: &DataWeight,
+    weighted: &[bool],
+    contact_tolerance: f64,
+    trace: Option<usize>,
+) -> Option<(CartesianFit, f64)> {
+    if !weighted.iter().any(|w| *w) {
+        return None;
+    }
+    let r = Restraints::new(problem, template, options);
+    let (start, _) = coordinate_objective(problem, x0, None);
+    let contact_limit = contact_tolerance.max(problem.worst_contact(x0));
+    let mut x = x0.to_vec();
+    let mut kept = None;
+    let mut w = 1.0;
+    while w < weight.max {
+        w = (std::f64::consts::SQRT_2 * w).min(weight.max);
+        let pass = format!("data weight x{w:.1}");
+        let fit = cartesian_refine_weighted(
+            problem,
+            &x,
+            template,
+            weight.steps,
+            lr,
+            options,
+            w,
+            Some(weighted),
+            trace.map(|basin| (basin, pass.as_str())),
+        );
+        problem.counter.add_objective_grad(weight.steps);
+        if fit.bond_rmsd > weight.bond_rmsd
+            || fit.one_three_rmsd > weight.one_three_rmsd
+            || r.ring_rmsd(&fit.x) > weight.ring_rmsd
+        {
+            break;
+        }
+        x.clone_from(&fit.x);
+        // a model that starts off its restraints or its priors first gives up density to mend
+        // them, and takes it back at a larger weight; so does one that settles into a contact,
+        // which a larger weight pushes it out of (the contacts grow with the weight)
+        if fit.terms.loglik >= start.loglik && problem.worst_contact(&fit.x) <= contact_limit {
+            kept = Some((fit, w));
+        }
+    }
+    kept.map(|(mut fit, w): (CartesianFit, f64)| {
+        fit.max_shift = fit
+            .x
+            .iter()
+            .zip(x0)
+            .map(|(a, b)| norm(sub(*a, *b)))
+            .fold(0.0, f64::max);
+        (fit, w)
+    })
 }
 
 /// `cartesian_refine` of every pose, in parallel.
