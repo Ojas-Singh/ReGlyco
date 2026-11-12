@@ -13,15 +13,19 @@
 //! 1. the deposited tree with the core linkages and the anomers of the known N-glycans
 //!    (`infer::corrected_tree`);
 //! 2. a fit of it that also starts at the deposited atoms (`known`), so the model is never worse
-//!    by the objective than the deposit with ideal geometry;
+//!    by the objective than the deposit with ideal geometry; it leaves the deposited pose only for
+//!    one that explains the map at least as well;
 //! 3. a cis amide between the asparagine and the glycan that the fit could not turn: the side
 //!    chain of the asparagine is rebuilt under the glycan (`sidechain`), and kept when the link
 //!    is then trans, the glycan stays in its pose and the map holds the glycan and the side
 //!    chain as well as before;
-//! 4. growth: while the map supports the outermost residues, the next residues of the glycans of
+//! 4. the residues the map does not hold (no residue from them outwards is in density) are placed
+//!    again by GlycoFlow on the residues in density, and that model is taken when its conformation
+//!    is clearly the more usual one and the residues in density keep their density;
+//! 5. growth: while the map supports the outermost residues, the next residues of the glycans of
 //!    the expression system are fitted on top of the model, and those that pass the support test
 //!    and the density gate are added, unless a residue the map supported loses its support to
-//!    them.
+//!    them, or a residue in density more than a fifth of its density.
 //!
 //! Deposited residues stay in the model whatever the map says, each with its verdict (supported:
 //! it passes the support test and the density gate; weak: one of the two; unsupported: neither);
@@ -837,7 +841,67 @@ fn fit_site(
             asn["atoms"] = json!({"CG": side.cg, "OD1": side.od1, "ND2": side.nd2});
         }
     }
-    // 4. growth along the glycans of the expression system, one layer of residues at a time
+    // 4. the residues the map does not hold, placed by GlycoFlow on the ones it does: where the
+    // map is silent the deposited pose is no evidence, so the model takes the conformation the
+    // glycan has there, when that is clearly the more usual one and costs the residues in density
+    // nothing
+    let mut replaced: Vec<String> = Vec::new();
+    let free: BTreeSet<String> = assessed
+        .density
+        .keys()
+        .filter(|path| {
+            let below = format!("{path}/");
+            !assessed
+                .density
+                .iter()
+                .any(|(q, &level)| level >= DENSITY_GATE && (q == *path || q.starts_with(&below)))
+        })
+        .cloned()
+        .collect();
+    let held: BTreeSet<String> = deposit_paths.difference(&free).cloned().collect();
+    if !free.is_empty() && held.contains("r") {
+        let x = &fit.outcome.basins[fit.outcome.best].x;
+        let known = KnownAtoms::of_fit(&fit.problem, x, Some(&held));
+        let t = Instant::now();
+        let (f_fit, f_assessed) = fitter.fit(&sequence, Some(known))?;
+        fits += 1;
+        // clearly the better conformation, and no worse a model on the whole
+        let terms = |fit: &SiteFit| fit.outcome.basins[fit.outcome.best].terms.clone();
+        let (old, new) = (terms(&fit), terms(&f_fit));
+        let taken = new.e_prior < old.e_prior - fitter.options.fit.alt_margin
+            && new.total < old.total
+            && assessed.supported().is_subset(&f_assessed.supported())
+            && !loses_density(&assessed.density, &f_assessed.density);
+        let mut record = stage_record(
+            "residues without density placed by GlycoFlow",
+            &sequence,
+            &f_fit,
+            &f_assessed,
+            t.elapsed().as_secs_f64(),
+        );
+        record["free"] = json!(free);
+        record["prior"] = json!([old.e_prior, new.e_prior]);
+        record["taken"] = json!(taken);
+        stages.push(record);
+        if taken {
+            (fit, assessed) = (f_fit, f_assessed);
+            let c = compare(&fit, &assessed);
+            for k in [
+                "fit",
+                "density_fit",
+                "rmsd",
+                "core_rmsd",
+                "per_residue_rmsd",
+            ] {
+                comparison[k] = c[k].clone();
+            }
+            // the residues in density are where the first fit had them
+            comparison["from_deposit"] =
+                json!(comparison["from_deposit"] == true && c["from_deposit"] == true);
+            replaced = free.into_iter().collect();
+        }
+    }
+    // 5. growth along the glycans of the expression system, one layer of residues at a time
     let mut tree = deposit_paths.clone();
     let mut tried: BTreeSet<(String, String)> = BTreeSet::new();
     let mut added: Vec<String> = Vec::new();
@@ -1137,6 +1201,7 @@ fn fit_site(
         "fit_errors": fit_errors,
         "typical": typical, "elsewhere": elsewhere, "whole_glycan": whole_glycan,
         "added": added,
+        "replaced": replaced,
         "residues": residues,
         "deposited_supported": count(&["deposited", "corrected"], "supported"),
         "deposited_weak": count(&["deposited", "corrected"], "weak"),
