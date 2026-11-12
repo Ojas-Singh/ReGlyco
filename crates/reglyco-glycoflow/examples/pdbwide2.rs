@@ -1688,7 +1688,7 @@ fn fit_site(
         &best.x,
     );
     let mut summary = json!({
-        "recipe": "v2",
+        "recipe": "v2.1",
         "deposited": deposited_sequence,
         "deposited_residues": deposit_paths.len(),
         "glycan": glycan, "sequence": sequence,
