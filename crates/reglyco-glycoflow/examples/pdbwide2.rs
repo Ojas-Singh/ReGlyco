@@ -53,7 +53,7 @@ use reglyco_density::DensityMap;
 use reglyco_glycoflow::cartesian::{
     DataWeight, Restraints, cartesian_refine, cartesian_refine_weighted,
 };
-use reglyco_glycoflow::ensemble::EnsembleOptions;
+use reglyco_glycoflow::ensemble::{EnsembleOptions, superpose};
 use reglyco_glycoflow::evaluation::recovery;
 use reglyco_glycoflow::infer::{
     CoreFault, CorrectedTree, DENSITY_GATE, DensityLevels, Gate, N_GLYCAN_SUGGESTIONS,
@@ -639,6 +639,15 @@ const ASN_STEP: f64 = 10.0;
 const ASN_TRIALS: usize = 2;
 /// Two trials are at least this far apart in chi1 (degrees).
 const ASN_APART: f64 = 60.0;
+/// Standard deviation (degrees) of the link torsion in the refit of a glycan moved under a rebuilt
+/// side chain: the final refinement weights the map up to 32 times, and a link held as loosely as
+/// in the fit itself (10 deg) is then turned back into the density the glycan left.
+const ASN_AMIDE_SD: f64 = 2.0;
+/// Reach (A) of the side chains tried under a glycan that moves, their number and how far apart
+/// in chi1 (degrees) two of them are at least.
+const ASN_REACH_MOVED: f64 = 3.0;
+const ASN_TRIALS_MOVED: usize = 4;
+const ASN_APART_MOVED: f64 = 20.0;
 /// Closest approach of a rebuilt carbon, and of a rebuilt N or O, to the atoms around (A).
 const ASN_CONTACT: [f64; 2] = [3.0, 2.6];
 
@@ -697,15 +706,42 @@ fn side_chains_under(
 }
 
 /// The first of `all`, and the next ones that are another rotamer than those taken.
-fn trials(all: &[(f64, AsnSideChain)]) -> Vec<(f64, AsnSideChain)> {
-    let apart = |a: f64, b: f64| ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs() >= ASN_APART;
+fn trials(all: &[(f64, AsnSideChain)], n: usize, apart: f64) -> Vec<(f64, AsnSideChain)> {
+    let apart = |a: f64, b: f64| ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs() >= apart;
     let mut taken: Vec<(f64, AsnSideChain)> = Vec::new();
     for (d, s) in all {
-        if taken.len() < ASN_TRIALS && taken.iter().all(|(_, t)| apart(t.chi1, s.chi1)) {
+        if taken.len() < n && taken.iter().all(|(_, t)| apart(t.chi1, s.chi1)) {
             taken.push((*d, *s));
         }
     }
     taken
+}
+
+/// A placed glycan moved as a rigid body under a rebuilt side chain: C1 goes to `to`, where a trans
+/// link puts it, and the rotation about it leaves the atoms that count as close as it can to where
+/// they were. A refinement from the fitted coordinates themselves starts with C1 off the link
+/// (the nearest trans link is 1 to 2.5 A from C1 of a cis one) and ends cis again.
+fn moved_under(x: &[V3], keep: &[bool], c1: usize, to: V3) -> Vec<V3> {
+    let sub = |a: V3, b: V3| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let neg = |a: V3| [-a[0], -a[1], -a[2]];
+    // both sets with their mirror images through the pivot: the superposition is then the
+    // rotation about the pivot alone
+    let (mut p, mut q) = (Vec::new(), Vec::new());
+    for i in (0..keep.len()).filter(|&i| keep[i] && i != c1) {
+        let (a, b) = (sub(x[i], x[c1]), sub(x[i], to));
+        p.extend([a, neg(a)]);
+        q.extend([b, neg(b)]);
+    }
+    if p.len() < 6 {
+        return x.iter().map(|v| [0, 1, 2].map(|k| v[k] + to[k] - x[c1][k])).collect();
+    }
+    let (r, _) = superpose(&p, &q);
+    x.iter()
+        .map(|v| {
+            let d = sub(*v, x[c1]);
+            [0, 1, 2].map(|i| r[i][0] * d[0] + r[i][1] * d[1] + r[i][2] * d[2] + to[i])
+        })
+        .collect()
 }
 
 /// The protein with atoms of the side chain of the asparagine at `atoms`.
@@ -1203,6 +1239,13 @@ fn fit_site(
     let mut asn = Value::Null;
     if rescore.is_none() && n_linked && psi_of(&fit).abs() < 90.0 {
         let reach = number("PDBWIDE_ASN_REACH").unwrap_or(2.5);
+        // the glycan moved under each rebuilt side chain before its refit (0: refitted from where it is)
+        let move_glycan = number("PDBWIDE_ASN_MOVE").unwrap_or(1.0) != 0.0;
+        let amide_sd = number("PDBWIDE_ASN_AMIDE_SD").unwrap_or(ASN_AMIDE_SD);
+        let n_moved = number("PDBWIDE_ASN_TRIALS_MOVED").map_or(ASN_TRIALS_MOVED, |n| n as usize);
+        let apart_moved = number("PDBWIDE_ASN_APART_MOVED").unwrap_or(ASN_APART_MOVED);
+        // a trans link also where the residues the map supports pay for it (1; off by default)
+        let force = number("PDBWIDE_ASN_FORCE").is_some_and(|f| f != 0.0);
         let at = |name: &str| atom_at(&structure, &residue, name);
         let old = [at("CG"), at("OD1"), at("ND2")];
         let level = |x: &[V3]| assessed.levels.as_ref().and_then(|l| l.fraction(&map, x));
@@ -1217,45 +1260,105 @@ fn fit_site(
         let all = side_chains_under(&fit, &structure, &residue, reach);
         let mut tried = Vec::new();
         let mut taken = None;
-        for (away, side) in trials(&all) {
-            let Some(old_level) = old_level else {
-                break;
-            };
-            let t = Instant::now();
-            let rebuilt = with_side_chain(&protein, &residue, &side.atoms())?;
-            let x = &fit.outcome.basins[fit.outcome.best].x;
-            let known = KnownAtoms::of_fit(&fit.problem, x, None);
-            let (r_fit, r_assessed) = fitter
-                .moved(&rebuilt, &side.atoms())
-                .fit(&sequence, Some(known))?;
-            fits += 1;
-            let b = &r_fit.outcome.basins[r_fit.outcome.best];
-            let (psi, loglik) = (psi_of(&r_fit), b.terms.loglik);
-            let new_level = level(&[side.cg, side.od1, side.nd2]);
-            let trans = psi.abs() >= 90.0;
-            let holds = loglik >= old_loglik - fitter.options.fit.alt_margin
-                || (old_loglik > 0.0 && loglik >= fitter.options.fit.known_share * old_loglik);
-            let dense = new_level.is_some_and(|l| l >= DENSITY_GATE.min(old_level));
-            // the glycan stays where the fit had it: a refit that leaves for another pose is
-            // not this glycan with its side chain turned
-            let stays = b.from_known;
-            let accepted = trans && holds && dense && stays;
-            tried.push(json!({
-                "chi1": side.chi1, "chi2": side.chi2, "away": away, "psi": psi,
-                "loglik": loglik, "level": new_level, "stays": stays, "accepted": accepted,
-                "seconds": t.elapsed().as_secs_f64(),
-            }));
-            if accepted {
-                stages.push(stage_record(
-                    "asparagine side chain rebuilt",
-                    &sequence,
-                    &r_fit,
-                    &r_assessed,
-                    t.elapsed().as_secs_f64(),
-                ));
-                taken = Some((side, rebuilt, r_fit, r_assessed, new_level));
+        // the best refit with a trans link that costs the residues the map supports nothing
+        let mut valid = None;
+        let all_moved = if move_glycan {
+            side_chains_under(&fit, &structure, &residue, reach.max(ASN_REACH_MOVED))
+        } else {
+            Vec::new()
+        };
+        // first with the glycan where it is; when no such refit is taken, with the glycan moved
+        // under the side chain and the link held trans as stiffly as the map is then weighted
+        for moved in [false, true] {
+            if taken.is_some() || (moved && !move_glycan) {
                 break;
             }
+            let some = if moved {
+                trials(&all_moved, n_moved, apart_moved)
+            } else {
+                trials(&all, ASN_TRIALS, ASN_APART)
+            };
+            for (away, side) in some {
+                let Some(old_level) = old_level else {
+                    break;
+                };
+                let t = Instant::now();
+                let rebuilt = with_side_chain(&protein, &residue, &side.atoms())?;
+                let x = &fit.outcome.basins[fit.outcome.best].x;
+                let under;
+                let mut trial = fitter.moved(&rebuilt, &side.atoms());
+                let x = if moved {
+                    trial.options.problem.amide_sd_deg = amide_sd;
+                    under = moved_under(x, &fit.problem.keep, fit.problem.c1, side.c1);
+                    &under
+                } else {
+                    x
+                };
+                let known = KnownAtoms::of_fit(&fit.problem, x, None);
+                let (r_fit, r_assessed) = trial.fit(&sequence, Some(known))?;
+                fits += 1;
+                let b = &r_fit.outcome.basins[r_fit.outcome.best];
+                let (psi, loglik) = (psi_of(&r_fit), b.terms.loglik);
+                let new_level = level(&[side.cg, side.od1, side.nd2]);
+                let trans = psi.abs() >= 90.0;
+                let holds = loglik >= old_loglik - fitter.options.fit.alt_margin
+                    || (old_loglik > 0.0 && loglik >= fitter.options.fit.known_share * old_loglik);
+                // a side chain the map does not show has no density to keep
+                let dense = new_level.is_some_and(|l| l >= DENSITY_GATE.min(old_level))
+                    || (moved && old_level < DENSITY_GATE);
+                // the glycan stays where the fit had it: a refit that leaves for another pose is
+                // not this glycan with its side chain turned
+                let stays = b.from_known;
+                // or no residue the map holds is the worse for it: where the map does not
+                // decide, the link is trans
+                let kept = moved && assessed.supported().is_subset(&r_assessed.supported());
+                let safe = kept && !loses_density(&assessed.density, &r_assessed.density);
+                let accepted = trans && dense && ((holds && stays) || safe);
+                // the residues the map supports keep their density, the others may lose it
+                let supported = assessed.supported();
+                let held = |d: &BTreeMap<String, f64>| -> BTreeMap<String, f64> {
+                    let of = |(p, l): (&String, &f64)| (p.clone(), *l);
+                    d.iter().filter(|(p, _)| supported.contains(*p)).map(of).collect()
+                };
+                let costs_nothing = trans
+                    && (force
+                        || (kept
+                            && !loses_density(
+                                &held(&assessed.density),
+                                &held(&r_assessed.density),
+                            )));
+                tried.push(json!({
+                    "chi1": side.chi1, "chi2": side.chi2, "away": away, "psi": psi,
+                    "loglik": loglik, "level": new_level, "stays": stays, "holds": holds,
+                    "safe": safe, "moved": moved, "accepted": accepted,
+                    "costs_nothing": costs_nothing, "kept": kept,
+                    "density": r_assessed.density,
+                    "seconds": t.elapsed().as_secs_f64(),
+                }));
+                let options = trial.options.clone();
+                let seconds = t.elapsed().as_secs_f64();
+                let found = (side, rebuilt, r_fit, r_assessed, new_level, options, seconds);
+                if accepted {
+                    taken = Some(found);
+                    break;
+                }
+                if costs_nothing && valid.as_ref().is_none_or(|(l, _)| loglik > *l) {
+                    valid = Some((loglik, found));
+                }
+            }
+        }
+        // where the map does not decide, the chemistry does: no refit was taken on the map's
+        // account, so the one with a trans link that the supported residues do not pay for is
+        let chemistry = taken.is_none() && valid.is_some();
+        let taken = taken.or(valid.map(|(_, found)| found));
+        if let Some((_, _, r_fit, r_assessed, _, _, seconds)) = &taken {
+            stages.push(stage_record(
+                "asparagine side chain rebuilt",
+                &sequence,
+                r_fit,
+                r_assessed,
+                *seconds,
+            ));
         }
         let chi = match (at("N"), at("CA"), at("CB"), old) {
             (Some(n), Some(ca), Some(cb), [Some(cg), Some(od1), _]) => Some([
@@ -1266,12 +1369,14 @@ fn fit_site(
         };
         asn = json!({
             "rebuilt": taken.is_some(), "candidates": all.len(), "tried": tried,
+            "candidates_moved": all_moved.len(), "chemistry": chemistry,
             "chi_deposit": chi, "psi_deposit_side_chain": old_psi,
             "loglik_deposit_side_chain": old_loglik, "level_deposit_side_chain": old_level,
         });
-        if let Some((side, rebuilt, r_fit, r_assessed, new_level)) = taken {
+        if let Some((side, rebuilt, r_fit, r_assessed, new_level, options, _)) = taken {
             rebuilt_protein = rebuilt;
             fitter = fitter.moved(&rebuilt_protein, &side.atoms());
+            fitter.options = options;
             (fit, assessed) = (r_fit, r_assessed);
             let c = compare(&fit, &assessed);
             for k in [
