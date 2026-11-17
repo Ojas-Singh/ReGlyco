@@ -25,7 +25,7 @@ use crate::pipeline::{
     density_problem, fit_site, prior_deviation, reselect,
 };
 use crate::problem::{Pose, ProblemOptions, SiteProblem, V3};
-use crate::site::{CrystalInput, Site, SiteOptions, deposited_glycan, load_site};
+use crate::site::{CrystalInput, Site, SiteOptions, deposited_glycan_with, load_site};
 use crate::support::{subtree_support, unsupported_torsions};
 use crate::symmetry::{UnitCell, parse_cryst1, parse_resolution};
 
@@ -601,7 +601,11 @@ pub fn run(input: &WorkflowInput) -> Result<WorkflowResult> {
     let mut protein = input.structure.clone();
     let mut remove = std::collections::BTreeSet::new();
     for request in &input.sites {
-        if let Some(d) = deposited_glycan(input.structure, &request.residue)? {
+        if let Some(d) = deposited_glycan_with(
+            input.structure,
+            &request.residue,
+            input.options.site.lenient_links,
+        )? {
             remove.extend(d.residue_ids());
         }
     }

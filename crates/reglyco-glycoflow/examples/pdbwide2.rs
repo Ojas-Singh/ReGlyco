@@ -66,7 +66,9 @@ use reglyco_glycoflow::known::{
 use reglyco_glycoflow::output::{PlacedGlycan, ResidueNaming, glycan_pdb};
 use reglyco_glycoflow::problem::{SiteProblem, V3, dihedral};
 use reglyco_glycoflow::sidechain::{AsnSideChain, asn_side_chains};
-use reglyco_glycoflow::site::{DepositedGlycan, atom_rename, deposited_glycan, sequence_paths};
+use reglyco_glycoflow::site::{
+    DepositedGlycan, atom_rename, deposited_glycan_with, sequence_paths,
+};
 use reglyco_glycoflow::workflow::{
     SiteFit, SiteRequest, extend_one, extension_report, fit_one, place_one, site_report,
 };
@@ -849,7 +851,10 @@ fn fit_site(
         }
         options.fit.data_weight = Some(weight);
     }
-    let deposited = deposited_glycan(&structure, &residue)?.ok_or("no deposited glycan")?;
+    // deposits as they are: a stretched link and a second glycan at the link atom are read
+    options.site.lenient_links = true;
+    let deposited =
+        deposited_glycan_with(&structure, &residue, true)?.ok_or("no deposited glycan")?;
     let deposited_sequence = deposited.glycam_sequence()?;
     let site_residue = structure
         .residues()
@@ -878,6 +883,7 @@ fn fit_site(
     let moved_deposit = DepositedGlycan {
         residues: deposited.residues.clone(),
         atoms: deposited_atoms.clone(),
+        duplicates: deposited.duplicates.clone(),
     };
     let from_deposit = |fit: &SiteFit, x: &[V3]| recovery(&fit.problem, &moved_deposit, x, &[]);
     let suggestions = suggestions_for(&site_residue, host);
