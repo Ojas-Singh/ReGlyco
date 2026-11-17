@@ -195,6 +195,27 @@ pub struct DensityMapMetadata {
     pub map_detail: Option<u8>,
 }
 
+/// Whether the only error of a validation is a header mean that differs from the computed one
+/// while both are zero up to rounding (below 1e-9): a difference map has a mean of zero, and the
+/// 1% relative tolerance of the check then compares two rounding errors.
+fn only_zero_mean_mismatch(validation: &mrc::ValidationReport) -> bool {
+    let mut errors = validation
+        .issues
+        .iter()
+        .filter(|issue| issue.severity == mrc::Severity::Error);
+    let (Some(issue), None) = (errors.next(), errors.next()) else {
+        return false;
+    };
+    let Some(rest) = issue.message.strip_prefix("Mismatch: dmean claimed=") else {
+        return false;
+    };
+    let mut values = rest.split(" actual=").map(|v| v.trim().parse::<f64>());
+    matches!(
+        (values.next(), values.next(), values.next()),
+        (Some(Ok(a)), Some(Ok(b)), None) if a.abs() < 1e-9 && b.abs() < 1e-9
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct DensityMap {
     metadata: DensityMapMetadata,
@@ -210,7 +231,7 @@ impl DensityMap {
             .map_err(|error| DensityError::Map(error.to_string()))?;
         let validation = mrc::validate_full(&path, false)
             .map_err(|error| DensityError::Map(error.to_string()))?;
-        if !validation.is_valid() {
+        if !validation.is_valid() && !only_zero_mean_mismatch(&validation) {
             let issues = validation
                 .issues
                 .iter()
