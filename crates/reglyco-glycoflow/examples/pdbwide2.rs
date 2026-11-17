@@ -81,6 +81,9 @@ use serde_json::{Value, json};
 type Error = Box<dyn std::error::Error>;
 
 /// Fits of one site at most (the deposit's, then growth).
+/// The host class (set by the preparation from the taxonomy of the source and of the host) of an
+/// N-glycan that the source organism made itself and that is not a eukaryotic one.
+const OWN_GLYCAN: &str = "own glycan (archaea, bacteria, giant virus)";
 const MAX_FITS: usize = 6;
 
 /// `CHAIN:NUM`, with an insertion code after the number when the residue has one.
@@ -864,8 +867,11 @@ fn fit_site(
         .ok_or("site residue not found")?;
     let host = site["host_class"].as_str().unwrap_or("");
     let n_linked = site_residue == "ASN";
+    // an N-glycan made by an archaeon, a bacterium or a giant virus is not a eukaryotic one: none of
+    // the rules of the eukaryotic core holds for it, so its tree is fitted as deposited and not grown
+    let n_glycan = n_linked && host != OWN_GLYCAN;
     // 1. the deposited tree with the core linkages and the anomers corrected
-    let corrected = if n_linked {
+    let corrected = if n_glycan {
         corrected_tree(&deposited_sequence, host)?
     } else {
         CorrectedTree::unchanged(&deposited_sequence)
@@ -886,7 +892,11 @@ fn fit_site(
         duplicates: deposited.duplicates.clone(),
     };
     let from_deposit = |fit: &SiteFit, x: &[V3]| recovery(&fit.problem, &moved_deposit, x, &[]);
-    let suggestions = suggestions_for(&site_residue, host);
+    let suggestions: &[(&str, &str)] = if n_linked && !n_glycan {
+        &[]
+    } else {
+        suggestions_for(&site_residue, host)
+    };
     // the glycan of a list that is the tree (told by `true`), or the first one that holds it
     let holding = |list: &[(&str, &str)], sequence: &str| {
         let holds = |big: &str, small: &str| contains_tree(big, small).unwrap_or(false);
@@ -1652,7 +1662,7 @@ fn fit_site(
             "deposit": position(from), "fit": position(to),
         }));
     }
-    if n_linked {
+    if n_glycan {
         for (path, fault) in core_faults(&corrected.sequence, host)? {
             let kind = match fault {
                 CoreFault::Linkage => "linkage",
@@ -1765,7 +1775,7 @@ fn fit_site(
     }
     // the glycan of this expression system that holds the model, or the system whose glycans do
     let named = holding(suggestions, &sequence);
-    let elsewhere = if named.is_some() || !n_linked {
+    let elsewhere = if named.is_some() || !n_glycan {
         None
     } else {
         N_GLYCAN_SUGGESTIONS
