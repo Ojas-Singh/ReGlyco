@@ -105,11 +105,19 @@ pub struct DepositedGlycan {
     pub residues: Vec<DepositedResidue>,
     /// (residue path, GLYCAM atom name) -> position (heavy atoms)
     pub atoms: BTreeMap<(String, String), [f64; 3]>,
+    /// residues of other glycans deposited at the same link atom (a second copy or an alternate
+    /// conformer; only found with [`SiteOptions::lenient_links`]): removed with the glycan
+    pub duplicates: Vec<ResidueId>,
 }
 
 impl DepositedGlycan {
+    /// The residues of the glycan and of its duplicates.
     pub fn residue_ids(&self) -> BTreeSet<ResidueId> {
-        self.residues.iter().map(|r| r.id.clone()).collect()
+        self.residues
+            .iter()
+            .map(|r| r.id.clone())
+            .chain(self.duplicates.iter().cloned())
+            .collect()
     }
 
     pub fn by_path(&self, path: &str) -> Option<&DepositedResidue> {
@@ -159,11 +167,17 @@ impl DepositedGlycan {
 
 /// Glycan residues connected to the protein link atom, by distance (anomeric carbon within
 /// `max_bond` of the link atom / a parent ring oxygen), as `site._sugar_tree`.
+///
+/// `lenient` (deposits as they are, for the PDB-wide refit): without a sugar within `max_bond`
+/// of the link atom the nearest one within [`STRETCHED_LINK`] is the root, and of several sugars
+/// bonded to the link atom the nearest is the root and the others, with what they carry, are
+/// returned as duplicates.
 fn sugar_tree(
     structure: &Structure,
     link: [f64; 3],
     max_bond: f64,
-) -> Result<Option<Vec<DepositedResidue>>> {
+    lenient: bool,
+) -> Result<Option<(Vec<DepositedResidue>, Vec<ResidueId>)>> {
     let atoms = structure.atoms();
     let mut by_residue: BTreeMap<ResidueId, Vec<&glysys::StructureAtom>> = BTreeMap::new();
     for atom in &atoms {
@@ -190,17 +204,27 @@ fn sugar_tree(
             .collect()
     };
     let mut seen = BTreeSet::new();
-    let roots = attached(link, &seen);
+    let mut roots = attached(link, &seen);
+    if roots.is_empty() && lenient {
+        roots.extend(
+            (0..sugars.len())
+                .filter(|&i| dist(sugars[i].2, link) < STRETCHED_LINK)
+                .min_by(|&a, &b| dist(sugars[a].2, link).total_cmp(&dist(sugars[b].2, link))),
+        );
+    }
     if roots.is_empty() {
         return Ok(None);
     }
-    if roots.len() != 1 {
+    if roots.len() != 1 && !lenient {
         return Err(invalid(format!(
             "expected one glycan residue bonded to the site, found {}",
             roots.len()
         )));
     }
-    seen.insert(sugars[roots[0]].0.clone());
+    roots.sort_by(|&a, &b| dist(sugars[a].2, link).total_cmp(&dist(sugars[b].2, link)));
+    for &i in &roots {
+        seen.insert(sugars[i].0.clone());
+    }
     let mut out = vec![DepositedResidue {
         id: sugars[roots[0]].0.clone(),
         name: sugars[roots[0]].1.clone(),
@@ -208,6 +232,7 @@ fn sugar_tree(
         parent_position: None,
     }];
     let mut stack = vec![0usize];
+    let mut own = None;
     while let Some(k) = stack.pop() {
         let parent = out[k].clone();
         for atom in by_residue.get(&parent.id).map(Vec::as_slice).unwrap_or(&[]) {
@@ -231,8 +256,26 @@ fn sugar_tree(
                 stack.push(out.len() - 1);
             }
         }
+        // the tree of the root first, then those of the other sugars at the link atom
+        if stack.is_empty() && own.is_none() {
+            own = Some(out.len());
+            for &i in &roots[1..] {
+                out.push(DepositedResidue {
+                    id: sugars[i].0.clone(),
+                    name: sugars[i].1.clone(),
+                    path: "duplicate".into(),
+                    parent_position: None,
+                });
+                stack.push(out.len() - 1);
+            }
+        }
     }
-    Ok(Some(out))
+    let duplicates = out
+        .split_off(own.unwrap_or(out.len()))
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    Ok(Some((out, duplicates)))
 }
 
 /// How the site environment is expanded by crystal symmetry.
@@ -356,6 +399,12 @@ pub struct SiteOptions {
     pub symmetry: SymmetryMode,
     /// GLYCAM sequence to fit instead of the deposited glycan's
     pub sequence: Option<String>,
+    /// atoms of the site residue at other positions than in the structure (a rebuilt side chain;
+    /// see [`crate::sidechain`]): atom name -> position
+    pub moved: BTreeMap<String, [f64; 3]>,
+    /// read the deposited glycan of a stretched link, and of a site with several glycans at its
+    /// link atom (off: such a site has no glycan, or is an error)
+    pub lenient_links: bool,
 }
 
 impl Default for SiteOptions {
@@ -364,6 +413,8 @@ impl Default for SiteOptions {
             env_radius: 45.0,
             symmetry: SymmetryMode::Auto,
             sequence: None,
+            moved: BTreeMap::new(),
+            lenient_links: false,
         }
     }
 }
@@ -551,15 +602,30 @@ fn anchor_of(structure: &Structure, residue: &ResidueId) -> Result<AnchorInfo> {
 /// page's site finder uses the same limit).
 pub const MAX_LINK_BOND: f64 = 1.9;
 
+/// With [`SiteOptions::lenient_links`]: the longest distance (A) between the link atom and the
+/// anomeric carbon of a deposited sugar that is still read as the glycan of the site. Deposits
+/// with a link record and the sugar placed 1.9 to 2.6 A from the asparagine are common (95 of
+/// the 113 such N-glycan sites of the PDB-wide run are within 2.7 A).
+pub const STRETCHED_LINK: f64 = 2.7;
+
 /// The deposited glycan attached at a site (None when the site carries no glycan).
 pub fn deposited_glycan(
     structure: &Structure,
     residue: &ResidueId,
 ) -> Result<Option<DepositedGlycan>> {
+    deposited_glycan_with(structure, residue, false)
+}
+
+/// [`deposited_glycan`], with the links read leniently or not ([`SiteOptions::lenient_links`]).
+pub fn deposited_glycan_with(
+    structure: &Structure,
+    residue: &ResidueId,
+    lenient: bool,
+) -> Result<Option<DepositedGlycan>> {
     let (_, _, anchor) = anchor_of(structure, residue)?;
-    let tree = sugar_tree(structure, anchor[2], MAX_LINK_BOND)?;
+    let tree = sugar_tree(structure, anchor[2], MAX_LINK_BOND, lenient)?;
     Ok(match tree {
-        Some(tree) => {
+        Some((tree, duplicates)) => {
             let mut atoms = BTreeMap::new();
             let all = structure.atoms();
             for r in &tree {
@@ -581,6 +647,7 @@ pub fn deposited_glycan(
             Some(DepositedGlycan {
                 residues: tree,
                 atoms,
+                duplicates,
             })
         }
         None => None,
@@ -613,8 +680,14 @@ pub fn load_site(
     crystal: &CrystalInput,
     options: &SiteOptions,
 ) -> Result<Site> {
-    let (residue_name, names, anchor) = anchor_of(structure, residue)?;
-    let deposited = deposited_glycan(structure, residue)?;
+    let (residue_name, names, mut anchor) = anchor_of(structure, residue)?;
+    // the glycan is read from the link atom as deposited; the fit then has the moved atoms
+    let deposited = deposited_glycan_with(structure, residue, options.lenient_links)?;
+    for (k, name) in names.iter().enumerate() {
+        if let Some(x) = options.moved.get(*name) {
+            anchor[k] = x.map(|v| v as f32 as f64);
+        }
+    }
     let tree = deposited.as_ref().map(|d| d.residues.clone());
     // sequence: requested, else crabWURCS from the deposited graph (checked against the
     // distance-based tree), else the tree itself
@@ -681,7 +754,10 @@ pub fn load_site(
                 && !a.element.eq_ignore_ascii_case("D")
         })
         .map(|a| EnvAtom {
-            position: v3(a.position),
+            position: match options.moved.get(&a.name) {
+                Some(x) if a.residue == *residue => *x,
+                _ => v3(a.position),
+            },
             atomic_number: atomic_number(&a.element),
             chain: a.residue.chain.clone(),
             residue_number: a.residue.number,

@@ -267,6 +267,7 @@ mod tests {
                 .iter()
                 .map(|(p, n, x)| ((p.to_string(), n.to_string()), *x))
                 .collect(),
+            duplicates: Vec::new(),
         }
     }
 

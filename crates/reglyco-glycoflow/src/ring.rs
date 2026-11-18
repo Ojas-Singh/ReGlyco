@@ -167,6 +167,95 @@ pub fn flip_root_chair(glycan: &mut Glycan, which: impl Fn(usize) -> bool) -> bo
     true
 }
 
+/// A six-ring within this Cremer-Pople theta of its chair is in the chair (degrees).
+pub const CHAIR_TOLERANCE: f64 = 30.0;
+
+/// Bring every six-ring that is out of its chair into that chair, with its substituents. Returns
+/// the number of rings changed.
+///
+/// The chair of an aldopyranose is the one of crystal structures, 4C1 for a D sugar and 1C4 for
+/// an L sugar (the rule of `Known::chair_deviation`), taken from the first template that has it;
+/// template 0 is corrected too when it is in the other chair. The majority build is not the
+/// rule: beta-D-xylose is 1C4 in 55% of its MD frames and 4C1 in 381 of 383 deposited rings. The
+/// chair of any other six-ring (sialic acids, Kdo) is that of the majority build (template 0).
+///
+/// The pucker states of the residue library and the ring shapes a model generates include the
+/// inverted chair and boats of residues such as GlcNAc at a few per cent each. A fit to a map
+/// takes the best of its templates, so in weak density such a ring is selected by noise, and the
+/// model would carry a conformation that no map at these resolutions can show. Iduronic acid,
+/// whose ring has several states in solution, is left as drawn.
+pub fn chair_templates(glycan: &mut Glycan) -> usize {
+    let rings: Vec<_> = glycan
+        .topology
+        .rings
+        .iter()
+        .filter(|ring| {
+            let name = &glycan.res_names[ring.atoms[0]];
+            ring.len() == 6 && !name.to_ascii_lowercase().ends_with("ua")
+        })
+        .cloned()
+        .collect();
+    let f64s = |x: &[[f32; 3]]| -> Vec<V> { x.iter().map(|p| p.map(f64::from)).collect() };
+    let theta = |q: &[f64; 3]| q[0].hypot(q[1]).atan2(q[2]).to_degrees();
+    let puckers: Vec<_> = glycan
+        .templates
+        .iter()
+        .map(|t| glycoflow_core::ring_puckers(&f64s(t), &rings))
+        .collect();
+    // the chair of each ring, and whether template 0 has to be brought into it
+    let mut chairs = puckers[0].clone();
+    let mut first = 1;
+    for (r, ring) in rings.iter().enumerate() {
+        // ring atoms O5 C1..C5 of an aldopyranose; the second letter of a GLYCAM residue name
+        // is upper case for a D sugar
+        let named: Option<Vec<usize>> = ["O5", "C1", "C2", "C3", "C4", "C5"]
+            .iter()
+            .map(|name| {
+                ring.atoms
+                    .iter()
+                    .copied()
+                    .find(|&i| glycan.atom_names[i] == *name)
+            })
+            .collect();
+        let Some(named) = named else { continue };
+        let l_sugar = glycan.res_names[ring.atoms[0]]
+            .chars()
+            .nth(1)
+            .is_some_and(|c| c.is_ascii_lowercase());
+        let deviation = |t: usize| {
+            let x = &glycan.templates[t];
+            let ring: [V; 6] = std::array::from_fn(|k| x[named[k]].map(f64::from));
+            let theta = chair_theta(&ring);
+            if l_sugar { 180.0 - theta } else { theta }
+        };
+        if deviation(0) <= CHAIR_TOLERANCE {
+            continue;
+        }
+        first = 0;
+        chairs[r] = match (1..glycan.templates.len()).find(|&t| deviation(t) <= CHAIR_TOLERANCE) {
+            Some(t) => puckers[t][r],
+            None => puckers[0][r].map(|q| -q), // the inverted ring
+        };
+    }
+    let mut changed = 0;
+    for (template, shapes) in glycan.templates.iter_mut().zip(puckers).skip(first) {
+        let mut shapes = shapes;
+        let before = changed;
+        for (shape, chair) in shapes.iter_mut().zip(&chairs) {
+            if (theta(shape) - theta(chair)).abs() > CHAIR_TOLERANCE {
+                *shape = *chair;
+                changed += 1;
+            }
+        }
+        if changed > before {
+            let mut x = f64s(template);
+            glycoflow_core::set_puckers(&mut x, &rings, &shapes);
+            *template = x.iter().map(|p| p.map(|v| v as f32)).collect();
+        }
+    }
+    changed
+}
+
 /// Cremer-Pople theta (degrees) of a six-ring given in order: 0 for 4C1, 180 for 1C4 (D-sugars,
 /// ring O5 C1 C2 C3 C4 C5).
 pub fn chair_theta(ring: &[V; 6]) -> f64 {
@@ -257,6 +346,55 @@ mod tests {
                     g.atom_names[i]
                 );
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs GLYCOFLOW_MODEL (residue_library.json of the licensed model)"]
+    fn chair_templates_use_the_crystal_chair() {
+        let path = std::path::Path::new(&std::env::var("GLYCOFLOW_MODEL").unwrap())
+            .join("residue_library.json");
+        let library =
+            glycoflow_core::ResidueLibrary::from_json_slice(&std::fs::read(path).unwrap()).unwrap();
+        // deviation of every aldopyranose ring of every template from its crystal chair
+        let worst = |g: &Glycan| {
+            let mut worst = 0f64;
+            for ring in g.topology.rings.iter().filter(|r| r.len() == 6) {
+                let named: Option<Vec<usize>> = ["O5", "C1", "C2", "C3", "C4", "C5"]
+                    .iter()
+                    .map(|n| ring.atoms.iter().copied().find(|&i| g.atom_names[i] == *n))
+                    .collect();
+                let Some(named) = named else { continue };
+                let l = g.res_names[named[0]].chars().nth(1).unwrap().is_ascii_lowercase();
+                for x in &g.templates {
+                    let t = chair_theta(&std::array::from_fn(|k| x[named[k]].map(f64::from)));
+                    worst = worst.max(if l { 180.0 - t } else { t });
+                }
+            }
+            worst
+        };
+        // beta-D-xylose: the majority build of the library is 1C4, the chair is 4C1
+        for seq in [
+            "DXylpb1-OH",
+            "DManpa1-6[DXylpb1-2]DManpb1-4DGlcpNAcb1-4[LFucpa1-3]DGlcpNAcb1-OH",
+        ] {
+            let mut g = crate::problem::build_glycan(&library, seq, 16, 0).unwrap();
+            assert!(worst(&g) > 150.0, "{seq}: the library has the other chair");
+            assert!(chair_templates(&mut g) > 0);
+            assert!(worst(&g) < CHAIR_TOLERANCE, "{seq}: {}", worst(&g));
+        }
+        // residues whose majority build is in the crystal chair: template 0 untouched, and the
+        // others as with template 0 for the rule (L sugars included)
+        for seq in [
+            "DManpa1-6[DManpa1-3]DManpb1-4DGlcpNAcb1-4[LFucpa1-6]DGlcpNAcb1-OH",
+            "DNeup5Aca2-6DGalpb1-4DGlcpNAcb1-OH",
+            "LRhapa1-OH",
+        ] {
+            let mut g = crate::problem::build_glycan(&library, seq, 16, 0).unwrap();
+            let before = g.templates[0].clone();
+            chair_templates(&mut g);
+            assert_eq!(g.templates[0], before, "{seq}");
+            assert!(worst(&g) < CHAIR_TOLERANCE, "{seq}: {}", worst(&g));
         }
     }
 }

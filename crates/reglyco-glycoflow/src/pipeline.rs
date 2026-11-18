@@ -18,10 +18,12 @@ use reglyco_density::site_likelihood::{
 };
 
 use crate::cartesian::{
-    CartesianFit, RestraintOptions, cartesian_refine, cartesian_refine_all, cartesian_refine_traced,
+    CartesianFit, DataWeight, RestraintOptions, Restraints, cartesian_refine,
+    cartesian_refine_all, cartesian_refine_traced, refine_weighted_up,
 };
 use crate::counter::CounterSnapshot;
 use crate::error::{Result, invalid};
+use crate::known::{CoordinateStart, hybrid, pose_from_atoms, start_template};
 use crate::model::GlycoflowModel;
 use crate::observation::{DensityObservation, Observation};
 use crate::prior::{MarginalPrior, PriorDeviation, RARE_PERCENTILE, RareTorsion};
@@ -29,7 +31,8 @@ use crate::problem::{Pose, ProblemOptions, SiteProblem, Terms, V3, build_glycan,
 use crate::search::{method_b, refine, sample_free};
 use crate::site::Site;
 use crate::support::{
-    Completion, SubtreeSupport, complete_from_prior, subtree_support, unsupported_torsions,
+    Completion, SubtreeSupport, complete_from_prior, subtree_support, supported_atoms,
+    unsupported_torsions,
 };
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -50,6 +53,12 @@ pub struct FitConfig {
     pub n_completions: usize,
     pub completion_guidance: f32,
     pub alt_margin: f64,
+    /// known positions stay the model against a basin that explains the map worse by more than
+    /// this (log-likelihood units), whatever the priors say (see `keeps_known`)
+    pub known_guard: f64,
+    /// ... and against a basin that keeps less than this share of their log-likelihood: where
+    /// the map is weak the whole log-likelihood is smaller than `known_guard`
+    pub known_share: f64,
     pub flow_steps: usize,
     pub guidance_scale: f64,
     pub guidance_start: f64,
@@ -62,7 +71,8 @@ pub struct FitConfig {
     pub steric_steps: usize,
     pub steric_lr: f64,
     /// Contact-validity escalation: while the selected pose's raw contact energy
-    /// (E_env + E_self, squared floor violations) exceeds `contact_tolerance`, multiply the final
+    /// (E_env + E_self, squared floor violations; in the Cartesian stage its deepest single
+    /// contact, `SiteProblem::worst_contact`) exceeds `contact_tolerance`, multiply the final
     /// contact weight by 10, re-score every basin, refine the best few and re-select (at most
     /// `max_escalations` times). The floors sit >= 0.08 A above the validator's van der Waals
     /// limits, so a tolerance of 0.08^2 guarantees no single pair violates them.
@@ -75,6 +85,9 @@ pub struct FitConfig {
     pub cartesian_lr: f64,
     pub cartesian_clash_weight: f64,
     pub restraints: RestraintOptions,
+    /// final refinement of the selected basin with the map weighted up (`DataWeight`; None: off).
+    /// Basins are ranked and selected at weight 1 as before.
+    pub data_weight: Option<DataWeight>,
     /// escalate the contact weight in torsion space too (re-ranking every basin under it)
     pub torsion_escalation: bool,
     pub cartesian_escalation: Escalation,
@@ -104,7 +117,22 @@ pub struct FitConfig {
     /// deposited glycan's (`evaluation::deposited_pose`), to measure the best the pipeline reaches
     #[serde(skip)]
     pub extra_starts: Vec<Pose>,
+    /// known atom positions (`known`): moved onto them, the extra starts and the
+    /// `coordinate_bases` lowest basins join the Cartesian refinement as basins of their own
+    #[serde(skip)]
+    pub coordinate_start: Option<CoordinateStart>,
+    pub coordinate_bases: usize,
 }
+
+/// Standard deviation of the springs that hold known atoms in place while their covalent
+/// geometry is repaired (A): loose against a bond (0.02 A), stiff against the drift of a residue.
+pub const KNOWN_TETHER: f64 = 0.1;
+
+/// The same for atoms that have no known position of their own (A): those of a residue placed as
+/// a rigid body on known atoms it cannot match (another anomer, a ring out of its chair), and
+/// those the known model lacks. Such a residue moves as a whole to mend its links; held as
+/// tightly as a known atom it would mend them by bending its ring instead.
+pub const PLACED_TETHER: f64 = 0.5;
 
 /// Contact-weight escalation of the Cartesian stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -133,6 +161,8 @@ impl Default for FitConfig {
             n_completions: 16,
             completion_guidance: 0.3,
             alt_margin: 5.0,
+            known_guard: 10.0,
+            known_share: 0.75,
             flow_steps: 8,
             guidance_scale: 2.0,
             guidance_start: 0.3,
@@ -146,6 +176,7 @@ impl Default for FitConfig {
             cartesian_lr: 0.005,
             cartesian_clash_weight: 100.0,
             restraints: RestraintOptions::default(),
+            data_weight: None,
             torsion_escalation: false,
             cartesian_escalation: Escalation::Selected,
             pre_refine: 0,
@@ -160,6 +191,8 @@ impl Default for FitConfig {
             branch_basins: 4,
             branch_per_branch: 2,
             extra_starts: Vec::new(),
+            coordinate_start: None,
+            coordinate_bases: 2,
         }
     }
 }
@@ -172,6 +205,34 @@ pub struct PriorConfig {
     pub steps: usize,
     pub bandwidth_deg: f64,
     pub seed: u64,
+    /// samples of glycans already drawn, shared between fits (a batch of sites repeats a few
+    /// glycans): the free glycan's samples depend on the glycan and these settings only
+    #[serde(skip)]
+    pub cache: Option<PriorCache>,
+}
+
+/// Free-glycan torsion samples by glycan and sampling settings (`PriorConfig::cache`).
+pub type PriorCache = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<Vec<u32>, std::sync::Arc<Vec<Vec<f64>>>>>,
+>;
+
+/// Everything `sample_free` reads: the glycan's tokens, torsions and local geometries, and the
+/// sampling settings.
+fn prior_key(problem: &SiteProblem, sampler: &Sampler, config: &PriorConfig) -> Vec<u32> {
+    let mut key = vec![
+        config.n_samples as u32,
+        config.steps as u32,
+        config.seed as u32,
+        (config.seed >> 32) as u32,
+        problem.batch.map_or(0, |b| b as u32 + 1),
+        sampler.tokens.len() as u32,
+    ];
+    key.extend(sampler.tokens.iter().flatten());
+    key.extend(sampler.topology.quads.iter().flatten().map(|&i| i as u32));
+    for template in &problem.glycan.templates {
+        key.extend(template.iter().flatten().map(|v| v.to_bits()));
+    }
+    key
 }
 
 impl Default for PriorConfig {
@@ -182,6 +243,7 @@ impl Default for PriorConfig {
             steps: 16,
             bandwidth_deg: 12.0,
             seed: 1234,
+            cache: None,
         }
     }
 }
@@ -271,6 +333,9 @@ pub fn density_problem(
     if generated {
         crate::problem::generate_ring_templates(&mut glycan, model, 16, options.template_seed)?;
     }
+    if options.chair_rings {
+        crate::ring::chair_templates(&mut glycan);
+    }
     // C-mannose: 1C4 in crystals, 4C1 in GlycoFlow's library; odd templates take the other chair
     if crate::anchor::anchor(&site.residue_name).is_some_and(|a| a.both_chairs) {
         crate::ring::flip_root_chair(&mut glycan, |t| t % 2 == 1);
@@ -295,7 +360,7 @@ pub fn density_problem(
         likelihood.obs_blur.dims,
     );
     let observation: Box<dyn Observation> = Box::new(DensityObservation::new(likelihood));
-    let mut problem = SiteProblem::new(
+    SiteProblem::with_rings(
         site,
         glycan,
         &model.meta.vocab,
@@ -303,9 +368,8 @@ pub fn density_problem(
         grid_box,
         radius,
         options,
-    )?;
-    problem.generated_rings = generated;
-    Ok(problem)
+        generated,
+    )
 }
 
 /// Candidate-independent constants of a density problem (box, protein-only fit, noise).
@@ -348,14 +412,31 @@ pub fn build_prior(
     sampler: &Sampler,
     config: &PriorConfig,
 ) -> Result<MarginalPrior> {
-    let taus = sample_free(
-        problem,
-        sampler,
-        config.n_samples,
-        config.steps,
-        Method::Euler,
-        config.seed,
-    )?;
+    let draw = || {
+        sample_free(
+            problem,
+            sampler,
+            config.n_samples,
+            config.steps,
+            Method::Euler,
+            config.seed,
+        )
+    };
+    let taus = match &config.cache {
+        Some(cache) => {
+            let key = prior_key(problem, sampler, config);
+            let hit = cache.lock().unwrap().get(&key).cloned();
+            match hit {
+                Some(taus) => taus,
+                None => {
+                    let taus = std::sync::Arc::new(draw()?);
+                    cache.lock().unwrap().insert(key, taus.clone());
+                    taus
+                }
+            }
+        }
+        None => std::sync::Arc::new(draw()?),
+    };
     // over the torsions the structure determines (`SiteProblem::heavy_torsions`)
     Ok(
         MarginalPrior::new(taus.concat(), problem.n_torsions, config.bandwidth_deg)
@@ -374,6 +455,16 @@ pub struct Basin {
     /// restraint energy of the Cartesian stage (0 without it); basins are ranked on
     /// terms.total + e_restraint
     pub e_restraint: f64,
+    /// refined from known atom positions (`FitConfig::coordinate_start`), not from a search pose
+    pub from_known: bool,
+    /// terms.total + e_restraint when the basins were ranked: the final refinement of the
+    /// selected basin (`FitConfig::data_weight`) changes its terms, not its rank
+    pub objective: f64,
+    /// weight of the map in that final refinement (1: not refined further)
+    pub data_weight: f64,
+    /// the pucker template its restraints take their rings from (a pose measured on known
+    /// positions may name another)
+    pub template: usize,
 }
 
 pub struct FitOutcome {
@@ -479,7 +570,7 @@ pub fn fit_site(
         (Vec::new(), Vec::new())
     };
     // search on the (smoother) search weights
-    let (mut poses, mut energies, unrefined, sources) = {
+    let (mut poses, mut energies, mut unrefined, mut sources) = {
         let problem: &SiteProblem = problem;
         let c = &problem.counter;
         let r = method_b(
@@ -667,23 +758,90 @@ pub fn fit_site(
     }
     // restrained Cartesian refinement of every basin, with the same contact escalation
     let mut cartesian: Option<Vec<CartesianFit>> = None;
+    let n_search = poses.len();
     if config.cartesian_steps > 0 {
         let t0 = Instant::now();
         if let Some(o) = observer {
             o.stage("cartesian");
         }
-        let templates: Vec<usize> = poses.iter().map(|p| p.template).collect();
         let mut xs: Vec<Vec<V3>> = {
             let problem: &SiteProblem = problem;
             poses.par_iter().map(|p| problem.place(p)).collect()
         };
+        if let Some(start) = &config.coordinate_start {
+            // the extra starts are the last search poses
+            let mut bases: Vec<usize> = (n_search - config.extra_starts.len()..n_search).collect();
+            let mut order: Vec<usize> = (0..n_search).collect();
+            order.sort_by(|&a, &b| energies[a].total_cmp(&energies[b]));
+            let lowest: Vec<usize> = order
+                .into_iter()
+                .filter(|i| !bases.contains(i))
+                .take(config.coordinate_bases)
+                .collect();
+            bases.extend(lowest);
+            // every residue as a rigid body on its known atoms (ideal geometry in the known
+            // place, whatever the geometry of the known model)
+            let placed = CoordinateStart {
+                x: start.x.clone(),
+                exact: vec![false; start.exact.len()],
+            };
+            // an atom placed with its residue, or not known at all, is not where it will end
+            let tether: Vec<f64> = (0..xs[0].len())
+                .map(|i| match start.exact.get(i) {
+                    Some(true) => KNOWN_TETHER,
+                    _ => PLACED_TETHER,
+                })
+                .collect();
+            for b in bases {
+                // on the pucker template closest to the known positions
+                let mut pose = poses[b].clone();
+                pose.template = start_template(problem, start, &pose);
+                let base = if pose.template == poses[b].template {
+                    xs[b].clone()
+                } else {
+                    problem.place(&pose)
+                };
+                // the covalent geometry of both repaired in place before the map is asked: a
+                // known model far off the restraint targets (another dictionary, a loose
+                // refinement, residues placed as rigid bodies) would otherwise spend the
+                // refinement on its geometry
+                let restraints = Restraints::new(problem, pose.template, &config.restraints);
+                for start in [start, &placed] {
+                    let x = hybrid(problem, &base, start);
+                    xs.push(restraints.regularise(&x, &problem.movable[..x.len()], &tether));
+                    poses.push(pose.clone());
+                    energies.push(energies[b]);
+                    unrefined.push(f64::NAN);
+                    sources.push(usize::MAX);
+                }
+            }
+        }
+        let templates: Vec<usize> = poses.iter().map(|p| p.template).collect();
         let w0 = config.cartesian_clash_weight;
-        let argmin = |fits: &[CartesianFit]| {
-            (0..fits.len())
-                .min_by(|&a, &b| fits[a].total.total_cmp(&fits[b].total))
-                .unwrap_or(0)
+        // no single contact deeper than the tolerance: many shallow ones (a glycan hydrogen-bonded
+        // to its neighbours all round) stay clear of the validator's limits and do not escalate
+        let clear = |problem: &SiteProblem, f: &CartesianFit| {
+            problem.worst_contact(&f.x) <= config.contact_tolerance
         };
-        let clear = |f: &CartesianFit| f.terms.e_env + f.terms.e_self <= config.contact_tolerance;
+        // the basin the fit would return: the lowest, or the lowest from known positions when
+        // the map cannot tell the two apart (see the selection below)
+        let selected = |fits: &[CartesianFit]| {
+            let lowest = |range: std::ops::Range<usize>| {
+                range.min_by(|&a, &b| fits[a].total.total_cmp(&fits[b].total))
+            };
+            let best = lowest(0..fits.len()).unwrap_or(0);
+            lowest(n_search..fits.len())
+                .filter(|&k| {
+                    let objective = fits[k].total - fits[best].total;
+                    keeps_known(
+                        config,
+                        objective,
+                        fits[k].terms.loglik,
+                        fits[best].terms.loglik,
+                    )
+                })
+                .unwrap_or(best)
+        };
         match config.cartesian_escalation {
             Escalation::Rerank => {
                 let mut w = w0;
@@ -699,7 +857,7 @@ pub fn fit_site(
                         config.cartesian_lr,
                         &config.restraints,
                     );
-                    let ok = clear(&fits[argmin(&fits)]);
+                    let ok = clear(problem, &fits[selected(&fits)]);
                     xs = fits.iter().map(|f| f.x.clone()).collect();
                     cartesian = Some(fits);
                     if ok {
@@ -720,12 +878,16 @@ pub fn fit_site(
                     config.cartesian_lr,
                     &config.restraints,
                 );
-                for attempt in 0..config.max_escalations {
-                    let b = argmin(&fits);
-                    if clear(&fits[b]) {
+                // a basin that takes the selection from an escalated one starts from the base
+                // weight again
+                let mut attempts = vec![0usize; fits.len()];
+                loop {
+                    let b = selected(&fits);
+                    if clear(problem, &fits[b]) || attempts[b] == config.max_escalations {
                         break;
                     }
-                    let factor = 10f64.powi(attempt as i32 + 1);
+                    attempts[b] += 1;
+                    let factor = 10f64.powi(attempts[b] as i32);
                     let w = w0 * factor;
                     problem.w_env = w;
                     problem.w_self = w;
@@ -737,6 +899,8 @@ pub fn fit_site(
                         sd_bond: r.sd_bond / factor.sqrt(),
                         sd_angle: r.sd_angle / factor.sqrt(),
                         sd_volume: r.sd_volume / factor.sqrt(),
+                        sd_ring: r.sd_ring / factor.sqrt(),
+                        sd_amide: r.sd_amide / factor.sqrt(),
                     };
                     let pass = format!("escalation x{factor}");
                     let up = cartesian_refine_traced(
@@ -772,21 +936,31 @@ pub fn fit_site(
     if let Some(o) = observer {
         o.stage("support+complete");
     }
-    let basins: Vec<Basin> = match cartesian {
+    let mut basins: Vec<Basin> = match cartesian {
         Some(fits) => {
             energies = fits.iter().map(|f| f.total).collect();
             poses
                 .into_iter()
                 .zip(fits)
                 .zip(&unrefined)
-                .map(|((mut pose, fit), &unrefined)| {
+                .enumerate()
+                .map(|(k, ((mut pose, fit), &unrefined))| {
                     pose.psi = fit.psi;
+                    let template = pose.template;
+                    // a basin refined from known positions: the pose is measured on it
+                    if k >= n_search {
+                        pose = pose_from_atoms(problem, |i| Some(fit.x[i]), &pose);
+                    }
                     Basin {
                         pose,
                         x: fit.x,
                         terms: fit.terms,
                         unrefined,
                         e_restraint: fit.e_restraint,
+                        from_known: k >= n_search,
+                        objective: fit.total,
+                        data_weight: 1.0,
+                        template,
                     }
                 })
                 .collect()
@@ -801,11 +975,15 @@ pub fn fit_site(
                 .zip(evaluated)
                 .zip(&unrefined)
                 .map(|((pose, ev), &unrefined)| Basin {
+                    template: pose.template,
                     pose,
                     x: ev.x,
+                    objective: ev.terms.total,
                     terms: ev.terms,
                     unrefined,
                     e_restraint: 0.0,
+                    from_known: false,
+                    data_weight: 1.0,
                 })
                 .collect()
         }
@@ -816,7 +994,28 @@ pub fn fit_site(
     }
     let mut order: Vec<usize> = (0..energies.len()).collect();
     order.sort_by(|&a, &b| energies[a].total_cmp(&energies[b]));
-    let best = order[0];
+    // known positions stay the model when the map cannot tell them from the lowest basin
+    let lowest = order[0];
+    let mut best = order
+        .iter()
+        .copied()
+        .find(|&i| basins[i].from_known)
+        .filter(|&i| {
+            let (known, other) = (basins[i].terms.loglik, basins[lowest].terms.loglik);
+            keeps_known(config, energies[i] - energies[lowest], known, other)
+        })
+        .unwrap_or(lowest);
+    // the final refinement of both; the known positions come back when the map then tells for
+    // them: at the weight of the search a model on them gives up density for its geometry
+    let known = order.iter().copied().find(|&i| basins[i].from_known);
+    if let Some(k) = known.filter(|&k| k != best && config.data_weight.is_some()) {
+        weigh_up(problem, config, &mut basins[best], best);
+        weigh_up(problem, config, &mut basins[k], k);
+        let (known, other) = (basins[k].terms.loglik, basins[best].terms.loglik);
+        if map_tells_for_known(config, known, other) {
+            best = k;
+        }
+    }
     let mut outcome = FitOutcome {
         basins,
         order,
@@ -837,6 +1036,58 @@ pub fn fit_site(
     Ok(outcome)
 }
 
+/// Whether the lowest basin from known positions stays the model against the lowest basin of
+/// all, given its objective and its log-likelihood relative to that one: when the map cannot tell
+/// the two apart, or when the map tells for the known positions (`map_tells_for_known`) and
+/// only the priors tell against them. The priors take the protein as it is given, and a misplaced
+/// side chain at the site would otherwise move a well-placed glycan out of its density.
+fn keeps_known(config: &FitConfig, objective: f64, known: f64, other: f64) -> bool {
+    objective <= config.alt_margin || map_tells_for_known(config, known, other)
+}
+
+/// Whether the map tells for known positions (log-likelihood `known`) against another basin
+/// (`other`): by more than `known_guard`, or the other keeps less than `known_share` of it
+/// (a share only means something of a log-likelihood above zero).
+pub(crate) fn map_tells_for_known(config: &FitConfig, known: f64, other: f64) -> bool {
+    known - other > config.known_guard || (known > 0.0 && other < config.known_share * known)
+}
+
+/// The final refinement of a basin with the map weighted up (`FitConfig::data_weight`), once.
+fn weigh_up(problem: &SiteProblem, config: &FitConfig, basin: &mut Basin, index: usize) {
+    let Some(weight) = config
+        .data_weight
+        .filter(|_| config.cartesian_steps > 0 && basin.data_weight == 1.0)
+    else {
+        return;
+    };
+    let weighted = supported_atoms(
+        problem,
+        &basin.x,
+        config.support_base,
+        config.support_per_torsion,
+    );
+    if let Some((fit, w)) = refine_weighted_up(
+        problem,
+        &basin.x,
+        basin.template,
+        config.cartesian_lr,
+        &config.restraints,
+        &weight,
+        &weighted,
+        config.contact_tolerance,
+        Some(index),
+    ) {
+        basin.pose.psi = fit.psi;
+        if basin.from_known {
+            basin.pose = pose_from_atoms(problem, |i| Some(fit.x[i]), &basin.pose);
+        }
+        basin.x = fit.x;
+        basin.terms = fit.terms;
+        basin.e_restraint = fit.e_restraint;
+        basin.data_weight = w;
+    }
+}
+
 /// Make basin `best` the selected one: its support, prior completions, prior deviation and the
 /// alternatives within `alt_margin` of it (`fit_site` calls this for the lowest-objective basin;
 /// the workflow again when that one fails validation and an alternative passes).
@@ -847,6 +1098,7 @@ pub fn reselect(
     outcome: &mut FitOutcome,
     best: usize,
 ) -> Result<()> {
+    weigh_up(problem, config, &mut outcome.basins[best], best);
     let basins = &outcome.basins;
     let support = subtree_support(
         problem,
@@ -869,7 +1121,7 @@ pub fn reselect(
     } else {
         Vec::new()
     };
-    let energy = |i: usize| basins[i].terms.total + basins[i].e_restraint;
+    let energy = |i: usize| basins[i].objective;
     let alternatives = outcome
         .order
         .iter()
@@ -903,5 +1155,36 @@ fn polish_top(
             poses[i] = pose;
             energies[i] = e;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_map_tells_for_known_positions_by_a_margin_or_by_a_share() {
+        let config = FitConfig::default();
+        // far apart in absolute terms
+        assert!(map_tells_for_known(&config, 120.0, 105.0));
+        // close in absolute terms, but the other basin keeps less than the share
+        assert!(map_tells_for_known(&config, 20.0, 14.0));
+        assert!(!map_tells_for_known(&config, 20.0, 16.0));
+        // the other basin fits the map as well or better
+        assert!(!map_tells_for_known(&config, 20.0, 21.0));
+        // a map that says nothing of either tells for neither
+        assert!(!map_tells_for_known(&config, -4.0, -3.5));
+        assert!(!map_tells_for_known(&config, 0.0, -1.0));
+    }
+
+    #[test]
+    fn known_positions_stay_when_the_map_cannot_tell_or_tells_for_them() {
+        let config = FitConfig::default();
+        // within the margin of the lowest basin
+        assert!(keeps_known(&config, config.alt_margin, 20.0, 20.0));
+        // further off by the priors, the map telling for them
+        assert!(keeps_known(&config, 40.0, 20.0, 9.0));
+        // further off by the priors, the map not telling
+        assert!(!keeps_known(&config, 40.0, 20.0, 19.0));
     }
 }

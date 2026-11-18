@@ -86,14 +86,17 @@ impl MarginalPrior {
                 *logit = self.kappa * (tau[k] - self.samples[j * t + k]).cos();
                 m = m.max(*logit);
             }
-            let sum = logits.iter().map(|l| (l - m).exp()).sum::<f64>();
+            for l in logits.iter_mut() {
+                *l = (*l - m).exp();
+            }
+            let sum = logits.iter().sum::<f64>();
             let lse = m + sum.ln();
             total -= lse - ln_s - self.log_norm;
             if let Some(g) = grad.as_deref_mut() {
                 // d/dtau of -lse = kappa * sum_j w_j sin(tau - s_j)
                 let mut acc = 0.0;
-                for (j, logit) in logits.iter().enumerate() {
-                    let w = (logit - m).exp() / sum;
+                for (j, weight) in logits.iter().enumerate() {
+                    let w = weight / sum;
                     acc += w * (tau[k] - self.samples[j * t + k]).sin();
                 }
                 g[k] += self.kappa * acc;

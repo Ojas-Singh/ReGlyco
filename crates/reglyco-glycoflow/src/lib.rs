@@ -15,7 +15,8 @@
 //!   completion (pinned-torsion inpainting); [`pipeline`]: `fit_site`;
 //! * [`output`], [`evaluation`], [`workflow`]: structures, reports, validation;
 //! * [`observer`]: watching a fit as it runs; [`deposition`]: chemistry checks of a deposit;
-//! * [`ensemble`]: the extend mode, an ensemble of conformers past the density.
+//! * [`ensemble`]: the extend mode, an ensemble of conformers past the density;
+//! * [`known`]: known atom positions (a deposit, an earlier fit) as starts of a fit.
 
 pub mod anchor;
 pub mod cartesian;
@@ -24,7 +25,9 @@ pub mod deposition;
 pub mod ensemble;
 pub mod error;
 pub mod evaluation;
+pub mod ideal;
 pub mod infer;
+pub mod known;
 pub mod maxent;
 pub mod model;
 pub mod observation;
@@ -35,6 +38,7 @@ pub mod prior;
 pub mod problem;
 pub mod ring;
 pub mod search;
+pub mod sidechain;
 pub mod site;
 pub mod support;
 pub mod symmetry;
@@ -45,7 +49,7 @@ pub use glycoflow_core;
 pub use model::{ComputeDevice, GlycoflowModel};
 pub use observation::{DensityObservation, Observation, ObservationValue};
 pub use observer::{CartesianStep, FitObserver, GuidedStep, Observer};
-pub use pipeline::{FitConfig, FitOutcome, PriorConfig, fit_site};
+pub use pipeline::{FitConfig, FitOutcome, PriorCache, PriorConfig, fit_site};
 pub use problem::{Pose, ProblemOptions, RingSource, SiteProblem, Terms};
 pub use site::{Site, SiteOptions, SymmetryMode, load_site};
 pub use workflow::{SiteRequest, WorkflowInput, WorkflowOptions, WorkflowResult};

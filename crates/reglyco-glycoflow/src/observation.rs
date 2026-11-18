@@ -49,6 +49,24 @@ pub trait Observation: Send + Sync {
         grad: Option<&mut [[f64; 3]]>,
     ) -> ObservationValue;
 
+    /// The part of the energy a rigid motion of the conformer leaves unchanged (density: the
+    /// glycan's overlap with itself), for [`Observation::evaluate_rigid`]; `None` when the
+    /// observation has no such part.
+    fn rigid_term(&self, _x: &[[f64; 3]], _active: Option<&[bool]>) -> Option<f64> {
+        None
+    }
+
+    /// `evaluate` without gradient, given the `rigid_term` of the same conformer in any frame.
+    /// Equal to `evaluate` up to rounding, at a fraction of the cost.
+    fn evaluate_rigid(
+        &self,
+        x: &[[f64; 3]],
+        active: Option<&[bool]>,
+        _rigid: f64,
+    ) -> ObservationValue {
+        self.evaluate(x, active, None)
+    }
+
     /// The density likelihood behind this observation, if it is one.
     fn density(&self) -> Option<&SiteLikelihood> {
         None
@@ -96,6 +114,19 @@ impl DensityObservation {
 
     pub fn weights(&self) -> &[f64] {
         &self.z
+    }
+
+    /// The weights with the atoms `active` switches off set to zero.
+    fn active_weights(&self, active: Option<&[bool]>) -> std::borrow::Cow<'_, [f64]> {
+        match active {
+            Some(active) => self
+                .z
+                .iter()
+                .zip(active)
+                .map(|(z, a)| if *a { *z } else { 0.0 })
+                .collect(),
+            None => std::borrow::Cow::Borrowed(&self.z),
+        }
     }
 }
 
@@ -145,34 +176,45 @@ impl Observation for DensityObservation {
         active: Option<&[bool]>,
         grad: Option<&mut [[f64; 3]]>,
     ) -> ObservationValue {
-        let masked;
-        let z: &[f64] = match active {
-            Some(active) => {
-                masked = self
-                    .z
-                    .iter()
-                    .zip(active)
-                    .map(|(z, a)| if *a { *z } else { 0.0 })
-                    .collect::<Vec<_>>();
-                &masked
-            }
-            None => &self.z,
-        };
+        let z = self.active_weights(active);
         let score = match grad {
             Some(g) => {
-                let score = self.likelihood.evaluate(x, z, Some(&mut *g));
+                let score = self.likelihood.evaluate(x, &z, Some(&mut *g));
                 negate(g);
                 score
             }
-            None => self.likelihood.evaluate(x, z, None),
+            None => self.likelihood.evaluate(x, &z, None),
         };
-        ObservationValue {
-            energy: -score.log_likelihood,
-            log_likelihood: score.log_likelihood,
-            gain: score.gain,
-            partial_correlation: score.partial_correlation,
-            scale: score.scale,
-        }
+        value_of(score)
+    }
+
+    fn rigid_term(&self, x: &[[f64; 3]], active: Option<&[bool]>) -> Option<f64> {
+        Some(
+            self.likelihood
+                .self_overlap(x, &self.active_weights(active)),
+        )
+    }
+
+    fn evaluate_rigid(
+        &self,
+        x: &[[f64; 3]],
+        active: Option<&[bool]>,
+        rigid: f64,
+    ) -> ObservationValue {
+        value_of(
+            self.likelihood
+                .evaluate_with_overlap(x, &self.active_weights(active), rigid),
+        )
+    }
+}
+
+fn value_of(score: reglyco_density::site_likelihood::SiteLikelihoodScore) -> ObservationValue {
+    ObservationValue {
+        energy: -score.log_likelihood,
+        log_likelihood: score.log_likelihood,
+        gain: score.gain,
+        partial_correlation: score.partial_correlation,
+        scale: score.scale,
     }
 }
 

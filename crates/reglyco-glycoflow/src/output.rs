@@ -47,6 +47,9 @@ pub fn residue_naming(
         );
     }
     let mut next = used.iter().max().copied().unwrap_or(0) + 1;
+    if next > 9999 {
+        next = (1..=9999).rev().find(|n| !used.contains(n)).unwrap_or(next);
+    }
     let mut paths: Vec<&String> = tokens.keys().collect();
     paths.sort_by(|a, b| (a.matches('/').count(), *a).cmp(&(b.matches('/').count(), *b)));
     let mut out = Vec::new();
@@ -77,7 +80,12 @@ pub fn residue_naming(
                     ccd: ccd.to_string(),
                     source: "generated".into(),
                 });
+                used.insert(next);
                 next += 1;
+                // a PDB residue number has four columns: past 9999, the highest free number
+                if next > 9999 {
+                    next = (1..=9999).rev().find(|n| !used.contains(n)).unwrap_or(next);
+                }
             }
         }
     }
